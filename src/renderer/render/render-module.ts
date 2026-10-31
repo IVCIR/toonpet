@@ -123,6 +123,12 @@ const REQUIRED_BONES = ['head', 'eyeL', 'eyeR'] as const;
 /** 嘴型图集帧数（8×8；PAT_MOUTH_FRAME 的 frameCount 参数）。 */
 const MOUTH_FRAME_COUNT = CH0335_MOUTH_LAYOUT.columns * CH0335_MOUTH_LAYOUT.rows;
 
+/**
+ * 表情嘴型用的**官方图集帧**（High 图集 8×8，行优先）。
+ * 只取"看得出情绪"的几帧：轻微张口 / 小口 / 张口。
+ */
+const EMOTION_MOUTH_FRAME = 1;
+
 /** 贴花调试色（`PET_DECAL_DEBUG=red` 等）：只用于核对平面位置，不进生产。 */
 const DEBUG_DECAL_COLORS: Record<string, number> = {
   red: 0xff0000,
@@ -684,7 +690,9 @@ class StageRender implements RenderModule {
     } else if (owner === 'pat') {
       layer = { kind: 'atlas', frame: PAT_MOUTH_FRAME, frameCount: MOUTH_FRAME_COUNT };
     } else if (owner === 'emotion') {
-      layer = { kind: 'glyph', shape: face.mouth };
+      // 表情嘴型改用**官方高清图集帧**，不再用 Canvas 画的 `glyph`
+      // （ADR 0026 D6.6：嘴型/眼型/腮红的每个像素都必须来自图片）
+      layer = { kind: 'atlas', frame: EMOTION_MOUTH_FRAME, frameCount: MOUTH_FRAME_COUNT };
     } else {
       layer = { kind: 'static' };
     }
