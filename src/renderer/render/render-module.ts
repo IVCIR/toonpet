@@ -123,6 +123,14 @@ const REQUIRED_BONES = ['head', 'eyeL', 'eyeR'] as const;
 /** 嘴型图集帧数（8×8；PAT_MOUTH_FRAME 的 frameCount 参数）。 */
 const MOUTH_FRAME_COUNT = CH0335_MOUTH_LAYOUT.columns * CH0335_MOUTH_LAYOUT.rows;
 
+/** 贴花调试色（`PET_DECAL_DEBUG=red` 等）：只用于核对平面位置，不进生产。 */
+const DEBUG_DECAL_COLORS: Record<string, number> = {
+  red: 0xff0000,
+  green: 0x00ff00,
+  blue: 0x0000ff,
+  yellow: 0xffff00,
+};
+
 export interface AnimationDiagnostics {
   clipCount: number;
   clips: string[];
@@ -254,6 +262,11 @@ export interface RenderModuleOptions {
     direction: 'left' | 'right';
     distancePx: number;
   }) => void;
+  /**
+   * 视觉调试（ADR 0027 D3 的"破坏性实验"）：`red` / `green` / `blue` 时，
+   * 贴花平面改用纯色渲染，并隐藏原 EyeMouth 网格——用来核对平面位置与尺寸。
+   */
+  decalDebug?: string;
 }
 
 class StageRender implements RenderModule {
@@ -803,7 +816,26 @@ class StageRender implements RenderModule {
       root: model.root,
       meshes: model.meshes,
       assets: { eyesClosed, mouthLine, mouthOpen, blush: null },
+      debugColor: DEBUG_DECAL_COLORS[this.options.decalDebug ?? ''] ?? null,
     });
+
+    // 调试：隐藏原 EyeMouth，只留贴花平面，便于核对位置/尺寸
+    if (this.options.decalDebug === 'blink') {
+      // 只为了截图：强制闭眼线稿常亮，不隐藏原眼（用于判断"叠在原眼上"的观感）
+      this.decal.setBlink(1);
+      console.log('[render] 贴花调试：强制眨眼');
+    } else if (this.options.decalDebug) {
+      const mouthMaterial = this.model?.mouthMaterial ?? null;
+      if (mouthMaterial) mouthMaterial.visible = false;
+      const world = new THREE.Vector3();
+      this.decal.debugWorldPositions().forEach((entry, index) => {
+        world.set(entry[0], entry[1], entry[2]);
+        console.log(
+          `[render] 贴花平面#${index} world=(${entry.map((v) => v.toFixed(2)).join(',')})`,
+        );
+      });
+      console.log(`[render] 贴花调试模式 decalDebug=${this.options.decalDebug}（已隐藏 EyeMouth）`);
+    }
     this.scheduleBlink(performance.now());
 
     const diag = this.decal.diagnostics();
@@ -811,6 +843,8 @@ class StageRender implements RenderModule {
       `[render] 面部贴花 ready=${String(diag.ready)} eyePlanes=${diag.eyePlanes} ` +
         `mouth=${String(diag.mouth)} blush=${String(diag.blush)} ` +
         `eyeCenter=${diag.eyeCenter?.map((value) => value.toFixed(6)).join(',') ?? '(none)'} ` +
+        `eyePatch=${diag.eyePatch ? `${diag.eyePatch[0].toFixed(1)}x${diag.eyePatch[1].toFixed(1)}` : '-'} ` +
+        `mouthPatch=${diag.mouthPatch ? `${diag.mouthPatch[0].toFixed(1)}x${diag.mouthPatch[1].toFixed(1)}` : '-'} ` +
         `reason=${diag.reason ?? '-'}`,
     );
   }

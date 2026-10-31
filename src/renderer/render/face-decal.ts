@@ -27,6 +27,9 @@ export interface FaceDecalDiagnostics {
   /** 平面中心（世界坐标，bind pose） */
   eyeCenter: [number, number, number] | null;
   mouthCenter: [number, number, number] | null;
+  /** 量出来的面片尺寸（世界单位≈像素），用于标定缩放 */
+  eyePatch: [number, number] | null;
+  mouthPatch: [number, number] | null;
   blink: number;
   mouthOpen: number;
   blushLevel: number;
@@ -43,6 +46,8 @@ export interface FaceDecal {
   /** 每帧调用：把贴花钉在骨骼上（骨骼动它就动） */
   update(): void;
   diagnostics(): FaceDecalDiagnostics;
+  /** 调试：各平面的世界坐标（顺序：左眼、右眼、嘴、左腮红、右腮红） */
+  debugWorldPositions(): Array<[number, number, number]>;
   dispose(): void;
 }
 
@@ -53,6 +58,11 @@ export interface FaceDecalOptions {
   root: THREE.Object3D;
   meshes: readonly THREE.Mesh[];
   assets: FaceDecalAssets;
+  /**
+   * 视觉调试用：给定时所有平面用这个纯色、不透明渲染（忽略贴图）。
+   * 用来确认"平面在哪、多大、朝哪"——比看线稿直观得多。
+   */
+  debugColor?: number | null;
 }
 
 interface SurfacePatch {
@@ -64,6 +74,23 @@ interface SurfacePatch {
 
 /** 贴花平面相对脸皮的抬升量（模型单位）。太小会 z-fighting，太大会浮起来。 */
 const SURFACE_LIFT = 0.00012;
+
+/**
+ * 视觉标定（硬编码，靠截图调）。
+ *
+ * 为什么不自动换算：量出来的 `eyePatch` 是**双眼连同睫毛**的包围盒（116×57），
+ * 直接铺满会盖住鼻子；线稿本身只画了眼睛那一条弧。所以宽高各乘一个手调系数，
+ * 并整体上移一点。换模型必须重标（写进 MODULE_STATUS 坑位）。
+ */
+const EYE_PLANE_SCALE_X = 1.0; // 相对"半宽"（一只眼）
+const EYE_PLANE_SCALE_Y = 0.62; // 相对整块高度
+const EYE_PLANE_OFFSET_Y = 0.12; // 相对整块高度，正值向上
+const MOUTH_PLANE_SCALE_X = 0.95;
+const MOUTH_PLANE_SCALE_Y = 1.0;
+const BLUSH_PLANE_SCALE_X = 0.42;
+const BLUSH_PLANE_SCALE_Y = 0.5;
+const BLUSH_OFFSET_Y = 0.35; // 眼睛中心往下多少（相对整块高度）
+const BLUSH_OFFSET_X = 1.35; // 眼睛中心往外多少（相对半宽）
 /** 平面尺寸相对 UV 岛包围盒的放大（线稿比几何略大一圈，避免边缘被裁）。 */
 const PATCH_SCALE = 1.25;
 
@@ -86,6 +113,10 @@ function measurePatches(mesh: THREE.Mesh): { eye: SurfacePatch | null; mouth: Su
 
   mesh.updateWorldMatrix(true, false);
   const matrix = mesh.matrixWorld;
+  // `EyeMouth` 是 SkinnedMesh：几何体顶点在**绑定空间**，真实位置要过蒙皮矩阵。
+  // 直接乘 matrixWorld 会得到"绑定姿态 + 未蒙皮"的错位置（实测红块盖在鼻嘴上）。
+  const skinned = mesh as THREE.SkinnedMesh;
+  const useSkinning = Boolean(skinned.isSkinnedMesh && typeof skinned.applyBoneTransform === 'function');
 
   const eyeBox = new THREE.Box3();
   const mouthBox = new THREE.Box3();
@@ -101,7 +132,9 @@ function measurePatches(mesh: THREE.Mesh): { eye: SurfacePatch | null; mouth: Su
     const v = (uv.getY(ia) + uv.getY(ib) + uv.getY(ic)) / 3;
     const target = u < 0.25 && v > 0.75 ? mouthBox : eyeBox;
     for (const i of [ia, ib, ic]) {
-      point.set(position.getX(i), position.getY(i), position.getZ(i)).applyMatrix4(matrix);
+      point.set(position.getX(i), position.getY(i), position.getZ(i));
+      if (useSkinning) skinned.applyBoneTransform(i, point);
+      point.applyMatrix4(matrix);
       target.expandByPoint(point);
     }
   }
@@ -120,16 +153,29 @@ function makePlane(
   width: number,
   height: number,
   opacity: number,
+  debugColor?: number | null,
 ): THREE.Mesh {
-  const material = new THREE.MeshBasicMaterial({
-    map: texture,
-    transparent: true,
-    opacity,
-    depthTest: true,
-    depthWrite: false,
-    side: THREE.DoubleSide,
-    toneMapped: false,
-  });
+  const material = new THREE.MeshBasicMaterial(
+    debugColor === null || debugColor === undefined
+      ? {
+          map: texture,
+          transparent: true,
+          opacity,
+          depthTest: true,
+          depthWrite: false,
+          side: THREE.DoubleSide,
+          toneMapped: false,
+        }
+      : {
+          color: debugColor,
+          transparent: false,
+          opacity: 1,
+          depthTest: true,
+          depthWrite: false,
+          side: THREE.DoubleSide,
+          toneMapped: false,
+        },
+  );
   // 与脸皮共面时避免 z-fighting：向相机方向偏移一个深度单位
   material.polygonOffset = true;
   material.polygonOffsetFactor = -2;
@@ -171,6 +217,8 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
     blush: false,
     eyeCenter: null,
     mouthCenter: null,
+    eyePatch: null,
+    mouthPatch: null,
     blink: 0,
     mouthOpen: 0,
     blushLevel: 0,
@@ -185,6 +233,7 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
       setBlush() {},
       update() {},
       diagnostics: () => diagnostics,
+      debugWorldPositions: () => [],
       dispose() {},
     };
   }
@@ -198,6 +247,7 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
       setBlush() {},
       update() {},
       diagnostics: () => diagnostics,
+      debugWorldPositions: () => [],
       dispose() {},
     };
   }
@@ -215,68 +265,69 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
   const liftWorld = SURFACE_LIFT * worldScale;
 
   const halfEyeWidthWorld = patches.eye.width / 4;
-  const eyeYWorld = patches.eye.center.y;
+  const eyeYWorld = patches.eye.center.y + patches.eye.height * EYE_PLANE_OFFSET_Y;
+  // 所有平面共用同一个 Z（眼睛那块脸的表面），不要用嘴底板自己的 Z——实测它靠前 18px
   const faceZWorld = patches.eye.center.z + liftWorld;
 
   const leftEyePos = toLocal(new THREE.Vector3(-halfEyeWidthWorld, eyeYWorld, faceZWorld));
   const rightEyePos = toLocal(new THREE.Vector3(halfEyeWidthWorld, eyeYWorld, faceZWorld));
 
+  const debugColor = options.debugColor ?? null;
   const leftEye = makePlane(
     eyeTexture,
-    ((patches.eye.width / 2) * PATCH_SCALE) / worldScale,
-    (patches.eye.height * PATCH_SCALE * 1.4) / worldScale,
+    ((patches.eye.width / 2) * EYE_PLANE_SCALE_X) / worldScale,
+    (patches.eye.height * EYE_PLANE_SCALE_Y) / worldScale,
     1,
+    debugColor,
   );
   leftEye.position.copy(leftEyePos);
 
   const rightEye = makePlane(
     eyeTextureMirrored,
-    ((patches.eye.width / 2) * PATCH_SCALE) / worldScale,
-    (patches.eye.height * PATCH_SCALE * 1.4) / worldScale,
+    ((patches.eye.width / 2) * EYE_PLANE_SCALE_X) / worldScale,
+    (patches.eye.height * EYE_PLANE_SCALE_Y) / worldScale,
     1,
+    debugColor,
   );
   rightEye.position.copy(rightEyePos);
 
   const mouthPatch = patches.mouth;
   const mouth = makePlane(
     mouthLineTexture,
-    ((mouthPatch?.width ?? patches.eye.width / 2) * 1.1) / worldScale,
-    ((mouthPatch?.height ?? patches.eye.height) * 1.6) / worldScale,
+    ((mouthPatch?.width ?? patches.eye.width / 2) * MOUTH_PLANE_SCALE_X) / worldScale,
+    ((mouthPatch?.height ?? patches.eye.height) * MOUTH_PLANE_SCALE_Y) / worldScale,
     1,
+    debugColor,
   );
-  if (mouthPatch) {
-    mouth.position.copy(
-      toLocal(
-        new THREE.Vector3(
-          mouthPatch.center.x,
-          mouthPatch.center.y,
-          mouthPatch.center.z + liftWorld,
-        ),
-      ),
-    );
-  } else {
-    mouth.position.copy(toLocal(new THREE.Vector3(0, eyeYWorld - patches.eye.height * 1.4, faceZWorld)));
-  }
-
-  // 腮红：从眼睛外下方推出去（左右各一），尺寸按眼宽估算
-  const blushWidth = (patches.eye.width * 0.5) / worldScale;
-  const blushHeight = (patches.eye.height * 1.1) / worldScale;
-  const leftBlush = makePlane(blushTexture, blushWidth, blushHeight, 0);
-  leftBlush.position.copy(
+  mouth.position.copy(
     toLocal(
       new THREE.Vector3(
-        -halfEyeWidthWorld * 1.55,
-        eyeYWorld - patches.eye.height * 0.95,
+        mouthPatch?.center.x ?? 0,
+        mouthPatch?.center.y ?? eyeYWorld - patches.eye.height,
         faceZWorld,
       ),
     ),
   );
-  const rightBlush = makePlane(blushTexture, blushWidth, blushHeight, 0);
+
+  // 腮红：眼睛中心往外、往下各推一点（左右各一）
+  const blushWidth = (patches.eye.width * BLUSH_PLANE_SCALE_X) / worldScale;
+  const blushHeight = (patches.eye.height * BLUSH_PLANE_SCALE_Y) / worldScale;
+  const leftBlush = makePlane(blushTexture, blushWidth, blushHeight, 0, debugColor);
+  leftBlush.position.copy(
+    toLocal(
+      new THREE.Vector3(
+        -halfEyeWidthWorld * BLUSH_OFFSET_X,
+        eyeYWorld - patches.eye.height * BLUSH_OFFSET_Y,
+        faceZWorld,
+      ),
+    ),
+  );
+  const rightBlush = makePlane(blushTexture, blushWidth, blushHeight, 0, debugColor);
   rightBlush.position.copy(
     toLocal(
       new THREE.Vector3(
-        halfEyeWidthWorld * 1.55,
-        eyeYWorld - patches.eye.height * 0.95,
+        halfEyeWidthWorld * BLUSH_OFFSET_X,
+        eyeYWorld - patches.eye.height * BLUSH_OFFSET_Y,
         faceZWorld,
       ),
     ),
@@ -284,6 +335,13 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
 
   group.add(leftEye, rightEye, mouth, leftBlush, rightBlush);
   headBone.add(group);
+
+  // 调试模式：所有平面立刻可见（生产路径下由 setBlink / setMouthOpen 控制）
+  if (debugColor !== null) {
+    for (const plane of [leftEye, rightEye, mouth, leftBlush, rightBlush]) {
+      plane.visible = true;
+    }
+  }
 
   // 贴花随头骨走，但朝向"世界 +Z"（面朝镜头）：把头的世界朝向抵消掉
   const headQuat = new THREE.Quaternion();
@@ -298,6 +356,8 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
   diagnostics.mouth = Boolean(mouthLineTexture);
   diagnostics.blush = Boolean(blushTexture);
   diagnostics.eyeCenter = [patches.eye.center.x, patches.eye.center.y, patches.eye.center.z];
+  diagnostics.eyePatch = [patches.eye.width, patches.eye.height];
+  diagnostics.mouthPatch = mouthPatch ? [mouthPatch.width, mouthPatch.height] : null;
   diagnostics.mouthCenter = mouthPatch
     ? [mouthPatch.center.x, mouthPatch.center.y, mouthPatch.center.z]
     : null;
@@ -361,6 +421,16 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
 
     diagnostics(): FaceDecalDiagnostics {
       return { ...diagnostics };
+    },
+
+    debugWorldPositions(): Array<[number, number, number]> {
+      const out: Array<[number, number, number]> = [];
+      const world = new THREE.Vector3();
+      for (const plane of [leftEye, rightEye, mouth, leftBlush, rightBlush]) {
+        plane.getWorldPosition(world);
+        out.push([world.x, world.y, world.z]);
+      }
+      return out;
     },
 
     dispose(): void {

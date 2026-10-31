@@ -665,6 +665,8 @@ export const shell: ShellModule = {
       modelId,
       // 自检模式：渲染侧忽略真实鼠标事件，避免用户/桌面输入污染脚本化场景
       ...(process.env['PET_SELFTEST'] === '1' ? { selftest: '1' } : {}),
+      // 视觉调试（ADR 0027 D3）：PET_DECAL_DEBUG=red 时贴花平面用纯色渲染
+      ...(process.env['PET_DECAL_DEBUG'] ? { decalDebug: process.env['PET_DECAL_DEBUG'] } : {}),
     });
 
     // 输入条：创建一次、`show:false` 复用（ADR 0003 §2）；装载失败不阻断启动。
