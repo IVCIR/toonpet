@@ -1,50 +1,38 @@
-﻿/**
- * render 妯″潡锛堥樁娈?5锛夛細HFSM 涓夊眰 + 妯″瀷鑷甫鍔ㄧ敾 + 楠ㄩ浠茶 + 鎽稿ご/鎷栨嫿濮挎€併€? *
- * 濂戠害锛毬?.1锛堢姸鎬侀泦鍚堬級銆伮?.4锛坕ntent锛夈€伮?.1锝灺?.3锛堜笁灞備笌閫氶亾浼樺厛绾э級銆? * 搂7.3锛坔andleIntent / getState / modelReady锛夈€伮?1锛堢己澶遍檷绾э級锛? * ADR 0009锛堝姞杞?楠ㄩ/鍖呭洿鐩掞級銆丄DR 0010锛堟棤 blendshape 鐨勯潰閮ㄩ檷绾э級銆? * ADR 0014锛堥楠间徊瑁侀『搴忋€丮ixer 鎺ュ叆銆侀厤浠堕殣钘忋€乸at_react锛夈€? *
- * 姣忓抚鐨勫浐瀹氶『搴忥紙ADR 0014 D1锛夛細
- *   1. AnimationMixer.update
- *   2. BoneArbiter.beginFrame锛堟姄鍙栧姩鐢诲熀搴曪級
- *   3. 瑙嗙嚎鍙犲姞
- *   4. 鍙嶅簲鍙犲姞锛坧at_react 绛夛級
- *   5. BoneArbiter.endFrame锛堟瘡鏍瑰彈鎺ч楠煎彧鍐欎竴娆★級
- *   6. Physics 鏍瑰彉鎹紙鎽囨憜/浣嶇Щ锛夆啋 renderer.render
+/**
+ * render 模块（第 1/3 轮重建：骨架与加载）。
+ *
+ * 契约：§3.2（窗口/画布）、§3.3（掩膜 R-2/R-4/R-9）、§7.3（handleIntent / getState / modelReady）、
+ * §11（缺失降级）；ADR 0009（GLB 加载、骨骼归一化、包围盒取景）、ADR 0010（口型/表情降级）、
+ * ADR 0014（HFSM 三层与骨骼仲裁）、ADR 0023（官方片段）、ADR 0024（行走/回弹）、ADR 0026（表情贴图）。
+ *
+ * 本轮只做「装得起来、看得见、诊断对」：
+ *   1. 渲染器 / 场景 / 正交相机 / 占位胶囊体 / 掩膜采集 / RAF 主循环；
+ *   2. `model-loader` 加载 GLB（取景排除、配件隐藏、骨骼归一化名），失败回退占位体；
+ *   3. `getState()` 与 `getDiagnostics()` 的完整字段（动画/表情相关先返回空值，第 2/3 轮接线）。
+ *
+ * 每帧固定顺序（ADR 0014 D1，第 2/3 轮补齐 2–5 步）：
+ *   1. AnimationMixer.update → 2. 骨骼仲裁 beginFrame → 3. 视线叠加
+ *   → 4. 反应叠加 → 5. 仲裁 endFrame → 6. Physics 根变换 → renderer.render
  */
 import * as THREE from 'three';
 import { DEFAULT_HIDE_ATTACHMENTS } from '../../shared/attachments';
-import { MOUTH_FRAME_CLOSED, SETTLE_SQUASH_MS, SETTLE_SQUASH_RATIO } from '../../shared/constants';
+import { MOUTH_FRAME_CLOSED, REBOUND_SETTLE_MS } from '../../shared/constants';
 import type { BroadcastEvent } from '../../shared/events';
 import { isIntent } from '../../shared/intents';
-import type { WalkCommand } from '../../shared/ipc';
 import type { Bounds3 } from '../../shared/model-frame';
 import { DEFAULT_FRAME_EXCLUDE } from '../../shared/model-frame';
 import type { Emotion, Intent, RenderState } from '../../shared/types';
-import type { BaseState, PhysicsState } from '../../shared/types';
 import { createModelAnimations } from './animation-controller';
-import type {
-  ActionStatus,
-  AnimationSlot,
-  AnimationStatus,
-  ModelAnimations,
-  OneShotStatus,
-} from './animation-controller';
+import type { ActionStatus, AnimationSlot, ModelAnimations } from './animation-controller';
 import { createBoneArbiter } from './bone-arbiter';
 import type { BoneArbiter } from './bone-arbiter';
 import type { ClipRole } from './clip-bank';
-import {
-  EMOTION_FACE,
-  EMOTION_FADE_MS,
-  WALK_YAW_RAD,
-  approach,
-  fadeProgress,
-  resolveMouthOwner,
-  walkYawFor,
-} from './emotion-face';
+import { approach, walkYawFor, EMOTION_FACE, EMOTION_FADE_MS, fadeProgress, resolveMouthOwner } from './emotion-face';
 import type { BlushLevel, EmotionFace, EyeAssetKey, MouthOwner, MouthShape } from './emotion-face';
 import { loadExpressionAssets } from './expression-assets';
 import type { ExpressionAssets, PixelImage } from './expression-assets';
 import { createFaceDecal } from './face-decal';
 import type { FaceDecal, FaceDecalDiagnostics } from './face-decal';
-import { DECAL_FACE_FILES } from '../../shared/expression-files';
 import { collectFacialGeometry } from './facial-geometry';
 import {
   CH0335_MOUTH_LAYOUT,
@@ -58,6 +46,7 @@ import type {
   FacialChannelDiagnostics,
   MouthLayer,
 } from './facial-texture';
+import { DECAL_FACE_FILES } from '../../shared/expression-files';
 import { createGazeController } from './gaze';
 import type { GazeController, GazeState } from './gaze';
 import { createHfsm } from './hfsm';
@@ -71,57 +60,54 @@ import type { PatPose } from './pat-react';
 import { createCapsulePlaceholder, PLACEHOLDER_BOTTOM_MARGIN_PX } from './placeholder';
 import type { PlaceholderModel } from './placeholder';
 
-/** 濂戠害 搂7.3 / 搂12锛氬悓涓€ intent 200ms 鍐呭彧鎵ц涓€娆°€?*/
+/** 契约 §7.3 / §12：同一 intent 200ms 内只执行一次。 */
 export const INTENT_DEDUPE_MS = 200;
 
-/** Base 鈫?Physics 鐨勪氦鍙夋贰鍏ワ紙ADR 0014 D3.2锛夈€?*/
+/** Base ↔ Physics 的交叉淡入（ADR 0014 D3.2）。 */
 const DRAG_IN_CROSSFADE_SECONDS = 0.25;
 const DRAG_OUT_CROSSFADE_SECONDS = 0.3;
-/** 琛岃蛋鐨勮繘鍑烘贰鍏ワ紙ADR 0024 D1锛夛細璧锋/鏀舵姣旀嫋鎷芥洿缂擄紝閬垮厤"鐬棿鍒囧Э鍔?銆?*/
+/** 行走的进出淡入（ADR 0024 D1） */
 const WALK_IN_FADE_SECONDS = 0.3;
 const WALK_OUT_FADE_SECONDS = 0.35;
-/** 鍥炲脊杩囩▼涓粠鎮┖濮挎€佹贰鍥?Idle锛圓DR 0024 D3锛夛細瑕佽鐩栨暣娈典笅钀斤紝涓嶈兘澶煭銆?*/
+/** 回弹过程中从悬空姿态淡回 Idle（ADR 0024 D3） */
 const SETTLE_FADE_SECONDS = 0.45;
 
-/** 鎷栨嫿鏈熼棿鐨?鏁翠綋杞诲井鎽囨憜"涓?琚嫀璧?鎶崌锛堜笉鍐欓楠硷紝鍙浆/鎶?animationRoot锛夈€?*/
+/** 拖拽期间的"整体轻微摇摆"与"被拎起"抬升（不写骨骼，只转/抬 animationRoot）。 */
 const DRAG_SWAY_PERIOD_S = 1.6;
 const DRAG_SWAY_RAD = 0.05;
 const DRAG_SWAY_RAMP_MS = 220;
 const DRAG_LIFT_PX = 18;
 const DRAG_LIFT_SMOOTHING = 12;
 
-/** 鍢村瀷鍥鹃泦甯ф暟锛?脳8锛汸AT_MOUTH_FRAME 鐨?frameCount 鍙傛暟锛夈€?*/
-const MOUTH_FRAME_COUNT = CH0335_MOUTH_LAYOUT.columns * CH0335_MOUTH_LAYOUT.rows;
+/** 待机姿态轮换（ADR 0023 D5）：22–40s 在 Cafe_Idle / Formation_Idle 之间换。 */
+const IDLE_VARIANT_ROLES: readonly ClipRole[] = ['idle', 'idle.alt1'];
+const IDLE_VARIANT_MIN_MS = 22_000;
+const IDLE_VARIANT_MAX_MS = 40_000;
+const IDLE_VARIANT_FADE_SECONDS = 0.8;
 
 /**
- * 琛岃蛋杞韩锛圓DR 0026 D1锛夛細`walking` 鏈熼棿鏁磋韩缁?Y 杞磋浆鍚戠Щ鍔ㄦ柟鍚戯紙卤90掳锛夛紝
- * 鍋滀笅骞虫粦鍥炴銆俙9 /s` 鐨勬寚鏁伴€艰繎 鈮?0.3s 璧板畬 96%锛岃捣姝?鏀舵鍚勮浆涓€娆°€? */
-const WALK_TURN_RATE = 9;
-
-/**
- * 琛ㄦ儏娣″叆鐨勯噺鍖栨鏁帮細鎶?250ms 鐨勬贰鍏ュ垏鎴?6 娆￠噸缁樸€? * 涓€娆￠噸缁樿鍐?10 涓囩骇璐村浘鍍忕礌锛圓DR 0026 D4.2锛夛紝姝ユ暟澶浼氬湪杩?250ms 閲岃繛缁帀甯с€? */
-const EMOTION_FADE_STEPS = 6;
-
-/** 琛ㄦ儏鍢村瀷鍦ㄥ簳鏉夸腑鐨勫搴?楂樺害姣斾緥锛堜笌 facial-texture 鐨勫父閲忎繚鎸佷竴鑷达級銆?*/
-const EMOTION_MOUTH_ASPECT = 0.62 / 0.72;
+ * 官方片段接线表（ADR 0023 D2）：只有这里列出的 intent 会用模型自带片段，
+ * 缺失时退回下面的程序化反应。`nod` / `shake_head` / `tilt_head` / `look_at_user` 没有片段。
+ */
+const INTENT_CLIP: Partial<Record<Intent, ClipRole>> = {
+  greet: 'greet',
+  happy_hop: 'happy',
+};
 
 interface ReactionSpec {
   durationMs: number;
   hopPx?: number;
   squash?: number;
   tilt?: number;
-  /** 鎽嗗姩鍨嬶紙鎽囧ご锛夎€岄潪淇濇寔鍨嬶紙姝ご锛?*/
+  /** 摆动型（摇头）而非保持型（歪头） */
   oscillate?: boolean;
   look?: number;
 }
 
-interface PatState {
-  pose: PatPose;
-  progress: number;
-}
-
 /**
- * 闈?pat_react 鐨勭▼搴忓寲鍙嶅簲锛氬彧鐢ㄤ綅绉?缂╂斁/鏃嬭浆琛ㄨ揪锛屼笉寮曞叆鏂扮姸鎬佸悕鎴?intent銆? * pat_react 璧?pat-react.ts 鐨勪笁閫氶亾鍚堟垚锛堝ご閮ㄥ悗浠?+ 鍢村瀷锛夛紝涓嶅湪杩欓噷銆? */
+ * 非 pat_react 的程序化反应：只用位移/缩放/旋转表达，不引入新状态名或 intent。
+ * pat_react 走 pat-react.ts 的三通道合成（头部后仰 + 嘴型）。
+ */
 const REACTIONS: Record<Exclude<Intent, 'none' | 'pat_react'>, ReactionSpec> = {
   greet: { durationMs: 700, hopPx: 18, look: 0.18 },
   nod: { durationMs: 380, squash: 0.06 },
@@ -131,23 +117,11 @@ const REACTIONS: Record<Exclude<Intent, 'none' | 'pat_react'>, ReactionSpec> = {
   happy_hop: { durationMs: 720, hopPx: 34 },
 };
 
-/** 鍔犺浇鎴愬姛浣嗙己灏戣繖浜涢楠兼椂锛屾寜 搂7.3 瑙嗕负"楠ㄩ缂哄け"鏁翠綋鍥為€€锛圓DR 0009 D6锛夈€?*/
+/** 加载成功但缺少这些骨骼时，按 §7.3 视为"骨骼缺失"整体回退（ADR 0009 D6）。 */
 const REQUIRED_BONES = ['head', 'eyeL', 'eyeR'] as const;
 
-/**
- * 瀹樻柟鐗囨鎺ョ嚎琛紙ADR 0023 D2锛夈€? *
- * 鍙湁杩欓噷鍒楀嚭鐨?intent 浼氬皾璇曠敤妯″瀷鑷甫鐗囨锛涚墖娈电己澶辨椂鑷姩閫€鍥? * `REACTIONS` 鐨勭▼搴忓寲濮挎€侊紙ADR 0014 D6 鐨勮矾寰勪繚鐣欎负闄嶇骇鍒嗘敮锛夈€? * `nod` / `shake_head` / `tilt_head` / `look_at_user` 璧勪骇閲屾病鏈夊搴旂墖娈碉紝淇濇寔绋嬪簭鍖栥€? */
-const INTENT_CLIP: Partial<Record<Intent, ClipRole>> = {
-  greet: 'greet',
-  happy_hop: 'happy',
-};
-
-/**
- * 寰呮満濮挎€佽疆鎹紙ADR 0023 D5锛夛細闀挎椂闂村彧鎾竴娈?Idle 浼氱湅鍑哄惊鐜€? * 榛樿鍙湪 `Cafe_Idle` 涓?`Formation_Idle` 涔嬮棿鎹紱`idle.alt2`锛圥ublic01锛? * 濮挎€佹洿"瀵瑰"锛屽厛涓嶉粯璁ゅ惎鐢紝棰勮纭鍚庡彲鍔犺繘鏉ャ€? */
-const IDLE_VARIANT_ROLES: readonly ClipRole[] = ['idle', 'idle.alt1'];
-const IDLE_VARIANT_MIN_MS = 22_000;
-const IDLE_VARIANT_MAX_MS = 40_000;
-const IDLE_VARIANT_FADE_SECONDS = 0.8;
+/** 嘴型图集帧数（8×8；PAT_MOUTH_FRAME 的 frameCount 参数）。 */
+const MOUTH_FRAME_COUNT = CH0335_MOUTH_LAYOUT.columns * CH0335_MOUTH_LAYOUT.rows;
 
 export interface AnimationDiagnostics {
   clipCount: number;
@@ -155,18 +129,8 @@ export interface AnimationDiagnostics {
   idle: { name: string | null; reason: string; preferred: string };
   held: { name: string | null; reason: string; preferred: string };
   walk: { name: string | null; reason: string; preferred: string };
-  /** 璇箟瑙掕壊鐨勫懡涓粨鏋滐紙ADR 0023锛夛細missing 琛ㄧず璧勪骇閲屾病鏈夊搴旂墖娈?*/
-  roles: Array<{
-    role: ClipRole;
-    name: string | null;
-    reason: string;
-    preferred: string;
-    loop: boolean;
-  }>;
-  /** 姝ｅ湪鎾殑涓€娆℃€ф紨鍑猴紙null = 甯搁┗妲戒綅锛?*/
-  oneShot: OneShotStatus | null;
-  current: AnimationStatus;
-  actions: ActionStatus[];
+  current: { name: string | null; slot: string | null; time: number; weight: number; running: boolean };
+  actions: { name: string; weight: number; time: number; running: boolean }[];
   groundCorrectionPx: number | null;
 }
 
@@ -177,31 +141,34 @@ export interface PatDiagnostics {
   mouthFrame: number | null;
 }
 
-export type { MouthOwner } from './emotion-face';
-
+/** 面部贴图通道诊断（ADR 0026 D4；不进 RenderState） */
 export interface FacialDiagnostics {
-  /** `intent_resolved` 甯︽潵鐨?emotion锛堟湭鍙犲姞鎽稿ご鎶曞奖锛?*/
   emotion: Emotion;
-  /** 瀹為檯鐢熸晥鐨?emotion锛堟懜澶存湡闂存姇褰变负 shy锛屄?.3锛?*/
   effective: Emotion;
-  /** 璇?emotion 浣跨敤鐨勫畼鏂圭溂鍨嬪樊鍒嗛敭锛坣ull = 淇濇寔榛樿鐪硷紝闄嶇骇锛?*/
-  eyes: EyeAssetKey | null;
-  /** 璇?emotion 鐨勫槾鍨嬪浘鍏?*/
+  eyes: string | null;
   mouthShape: MouthShape;
   mouthOwner: MouthOwner;
-  blush: BlushLevel;
-  /** 褰撳墠琛ㄦ儏灞傜殑涓嶉€忔槑搴︼紙0..1锛涙贰鍏ユ湡闂村湪涓よ€呬箣闂达級 */
+  blush: number;
   alpha: number;
-  /** 娣″叆鏄惁浠嶅湪杩涜 */
   fading: boolean;
-  /** 閲嶇粯娆℃暟涓庢渶杩戜竴娆¤€楁椂锛堟绉掞級 */
   repaints: number;
   lastRepaintMs: number | null;
-  channel: FacialChannelDiagnostics | null;
-  blushChannel: FacialChannelDiagnostics | null;
-  /** 瀹樻柟琛ㄦ儏宸垎鐨勫姞杞芥儏鍐碉紙缂哄け鍗抽檷绾э紝涓嶉樆鏂級 */
+  channel: {
+    calibrated: boolean;
+    eyeCalibrated: boolean;
+    eyePixels: number;
+    mouthPixels: number;
+    textureDigest: string | null;
+    faceDistance: number | null;
+  } | null;
+  blushChannel: {
+    calibrated: boolean;
+    mouthPixels: number;
+    textureDigest: string | null;
+    faceDistance: number | null;
+  } | null;
   assets: {
-    loadedEyes: EyeAssetKey[];
+    loadedEyes: string[];
     blushLoaded: boolean;
     missing: string[];
     eyeImageLabel: string | null;
@@ -211,7 +178,6 @@ export interface FacialDiagnostics {
 export interface RenderDiagnostics {
   ready: boolean;
   loading: boolean;
-  fallback: boolean;
   error: string | null;
   modelId: string | null;
   loadMs: number | null;
@@ -231,111 +197,83 @@ export interface RenderDiagnostics {
     atlasLoaded: boolean;
     calibrated: boolean;
   };
-  /** 琛ㄦ儏璐村浘鍚堟垚锛圓DR 0026锛夛細褰撳墠鍥惧厓銆佸彛鍨嬩紭鍏堢骇涓庝袱寮犺创鍥鹃€氶亾鐨勭姸鎬?*/
-  facial: FacialDiagnostics;
-  /** 瀹樻柟绾跨璐磋姳灞傦紙ADR 0026 D7锛夛紱null = 鏈惎鐢?*/
-  decal: FaceDecalDiagnostics | null;
-  gaze: GazeState;
+  gaze: { yaw: number; pitch: number; targetYaw: number; targetPitch: number; idle: boolean; submitted: boolean };
   animation: AnimationDiagnostics | null;
+  /** 面部贴图通道（ADR 0026）；null = 未启用 */
+  facial: FacialDiagnostics | null;
+  /** 官方线稿贴花层（ADR 0026 D7）；null = 未启用 */
+  decal: FaceDecalDiagnostics | null;
   hfsm: HfsmSnapshot;
-  /** 琛岃蛋 / 鍥炲脊锛圓DR 0024锛夛細Base 涓?Physics 鐨勭姸鎬併€佸綋鍓嶈璧拌鍒掋€佷笅娆¤皟搴﹀€掕鏃?*/
+  /** ADR 0024：行走 / 回弹状态 + ADR 0026 D1 的行走朝向 */
   motion: {
-    base: BaseState;
-    physics: PhysicsState | null;
-    walking: WalkPlan | null;
+    base: string;
+    physics: string | null;
+    walking: { direction: string; distancePx: number } | null;
     nextWalkInMs: number | null;
-    /** 褰撳墠鏁磋韩鍋忚埅锛坮ad锛涜璧版椂 卤蟺/2锛岀珯瀹氫负 0锛夆€斺€擜DR 0026 D1 */
     walkYaw: number;
     walkYawTarget: number;
   };
   pat: PatDiagnostics;
-  /** 璇煶鍙ｅ瀷锛圓DR 0015 D4锛夛細褰撳墠甯х敱娓叉煋渚ф挱鏀惧櫒鎸夊寘缁滄帹杩涳紝涓嶈法杩涚▼ */
   speech: { frame: number; driven: boolean };
   probePoints: { head: { x: number; y: number } | null; body: { x: number; y: number } | null };
 }
 
 export interface RenderModule {
-  /** 鍛戒护锛氱珛鍗虫墽琛屽姩浣滄剰鍥俱€傛湭鐭ュ€奸檷绾?`none` 骞跺憡璀︼紙濂戠害 搂4.4銆伮?.3锛夈€?*/
+  /** 命令：立即执行动作意图。未知值降级 `none` 并告警（契约 §4.4、§7.3）。 */
   handleIntent(intent: string): void;
-  /** 浜嬪疄鎷夊彇锛氬悓姝ヨ繑鍥烇紝涓嶅緱瑙﹀彂娓叉煋鎴?IO锛堝绾?搂7.3锛夈€?*/
+  /** 事实拉取：同步返回，不得触发渲染或 IO（契约 §7.3）。 */
   getState(): RenderState;
   resize(width: number, height: number): void;
   dispose(): void;
-  /** 鍐呴儴锛歚cmd:probe` 鐨勫厜鏍囦綅缃紝鐢ㄤ簬瑙嗙嚎璺熼殢锛堜笉璺ㄨ繘绋嬫毚闇诧級 */
+  /** 内部：`cmd:probe` 的光标位置，用于视线跟随（不跨进程暴露） */
   setCursor(cssX: number, cssY: number, at?: number): void;
-  /**
-   * 鍐呴儴锛氭覆鏌撲晶璇煶鎾斁鍣ㄧ殑鍙ｅ瀷椹卞姩鍏ュ彛锛圓DR 0015 D4锛夈€?   * 涓嶅睘浜?搂7.3锛屼笉鏀?`RenderState`锛涘彧鎶婂抚鍙疯浆缁?`MouthChannel.setFrame`銆?   */
+  /** 内部：语音播放器的口型驱动入口（ADR 0015 D4） */
   setMouthFrame(frame: number): void;
-  /** 鍐呴儴锛氫氦杩橀棴鍢村抚锛坄speech_ended` / 鎵撴柇鏃惰皟鐢級 */
+  /** 内部：交还闭嘴帧（`speech_ended` / 打断时调用） */
   resetMouthFrame(): void;
-  /**
-   * 鍐呴儴锛歚evt:broadcast` 鐨勬覆鏌撲晶鍏ュ彛锛埪?.3 鐧藉悕鍗曞凡鐢?preload 鏍￠獙锛夈€?   * 鍙帴鍙?speech_* / drag_* / head_patted / intent_resolved锛涗笉灞炰簬 搂7.3 鐨勫叕鍏辨帴鍙ｃ€?   */
+  /** 内部：`evt:broadcast` 的渲染侧入口（§6.3 白名单已由 preload 校验） */
   handleEvent(event: BroadcastEvent): void;
-  /** 鍐呴儴锛氳嚜妫€/璇婃柇鐢紙涓嶅睘浜?搂7.3 鐨?render 鍏叡鎺ュ彛锛?*/
+  /** 内部：自检/诊断用（不属于 §7.3） */
   getDiagnostics(): RenderDiagnostics;
-  /**
-   * 鍐呴儴锛堥潪濂戠害锛夛細鏀硅璧拌皟搴﹂棿闅斻€傝嚜妫€鎶?20鈥?0s 鍘嬪埌 1.5鈥?s锛?   * 鍚﹀垯涓€娆¤嚜妫€绛変笉鍒拌皟搴﹁Е鍙戙€傜敓浜ц矾寰勪笉璋冪敤銆?   */
+  /** 内部：自检把 20–40s 的行走调度压到 1.5–2s */
   setWalkInterval(minIntervalMs: number, maxIntervalMs: number): void;
 }
 
 export interface RenderModuleOptions {
-  /** 鍙栨櫙鎺掗櫎姝ｅ垯锛堜笌涓昏繘绋嬪悓涓€浠斤紝缁?loadFile query 浼犲叆锛?*/
+  /** 取景排除正则（与主进程同一份，经 loadFile query 传入） */
   frameExclude?: string;
-  /** 瑁呴厤鏈熼厤浠堕殣钘忔鍒欙紙ADR 0014 D5锛涚己鐪佷笌鍙栨櫙鎺掗櫎鍚屾簮锛?*/
+  /** 装配期配件隐藏正则（ADR 0014 D5；缺省与取景排除同源） */
   hideAttachments?: string;
-  /** 妯″瀷鏍囪瘑锛堟枃浠跺悕锛夛紝鐢ㄤ簬 `model_ready` */
+  /** 模型标识（文件名），用于 `model_ready` */
   modelId?: string;
-  /** 鍔犺浇鎴愬姛涓旈甯у凡娓叉煋鍚庡洖璋冧竴娆★紱鐢辨覆鏌撻〉璐熻矗鍙戝嚭 model_ready */
+  /** 加载成功且首帧已渲染后回调一次；由渲染页负责发出 model_ready */
   onModelReady?: (payload: { modelId: string; loadMs: number }) => void;
-  /**
-   * ADR 0024 D5锛氭妸"瑕佸線鍝竟璧?杞垚 `cmd:walk`銆傜己鐪佹椂鍙挱鍔ㄧ敾涓嶅姩绐楀彛
-   * 锛堥瑙堥〉/鍗曟祴鍦烘櫙锛夛紝涓嶅奖鍝?`walking` 鐘舵€佹湰韬€?   */
-  onWalkRequest?: (command: WalkCommand) => void;
+  /** ADR 0024 D5：把"要往哪边走"转成 `cmd:walk` */
+  onWalkRequest?: (command: {
+    phase: 'start';
+    direction: 'left' | 'right';
+    distancePx: number;
+  }) => void;
 }
 
 class StageRender implements RenderModule {
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene = new THREE.Scene();
   private readonly camera: THREE.OrthographicCamera;
-  /** Physics/Overlay 鐨勪綅绉讳笌鏃嬭浆鎸傚湪杩欓噷锛涘畠鐨勫師鐐?= 鍐呭鍖哄簳杈逛腑蹇冿紙鑴氬簳锛?*/
+  /** Physics/Overlay 的位移与旋转挂在这里；它的原点 = 内容区底边中心（脚底） */
   private readonly animationRoot = new THREE.Group();
   private readonly options: RenderModuleOptions;
 
   private placeholder: PlaceholderModel | null;
   private model: LoadedModel | null = null;
+  private readonly hfsm: Hfsm;
   private animations: ModelAnimations | null = null;
   private arbiter: BoneArbiter | null = null;
-  private readonly hfsm: Hfsm;
-  /** 褰撳墠琛岃蛋璁″垝锛坄walking` 鏈熼棿闈炵┖锛涜瘖鏂笌鏀舵鐢級 */
-  private walkingPlan: WalkPlan | null = null;
   private gaze: GazeController | null = null;
-  /** EyeMouth 璐村浘閫氶亾锛氬畼鏂圭溂鍨嬪樊鍒?+ 琛ㄦ儏鍢村瀷 + 鍥惧眰浠茶鍚庣殑閲嶇粯锛圓DR 0026 D3/D6锛?*/
-  private facial: FacialChannel | null = null;
-  /** Face 璐村浘閫氶亾锛氱孩鏅曪紙涓庣溂鐫?鍢翠笉鏄悓涓€寮犺创鍥撅級 */
-  private blushChannel: BlushChannel | null = null;
-  /** 瀹樻柟琛ㄦ儏宸垎锛坄data/expressions/`锛夛紱缂哄け椤圭疆绌哄苟闄嶇骇锛屼笉闃绘柇 */
-  private expressions: ExpressionAssets | null = null;
-  private atlasLoaded = false;
-  private emotion: Emotion = 'neutral';
-  /** 琛ㄦ儏娣″叆璧风偣锛坄performance.now`锛夛紱涓婁竴甯х殑 emotion 鍙樺寲鏃堕噸缃?*/
-  private emotionFadeStartedAt = 0;
-  /** 涓婁竴娆″疄闄呯敓鏁堢殑 emotion锛堢敤鏉ュ垽鏂槸鍚﹂渶瑕侀噸鏂板紑濮嬫贰鍏ワ級 */
-  private appliedEmotion: Emotion = 'neutral';
-  private facialRepaints = 0;
-  private facialLastRepaintMs: number | null = null;
-  /** 鏈€杩戜竴娆￠噸缁樿鐩栫殑璐村浘鍍忕礌鏁帮紙璇婃柇锛氳瘉鏄庡彧鍔ㄥ眬閮ㄥ尯鍩燂級 */
-  private facialLastPainted = 0;
-  /** 涓婁竴娆￠噸缁樼殑鐘舵€佹寚绾癸紙閬垮厤鏃犲彉鍖栨椂閲嶅涓婁紶璐村浘锛?*/
-  private facialKey = '';
+  /** 当前行走计划（`walking` 期间非空） */
+  private walkingPlan: WalkPlan | null = null;
 
-  /** 瀹樻柟绾跨璐磋姳灞傦紙ADR 0026 D7锛夛細鐪ㄧ溂绾?+ 鍢寸嚎 + 鑵孩锛屾寕鍦ㄥご楠ㄤ笂 */
-  private decal: FaceDecal | null = null;
-  /** 涓嬩竴娆＄湪鐪肩殑鏃跺埢锛坄performance.now`锛?*/
-  private nextBlinkAt = 0;
-  /** 褰撳墠鐪ㄧ溂鍔ㄧ敾鐨勮捣鐐癸紱null = 涓嶅湪鐪ㄧ溂 */
-  private blinkStartedAt: number | null = null;
-
-  /** 鍐呴儴鎺ュ彛锛氭帺鑶滈噰闆嗭紙鐢?RenderBundle 鎸佹湁锛屼笉灞炰簬 搂7.3锛?*/
+  /** 内部接口：掩膜采集（由 RenderBundle 持有，不属于 §7.3） */
   readonly maskCapture: MaskCapture;
 
   private readonly startedAt = performance.now();
@@ -345,27 +283,53 @@ class StageRender implements RenderModule {
   private lastFrameAt = performance.now();
 
   private readonly lastIntentAt = new Map<string, number>();
-  /** 闈?pat_react 鐨勭▼搴忓寲鍙嶅簲锛堣瑙夛級锛屼笌 HFSM 鐨?reacting 鍚屾簮璁℃椂 */
+  private emotion: Emotion = 'neutral';
+
+  /** Idle 姿态下可见网格的最低点（root 局部单位）；null = 未校正 */
+  private groundMinYLocal: number | null = null;
+
+  /** ADR 0026 D1：行走朝向（rad）与目标 */
+  private walkYaw = 0;
+  private walkYawTarget = 0;
+
+  /** 非 pat_react 的程序化反应（视觉），与 HFSM 的 reacting 同源计时 */
   private reaction: { spec: ReactionSpec; startedAt: number } | null = null;
   private dragStartedAt: number | null = null;
   private dragging = false;
   private dragSwayGain = 0;
   private dragLiftPx = 0;
   private patMouthActive = false;
-  /** 琛岃蛋杞韩鐨勫綋鍓?/ 鐩爣鍋忚埅锛坮ad锛孉DR 0026 D1锛?*/
-  private walkYaw = 0;
-  private walkYawTarget = 0;
-  /** 鎽稿ご鏄惁鐢卞畼鏂规暣韬墖娈垫壙鎷咃紙true 鏃朵笉鍐嶅彔鍔犵▼搴忓寲澶撮儴鍋忕Щ锛孉DR 0023 D4锛?*/
+  /** 摸头是否由官方整身片段承担（true 时不再叠加程序化头部偏移，ADR 0023 D4） */
   private officialPat = false;
-  /** 涓嬩竴娆″緟鏈哄Э鎬佽疆鎹㈢殑鏃跺埢锛坧erformance.now 鍩哄噯锛?*/
+  /** 下一次待机姿态轮换的时刻（performance.now 基准） */
   private idleVariantAt = 0;
   private idleVariantRole: ClipRole = 'idle';
-  /** 璇煶鍙ｅ瀷锛圓DR 0015 D4锛夛細甯у彿鐢辨挱鏀惧櫒鎸夊寘缁滄帹杩?*/
+  /** 语音口型（ADR 0015 D4）：帧号由播放器按包络推进 */
   private lipSyncFrame = MOUTH_FRAME_CLOSED;
   private lipSyncDriven = false;
 
-  /** Idle 濮挎€佷笅鍙缃戞牸鐨勬渶浣庣偣锛坮oot 灞€閮ㄥ崟浣嶏級锛沶ull = 鏈牎姝?*/
-  private groundMinYLocal: number | null = null;
+  /** EyeMouth 贴图通道：官方眼型差分 + 表情嘴型 + 图层仲裁后的重绘（ADR 0026 D3/D6） */
+  private facial: FacialChannel | null = null;
+  /** Face 贴图通道：红晕（与眼睛/嘴不是同一张贴图） */
+  private blushChannel: BlushChannel | null = null;
+  /** 官方表情差分（`data/expressions/`）；缺失项置空并降级，不阻断 */
+  private expressions: ExpressionAssets | null = null;
+  private atlasLoaded = false;
+  /** 表情淡入起点；emotion 变化时重置 */
+  private emotionFadeStartedAt = 0;
+  /** 上一次实际生效的 emotion（判断是否需要重新开始淡入） */
+  private appliedEmotion: Emotion = 'neutral';
+  private facialRepaints = 0;
+  private facialLastRepaintMs: number | null = null;
+  /** 上一次重绘的状态指纹（避免无变化时重复上传贴图） */
+  private facialKey = '';
+
+  /** 官方线稿贴花层（ADR 0026 D7）：眨眼线 + 嘴线，挂在头骨上 */
+  private decal: FaceDecal | null = null;
+  /** 下一次眨眼的时刻 */
+  private nextBlinkAt = 0;
+  /** 当前眨眼动画的起点；null = 不在眨眼 */
+  private blinkStartedAt: number | null = null;
 
   private ready = false;
   private loading = true;
@@ -374,18 +338,19 @@ class StageRender implements RenderModule {
 
   constructor(canvas: HTMLCanvasElement, options: RenderModuleOptions = {}) {
     this.options = options;
-    this.hfsm = createHfsm({ patDurationMs: PAT_DURATION_MS });
+    this.hfsm = createHfsm({ patDurationMs: 1100 });
 
     this.renderer = new THREE.WebGLRenderer({
       canvas,
       alpha: true,
       antialias: true,
-      // 濂戠害 搂3.3 R-2 / 搂3.6 P-2锛氱姝㈠紑鍚?preserveDrawingBuffer
+      // 契约 §3.3 R-2 / §3.6 P-2：禁止开启 preserveDrawingBuffer
       preserveDrawingBuffer: false,
     });
     this.renderer.setClearColor(0x00000000, 0);
     this.renderer.setPixelRatio(window.devicePixelRatio || 1);
 
+    // 正交相机：内容区 1 CSS px = 1 世界单位（ADR 0009 D4）
     this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, -1000, 1000);
     this.camera.position.z = 100;
 
@@ -418,7 +383,7 @@ class StageRender implements RenderModule {
       if (missing.length > 0) {
         loaded.dispose();
         throw new Error(
-          `楠ㄩ缂哄け锛?{missing.join(', ')}锛埪?.3锛歮odelReady=false锛屽洖閫€鍗犱綅鑳跺泭浣擄級`,
+          `骨骼缺失：${missing.join(', ')}（§7.3：modelReady=false，回退占位胶囊体）`,
         );
       }
 
@@ -441,12 +406,15 @@ class StageRender implements RenderModule {
       }
       this.gaze = createGazeController(loaded.bones);
 
+      void this.attachFacialChannel();
+      void this.attachFaceDecal();
+
       this.ready = true;
       this.readyPending = true;
       this.error = null;
 
       console.log(
-        `[render] 妯″瀷宸插姞杞?modelId=${loaded.modelId} loadMs=${Math.round(loaded.loadMs)} ` +
+        `[render] 模型已加载 modelId=${loaded.modelId} loadMs=${Math.round(loaded.loadMs)} ` +
           `meshes=${loaded.meshNames.length} triangles=${loaded.triangleCount} ` +
           `morphTargets=${String(loaded.hasMorphTargets)} ` +
           `bones=head:${String(Boolean(loaded.bones.head))},eyeL:${String(Boolean(loaded.bones.eyeL))},` +
@@ -454,85 +422,170 @@ class StageRender implements RenderModule {
           `hidden=${loaded.hiddenMeshes.join('|') || '(none)'} ` +
           `ppm=${Math.round(loaded.pixelsPerUnit)}`,
       );
-
-      void this.attachFacialChannel();
-      void this.attachFaceDecal();
     } catch (error) {
       this.error = String(error);
       this.ready = false;
-      // 搂7.3 / 搂11锛氭ā鍨嬬己澶?瑙ｆ瀽澶辫触/楠ㄩ缂哄け 鈫?鍗犱綅鑳跺泭浣擄紝涓嶇櫧灞忋€佷笉鎶涘紓甯?      console.warn('[render] 妯″瀷鍔犺浇澶辫触锛屽洖閫€鍗犱綅鑳跺泭浣擄紙搂7.3/搂11锛?, error);
+      // §7.3 / §11：模型缺失/解析失败/骨骼缺失 → 占位胶囊体，不白屏、不抛异常
+      console.warn('[render] 模型加载失败，回退占位胶囊体（§7.3/§11）', error);
     } finally {
       this.loading = false;
     }
   }
 
-  /** 鏋氫妇 44 娈靛姩鐢?+ 閫変腑 idle/held/walk + 璧锋挱 Idle锛圓DR 0014 D3锛夈€?*/
+  /** 枚举 44 段动画 + 选中 idle/held/walk + 起播 Idle（ADR 0014 D3、ADR 0023）。 */
   private setupAnimations(model: LoadedModel): void {
     const animations = createModelAnimations(model.root, model.animations);
     this.animations = animations;
 
-    console.log(`[render] 妯″瀷鑷甫鍔ㄧ敾 ${animations.clipNames.length} 娈碉細${animations.clipNames.join(', ')}`);
+    console.log(`[render] 模型自带动画 ${animations.clipNames.length} 段：${animations.clipNames.join(', ')}`);
     const selection = animations.selection;
-    const hasClip = (name: string): string => (animations.clipNames.includes(name) ? name : '(none)');
     console.log(
-      `[render] 鍔ㄧ敾閫夋嫨 idle=${String(selection.idle.name)}(${selection.idle.reason}) ` +
+      `[render] 动画选择 idle=${String(selection.idle.name)}(${selection.idle.reason}) ` +
         `held=${String(selection.held.name)}(${selection.held.reason}) ` +
-        `walk=${String(selection.walk.name)}(${selection.walk.reason}锛涙湰杞彧璇嗗埆銆佷笉鍚敤)`,
+        `walk=${String(selection.walk.name)}(${selection.walk.reason})`,
     );
-    console.log(
-      `[render] 鍔ㄤ綔瑙掕壊璇嗗埆锛歱ickup=${hasClip('CH0335_Formation_Pickup')}锛堣鎷庤捣锛宧eld 鐨勯檷绾у€欓€夛級 ` +
-        `struggle=${hasClip('CH0335_Vital_Panic')}锛堟專鎵庯紝held 鐨勯檷绾у€欓€夛級`,
-    );
+    const roleReport = Object.values(animations.roles)
+      .map((role) => `${role.role}=${role.name ?? '(missing)'}${role.reason === 'pattern' ? '(pattern)' : ''}`)
+      .join(' ');
+    console.log(`[render] 语义角色：${roleReport}`);
+
     for (const slot of ['idle', 'held', 'walk'] as AnimationSlot[]) {
       if (selection[slot].reason === 'missing') {
-        console.warn(`[render] 鏈壘鍒?${slot} 鐗囨锛堥閫?${selection[slot].preferred}锛夛紝璇ユЫ浣嶄繚鎸佺┖杞琡);
+        console.warn(`[render] 未找到 ${slot} 片段（首选 ${selection[slot].preferred}），该槽位保持空转`);
       }
     }
 
-    // ADR 0023锛氭妸璇箟瑙掕壊鐨勫懡涓粨鏋滃叏閮ㄦ墦鍑烘潵锛屾帴绾挎槸鍚︾敓鏁堜竴鐪煎彲瑙?    const roleReport = Object.values(animations.roles)
-      .map((role) => `${role.role}=${role.name ?? '(missing)'}${role.reason === 'pattern' ? '(pattern)' : ''}`)
-      .join(' ');
-    console.log(`[render] 璇箟瑙掕壊锛?{roleReport}`);
-
     if (!animations.play('idle', 0)) {
-      console.warn('[render] Idle 鐗囨缂哄け锛欱ase 灞傛病鏈夊姩鐢婚┍鍔紙ADR 0014 D3锛?);
+      console.warn('[render] Idle 片段缺失：Base 层没有动画驱动（ADR 0014 D3）');
       return;
     }
     this.idleVariantRole = 'idle';
     this.scheduleIdleVariant(performance.now());
-    // 璁╅甯у姩浣滄潈閲嶇敓鏁堬紝闅忓悗鎵嶈兘鍋氬湴闈㈡牎姝ｇ殑钂欑毊閲囨牱
+    // 让首帧动作权重生效，随后才能做地面校正的蒙皮采样
     animations.update(0);
     model.root.updateMatrixWorld(true);
   }
 
-  /**
-   * ADR 0014 D4锛氳嚜甯﹀姩鐢荤殑鏍归骞崇Щ鎶婅鑹蹭粠缁戝畾濮挎€佹姮璧凤紙瀹炴祴绾?22px锛夛紝
-   * 杩欓噷鎸?Idle 濮挎€佸仛涓€娆?CPU 钂欑毊閲囨牱锛屾妸鏈€浣庣偣瀵归綈鍐呭鍖哄簳杈广€?   */
-  private calibrateGround(): void {
-    const model = this.model;
-    if (!model) return;
-    const minY = measureAnimatedMinY(model.root, model.meshes);
-    if (minY === null || !Number.isFinite(minY)) {
-      console.warn('[render] 鍦伴潰鏍℃閲囨牱澶辫触锛屼繚鐣欑粦瀹氬Э鎬佹斁缃紙ADR 0014 D4锛?);
-      return;
+  private playAnimation(slot: AnimationSlot, fadeSeconds: number, reason: string): void {
+    if (!this.animations) return;
+    const ok = this.animations.play(slot, fadeSeconds);
+    const current = this.animations.current();
+    if (ok) {
+      console.log(`[render] 动作切换 ${reason} → ${slot}=${String(current.name)}（crossFade ${fadeSeconds}s）`);
+    } else {
+      console.warn(`[render] 动作切换失败 ${reason} → ${slot}（片段缺失，保持当前动作）`);
     }
-    const beforePx = model.root.position.y;
-    this.groundMinYLocal = minY;
-    this.applyPlacement();
-    const afterPx = model.root.position.y;
-    console.log(
-      `[render] 鍦伴潰鏍℃ minY=${minY.toFixed(6)} 鍗曚綅 rootY ${beforePx.toFixed(1)} 鈫?${afterPx.toFixed(1)}px ` +
-        `(${(afterPx - beforePx).toFixed(1)}px)`,
-    );
+  }
+
+  /** ADR 0023：优先播官方片段；返回 false 表示调用方应走程序化降级。 */
+  private playOfficial(role: ClipRole, returnTo: AnimationSlot, reason: string): boolean {
+    const animations = this.animations;
+    if (!animations) return false;
+    const ok = animations.playOnce(role, { returnTo });
+    const one = animations.oneShot();
+    if (ok) {
+      console.log(
+        `[render] 官方片段 ${reason} → ${role}=${String(one?.name)}` +
+          `（${one ? one.duration.toFixed(2) : '?'}s，播完回 ${returnTo}）`,
+      );
+    } else {
+      console.log(`[render] 官方片段缺失 ${reason} → ${role}，走程序化降级`);
+    }
+    return ok;
+  }
+
+  /** 一次性片段的时长（毫秒）；用于让 HFSM 的 reacting 与动画同寿命。 */
+  private oneShotDurationMs(): number {
+    const one = this.animations?.oneShot();
+    return one ? one.duration * 1000 : 0;
+  }
+
+  /** ADR 0023 D5：排下一次待机姿态轮换。 */
+  private scheduleIdleVariant(now: number): void {
+    const span = IDLE_VARIANT_MAX_MS - IDLE_VARIANT_MIN_MS;
+    this.idleVariantAt = now + IDLE_VARIANT_MIN_MS + Math.random() * span;
+  }
+
+  /** ADR 0023 D5：在待机姿态之间交叉淡入，避免长时间看出循环。 */
+  private rotateIdleVariant(now: number): void {
+    this.scheduleIdleVariant(now);
+    const animations = this.animations;
+    if (!animations || IDLE_VARIANT_ROLES.length < 2) return;
+    const candidates = IDLE_VARIANT_ROLES.filter((role) => role !== this.idleVariantRole);
+    if (candidates.length === 0) return;
+    const role = candidates[Math.floor(Math.random() * candidates.length)];
+    if (animations.playRole(role, IDLE_VARIANT_FADE_SECONDS, 'idle')) {
+      this.idleVariantRole = role;
+      console.log(`[render] 待机姿态轮换 → ${role}=${String(animations.roles[role].name)}`);
+    }
   }
 
   /**
-   * 闈㈤儴璐村浘閫氶亾锛圓DR 0026锛夛細鎶婂畼鏂圭溂鍨嬪樊鍒?+ 鍢磋创鍒?`EyeMouth`銆佹妸绾㈡檿璐村埌 `Face`銆?   *
-   * 涓ゅ紶璐村浘鏄袱涓潗璐紝鎵€浠ユ槸涓ゆ潯閫氶亾锛涜〃鎯呭眰鐨?鐢ㄥ摢寮犲浘"鐢?`applyFacial` 鍐冲畾锛?   * 杩欓噷鍙礋璐ｈ閰嶃€佷竴娆℃€ф爣瀹氾紙涓夎褰?鈫?闈㈢┖闂磋〃闈級涓庡樊鍒嗛杞姐€?   */
+   * ADR 0024 D1：进入 `walking`。
+   * 位移**不使用动画里的 root motion**——窗口位置由 `cmd:walk` 交给 shell 的纯函数物理，
+   * 这里只负责换动作与记录计划。
+   */
+  private beginWalk(plan: WalkPlan, now: number): void {
+    this.walkingPlan = plan;
+    this.scheduleIdleVariant(now);
+    this.walkYawTarget = walkYawFor(plan.direction);
+    const played = this.animations?.playRole('walk', WALK_IN_FADE_SECONDS, 'walk') ?? false;
+    this.options.onWalkRequest?.({
+      phase: 'start',
+      direction: plan.direction,
+      distancePx: plan.distancePx,
+    });
+    console.log(
+      `[render] walking 开始 direction=${plan.direction} distance=${plan.distancePx}px ` +
+        `clip=${played ? String(this.animations?.roles.walk.name) : '(缺失，原地不动)'}`,
+    );
+  }
+
+  /** 收步：请求 shell 停下，并淡回 Idle（到达 / 撞边 / 被拖拽打断都走这里）。 */
+  private stopWalk(reason: string): void {
+    if (!this.walkingPlan) return;
+    this.walkingPlan = null;
+    this.walkYawTarget = 0;
+    this.playAnimation('idle', WALK_OUT_FADE_SECONDS, `stopWalk(${reason})`);
+  }
+
+  /** 摸头姿态（ADR 0014 D6）：头部后仰/侧倾 + 身体前倾，按 `sin(πp)` 包络。 */
+  private patState(now: number): { pose: PatPose; progress: number } | null {
+    const snapshot = this.hfsm.snapshot();
+    const reaction = snapshot.reaction;
+    if (!reaction) return null;
+    const isPat = reaction.kind === 'head_patted' || reaction.intent === 'pat_react';
+    if (!isPat) return null;
+    const progress = (now - reaction.startedAt) / reaction.durationMs;
+    if (progress >= 1) return null;
+    const speaking = snapshot.speakingUtteranceId !== null;
+    return { pose: patPose(progress, speaking), progress };
+  }
+
+  /** 摸头的表情通道：非说话时切 shy 嘴型；说话时让位给口型（§5.2 / §5.3）。 */
+  private syncPatMouth(pat: { pose: PatPose } | null): void {
+    const shouldPaint = pat !== null && pat.pose.allowMouthChange;
+    if (shouldPaint && !this.patMouthActive) {
+      this.patMouthActive = true;
+      return;
+    }
+    if (!shouldPaint) this.restorePatMouth();
+  }
+
+  /** 交还嘴型通道（回到静态闭嘴底图）。幂等。 */
+  private restorePatMouth(): void {
+    if (!this.patMouthActive) return;
+    this.patMouthActive = false;
+  }
+
+  /**
+   * 面部贴图通道（ADR 0026 D2/D6）：EyeMouth（眼型+嘴）+ Face（红晕）两条通道。
+   * 两张贴图是两个材质，所以是两条通道；"用哪张图"由 `applyFacial` 决定。
+   */
   private async attachFacialChannel(): Promise<void> {
     const mouthTarget = this.model?.mouthMaterial ?? null;
     if (!mouthTarget) {
-      console.warn('[render] 鏈壘鍒?EyeMouth 鏉愯川锛屽彛鍨?琛ㄦ儏涓嶅彲鐢紙搂11 璁板綍涓€娆″憡璀︼級');
+      console.warn('[render] 未找到 EyeMouth 材质，口型/表情不可用（§11 记录一次告警）');
       return;
     }
     const geometry = this.model ? collectFacialGeometry(this.model) : null;
@@ -549,7 +602,8 @@ class StageRender implements RenderModule {
         atlas,
       });
     } else {
-      // 搂11锛氭病鏈夊彲鐢ㄥ嚑浣曟椂閫€鍥?鍙湁鍢淬€佹病鏈夌溂鍨?绾㈡檿"鐨勬棫璺緞锛堜粛鐒朵笉鐧藉睆锛?      this.facial = createFacialChannel({
+      // §11：没有可用几何时退回"只有嘴、没有眼型/红晕"的路径（仍然不白屏）
+      this.facial = createFacialChannel({
         material: mouthTarget,
         sourceTexture: this.model?.mouthSourceTexture ?? null,
         triangles: [],
@@ -570,23 +624,152 @@ class StageRender implements RenderModule {
 
     const mouthDiag = this.facial.diagnostics();
     console.log(
-      `[render] 闈㈤儴璐村浘閫氶亾 material=${String(mouthDiag.materialName)} ` +
+      `[render] 面部贴图通道 material=${String(mouthDiag.materialName)} ` +
         `atlasLoaded=${String(this.atlasLoaded)} calibrated=${String(mouthDiag.calibrated)} ` +
         `eyeCalibrated=${String(mouthDiag.eyeCalibrated)} ` +
-        `eyes=${mouthDiag.eyes.map((eye) => `${eye.x.toFixed(5)}/${eye.y.toFixed(5)}`).join('|') || '(none)'} ` +
         `blush=${String(this.blushChannel?.calibrated ?? false)} ` +
         `expressions=${Object.keys(expressions.eyes).join(',') || '(none)'} ` +
         `missing=${expressions.missing.join('|') || '(none)'}`,
     );
 
-    // 棣栧抚鎶婇潤鎬侀棴鍢?+ 褰撳墠 emotion 鐢讳笂鍘伙紙涓嶆敼鍙?鏈敹鍒版儏缁椂鏄?neutral"鐨勮涔夛級
+    // 首帧把静态闭嘴 + 当前 emotion 画上去
     this.applyFacial(performance.now(), true);
   }
 
+  /** 每帧/每次状态变化时合成面部贴图（只在状态指纹变化时真正重绘）。 */
+  private applyFacial(now: number, force = false): void {
+    const facial = this.facial;
+    if (!facial) return;
+
+    const snapshot = this.hfsm.snapshot();
+    const speaking = snapshot.speakingUtteranceId !== null;
+    const pat = this.patState(now);
+    const patActive = pat !== null;
+    const effective: Emotion = patActive ? 'shy' : this.emotion;
+
+    if (effective !== this.appliedEmotion) {
+      this.appliedEmotion = effective;
+      this.emotionFadeStartedAt = now;
+    }
+    const alpha = fadeProgress(now - this.emotionFadeStartedAt, EMOTION_FADE_MS);
+    const face: EmotionFace = EMOTION_FACE[effective] ?? EMOTION_FACE.neutral;
+
+    const eyeKey: EyeAssetKey | null = face.eyes;
+    const eyeImage: PixelImage | null = eyeKey ? (this.expressions?.eyes[eyeKey] ?? null) : null;
+
+    const owner: MouthOwner = resolveMouthOwner({
+      speaking,
+      lipSyncDriven: this.lipSyncDriven,
+      patActive,
+      emotionMouth: face.mouth,
+      alpha,
+    });
+
+    let layer: MouthLayer;
+    if (owner === 'lip-sync') {
+      layer = { kind: 'atlas', frame: this.lipSyncFrame, frameCount: MOUTH_FRAME_COUNT };
+    } else if (owner === 'pat') {
+      layer = { kind: 'atlas', frame: PAT_MOUTH_FRAME, frameCount: MOUTH_FRAME_COUNT };
+    } else if (owner === 'emotion') {
+      layer = { kind: 'glyph', shape: face.mouth };
+    } else {
+      layer = { kind: 'static' };
+    }
+
+    const key = `${eyeKey ?? '-'}|${owner}|${JSON.stringify(layer)}|${alpha.toFixed(2)}|${face.blush}`;
+    if (!force && key === this.facialKey) return;
+    this.facialKey = key;
+
+    const startedAt = performance.now();
+    if (eyeKey === null || alpha <= 0.001) {
+      // 没有眼型差分（或淡出到 0）→ 精确还原到"原贴图 + 肤色底板 + 静态闭嘴"
+      facial.clearEmotion();
+    } else {
+      facial.setEyes(eyeImage, alpha);
+      facial.setMouth(layer);
+      facial.repaint();
+    }
+
+    if (this.blushChannel) {
+      const level: BlushLevel = face.blush;
+      if (level === 0 || alpha <= 0.001 || !this.expressions?.blush) {
+        this.blushChannel.clear();
+      } else {
+        this.blushChannel.setBlush(this.expressions.blush, level, alpha);
+        this.blushChannel.repaint();
+      }
+    }
+    this.facialRepaints += 1;
+    this.facialLastRepaintMs = Number((performance.now() - startedAt).toFixed(2));
+
+    console.log(
+      `[render] emotion ${this.appliedEmotion === effective ? '=' : '→'} ${effective} ` +
+        `（eyes=${eyeKey ? `${eyeKey}:${eyeImage ? 'loaded' : 'missing'}` : '-'} ` +
+        `mouth=${owner} blush=${face.blush}）`,
+    );
+  }
+
+  private facialDiagnostics(now: number, pat: { pose: PatPose } | null): FacialDiagnostics | null {
+    const facial = this.facial;
+    if (!facial) return null;
+    const snapshot = this.hfsm.snapshot();
+    const speaking = snapshot.speakingUtteranceId !== null;
+    const effective: Emotion = pat ? 'shy' : this.emotion;
+    const face: EmotionFace = EMOTION_FACE[effective] ?? EMOTION_FACE.neutral;
+    const alpha = fadeProgress(now - this.emotionFadeStartedAt, EMOTION_FADE_MS);
+    const owner = resolveMouthOwner({
+      speaking,
+      lipSyncDriven: this.lipSyncDriven,
+      patActive: pat !== null,
+      emotionMouth: face.mouth,
+      alpha,
+    });
+
+    const channel: FacialChannelDiagnostics = facial.diagnostics();
+    const blushDiag = this.blushChannel?.diagnostics() ?? null;
+    return {
+      emotion: this.emotion,
+      effective,
+      eyes: face.eyes,
+      mouthShape: face.mouth,
+      mouthOwner: owner,
+      blush: face.blush,
+      alpha,
+      fading: alpha < 0.999,
+      repaints: this.facialRepaints,
+      lastRepaintMs: this.facialLastRepaintMs,
+      channel: {
+        calibrated: channel.calibrated,
+        eyeCalibrated: channel.eyeCalibrated,
+        eyePixels: channel.eyePixels,
+        mouthPixels: channel.mouthPixels,
+        textureDigest: channel.textureDigest,
+        faceDistance: channel.faceDistance,
+      },
+      blushChannel: blushDiag
+        ? {
+            calibrated: blushDiag.calibrated,
+            mouthPixels: blushDiag.mouthPixels,
+            textureDigest: blushDiag.textureDigest,
+            faceDistance: blushDiag.faceDistance,
+          }
+        : null,
+      assets: {
+        loadedEyes: Object.keys(this.expressions?.eyes ?? {}),
+        blushLoaded: Boolean(this.expressions?.blush),
+        missing: this.expressions?.missing ?? [],
+        eyeImageLabel: facial.eyeImageLabel,
+      },
+    };
+  }
+
   /**
-   * 瀹樻柟绾跨璐磋姳灞傦紙ADR 0026 D7锛夈€?   *
-   * 绾跨鏉ヨ嚜 `FX_TEX_CH0335_Img_Face_01.png`锛堝畼鏂圭粰 3D 灏忎汉鍋氳〃鎯呯敤鐨?3脳3 绾跨锛夛紝
-   * 鎸傚湪澶撮涓嬨€佸弬涓庢繁搴︽祴璇曪紝鍥犳闅忓姩鐢昏蛋涓斾細琚垬娴锋纭伄鎸°€?   * 璐村浘缂哄け鏃舵暣灞備笉鐢熸晥锛屽彧璁颁竴鏉?WARN锛埪?1锛夈€?   */
+   * 官方线稿贴花层（ADR 0026 D7）。
+   *
+   * 线稿来自 `FX_TEX_CH0335_Img_Face_01.png`（官方给 3D 小人做表情用的 3×3 线稿），
+   * 挂在头骨下、参与深度测试，因此随动画走且会被刘海正确遮挡。
+   * 贴图缺失时整层不生效，只记一条 WARN（§11）。
+   */
   private async attachFaceDecal(): Promise<void> {
     const model = this.model;
     if (!model) return;
@@ -608,7 +791,7 @@ class StageRender implements RenderModule {
     ]);
 
     if (!eyesClosed && !mouthLine) {
-      console.warn('[render] 闈㈤儴绾跨璐村浘缂哄け锛岃创鑺卞眰涓嶅惎鐢紙搂11锛?);
+      console.warn('[render] 面部线稿贴图缺失，贴花层不启用（§11）');
       return;
     }
 
@@ -622,19 +805,19 @@ class StageRender implements RenderModule {
 
     const diag = this.decal.diagnostics();
     console.log(
-      `[render] 闈㈤儴璐磋姳 ready=${String(diag.ready)} eyePlanes=${diag.eyePlanes} ` +
+      `[render] 面部贴花 ready=${String(diag.ready)} eyePlanes=${diag.eyePlanes} ` +
         `mouth=${String(diag.mouth)} blush=${String(diag.blush)} ` +
         `eyeCenter=${diag.eyeCenter?.map((value) => value.toFixed(6)).join(',') ?? '(none)'} ` +
         `reason=${diag.reason ?? '-'}`,
     );
   }
 
-  /** 鐪ㄧ溂闂撮殧 2.6鈥?s锛堥殢鏈猴紝閬垮厤鏈烘鎰燂級銆?*/
+  /** 眨眼间隔 2.6–6s（随机，避免机械感）。 */
   private scheduleBlink(now: number): void {
     this.nextBlinkAt = now + 2600 + Math.random() * 3400;
   }
 
-  /** 姣忓抚鎺ㄨ繘鐪ㄧ溂锛氫笁瑙掑寘缁?0鈫?鈫?锛屾€绘椂闀?140ms銆?*/
+  /** 每帧推进眨眼：三角包络 0→1→0，总时长 140ms。 */
   private updateBlink(now: number): void {
     const decal = this.decal;
     if (!decal) return;
@@ -647,7 +830,6 @@ class StageRender implements RenderModule {
       this.blinkStartedAt = now;
     }
 
-    decal.setBlink(1); this.decal?.update(); return;
     const elapsed = now - this.blinkStartedAt;
     const duration = 140;
     if (elapsed >= duration) {
@@ -659,6 +841,51 @@ class StageRender implements RenderModule {
       decal.setBlink(progress < 0.5 ? progress * 2 : (1 - progress) * 2);
     }
     decal.update();
+  }
+
+  /** 拖拽期间的轻微摇摆（ADR 0014 D3）。 */
+  private dragSway(now: number): number {
+    if (this.dragStartedAt === null || this.dragSwayGain <= 0.001) return 0;
+    const elapsedMs = Math.max(0, now - this.dragStartedAt);
+    const ramp = Math.min(1, elapsedMs / DRAG_SWAY_RAMP_MS);
+    const phase = (elapsedMs / 1000 / DRAG_SWAY_PERIOD_S) * Math.PI * 2;
+    return Math.sin(phase) * DRAG_SWAY_RAD * ramp * this.dragSwayGain;
+  }
+
+  /**
+   * ADR 0014 D4：按 Idle 姿态做一次 CPU 蒙皮采样，把最低点对齐内容区底边。
+   * 只在加载与 resize 后执行，不逐帧。
+   */
+  private calibrateGround(): void {
+    const model = this.model;
+    if (!model) return;
+    const minY = measureAnimatedMinY(model.root, model.meshes);
+    if (minY === null || !Number.isFinite(minY)) {
+      console.warn('[render] 地面校正采样失败，保留绑定姿态放置（ADR 0014 D4）');
+      return;
+    }
+    const beforePx = model.root.position.y;
+    this.groundMinYLocal = minY;
+    this.applyPlacement();
+    const afterPx = model.root.position.y;
+    console.log(
+      `[render] 地面校正 minY=${minY.toFixed(6)} 单位 rootY ${beforePx.toFixed(1)} → ${afterPx.toFixed(1)}px ` +
+        `(${(afterPx - beforePx).toFixed(1)}px)`,
+    );
+  }
+
+  /** 模型定标：脚底中心 = 内容区底边中心（ADR 0009 D4）。 */
+  private applyPlacement(): void {
+    if (this.model) {
+      this.model.pixelsPerUnit = placeModel(this.model.root, this.model.frame, this.height);
+      // 地面校正（ADR 0014 D4）：最低点对齐内容区底边；未校正时用绑定姿态
+      if (this.groundMinYLocal !== null) {
+        this.model.root.position.y = -this.groundMinYLocal * this.model.pixelsPerUnit;
+      }
+    }
+    if (this.placeholder) {
+      this.placeholder.group.position.y = -this.height / 2 + PLACEHOLDER_BOTTOM_MARGIN_PX;
+    }
   }
 
   resize(width: number, height: number): void {
@@ -675,44 +902,35 @@ class StageRender implements RenderModule {
     this.applyPlacement();
   }
 
-  private applyPlacement(): void {
-    if (this.model) {
-      this.model.pixelsPerUnit = placeModel(this.model.root, this.model.frame, this.height);
-      // 鍦伴潰鏍℃锛圓DR 0014 D4锛夛細鏈€浣庣偣瀵归綈鍐呭鍖哄簳杈癸紱鏈牎姝ｆ椂鐢ㄧ粦瀹氬Э鎬?      if (this.groundMinYLocal !== null) {
-        this.model.root.position.y = -this.groundMinYLocal * this.model.pixelsPerUnit;
-      }
-    } else if (this.placeholder) {
-      this.placeholder.group.position.set(0, PLACEHOLDER_BOTTOM_MARGIN_PX, 0);
-    }
-  }
-
   handleIntent(intent: string): void {
     if (!isIntent(intent)) {
-      // 濂戠害 搂4.4锛氶檷绾т负 none锛屽啓鍛婅锛屼笉鎶涘紓甯搞€佷笉闅忔満鎾埆鐨勫姩浣?      console.warn(`[render] 鏈煡 intent "${String(intent)}"锛屽凡闄嶇骇涓?none锛堝绾?搂4.4锛塦);
+      // 契约 §4.4：降级为 none，写告警，不抛异常、不随机播别的动作
+      console.warn(`[render] 未知 intent "${String(intent)}"，已降级为 none（契约 §4.4）`);
       return;
     }
     if (intent === 'none') return;
-
-    // ADR 0024 D3锛氬洖寮规湡闂翠笉鎺ュ彈鏂扮殑鍔ㄤ綔鎰忓浘锛堝敮涓€渚嬪鏄噸鏂版嫋鎷斤紝璧?drag_started锛?    if (this.hfsm.snapshot().physics === 'settling') {
-      console.log(`[render] settling 鏈熼棿蹇界暐 intent=${intent}锛圓DR 0024 D3锛塦);
-      return;
-    }
 
     const now = performance.now();
     const last = this.lastIntentAt.get(intent) ?? Number.NEGATIVE_INFINITY;
     if (now - last < INTENT_DEDUPE_MS) return;
     this.lastIntentAt.set(intent, now);
 
+    // ADR 0024 D3：回弹期间不接受新的动作意图（唯一例外是重新拖拽）
+    if (this.hfsm.snapshot().physics === 'settling') {
+      console.log(`[render] settling 期间忽略 intent=${intent}（ADR 0024 D3）`);
+      return;
+    }
+
     if (intent === 'pat_react') {
-      // 涓?head_patted 鍚屼竴鏉″弽搴旇矾寰勶紙搂4.4锛氫綆鏉冮噸娣峰悎锛屼笉寰楁墦鏂彛鍨嬶級
+      // 与 head_patted 同一条反应路径（§4.4：低权重混合，不得打断口型）
       this.hfsm.intent(now, intent, PAT_DURATION_MS);
-      console.log('[render] pat_react锛坕ntent 鍛戒护锛夆啋 reacting');
+      console.log('[render] pat_react（intent 命令）→ reacting');
       return;
     }
 
     const spec = REACTIONS[intent];
     if (!spec) return;
-    // ADR 0023 D2锛氭湁瀹樻柟鐗囨灏辨暣韬挱锛屾病鏈夊氨閫€鍥炵▼搴忓寲浣嶇Щ/缂╂斁
+    // ADR 0023 D2：有官方片段就整身播，没有就退回程序化位移/缩放
     const role = INTENT_CLIP[intent];
     const played = role ? this.playOfficial(role, 'idle', `intent ${intent}`) : false;
     const clipMs = played ? this.oneShotDurationMs() : 0;
@@ -721,62 +939,60 @@ class StageRender implements RenderModule {
   }
 
   /**
-   * 鍐呴儴锛歚evt:broadcast` 鐨勬覆鏌撲晶鍏ュ彛銆傚绾?搂7.3 鐨勮闃呴泦鍚堬細
-   * speech_*锛堝彛鍨嬪眰锛屾湰杞彧璺熼殢鐘舵€侊級銆乨rag_*锛圥hysics锛夈€乭ead_patted锛堜綆鏉冮噸 pat_react锛夈€?   * intent_resolved锛堝彧鍙?emotion锛夈€?   */
+   * 内部：`evt:broadcast` 的渲染侧入口。契约 §7.3 的订阅集合：
+   * speech_*、drag_*、head_patted、intent_resolved、motion_ended。
+   */
   handleEvent(event: BroadcastEvent): void {
     const now = performance.now();
     switch (event.name) {
       case 'speech_started': {
         const payload = event.payload as { utteranceId: string };
         this.hfsm.speechStarted(now, payload.utteranceId);
-        // 搂5.2锛氬彛鍨嬮€氶亾浼樺厛绾ф渶楂樸€傝璇濅竴寮€濮嬪氨绔嬪埢浜よ繕鍢村瀷锛屼笉绛変笅涓€甯с€?        this.lipSyncDriven = true;
-        this.applyFacial(now, true);
-        console.log(`[render] speaking 寮€濮?utteranceId=${payload.utteranceId}锛堝彛鍨嬬敱鍖呯粶椹卞姩锛孉DR 0015 D4锛塦);
+        this.restorePatMouth();
+        this.lipSyncDriven = true;
+        console.log(`[render] speaking 开始 utteranceId=${payload.utteranceId}`);
         break;
       }
       case 'speech_ended': {
         const payload = event.payload as { utteranceId: string; reason: string };
         this.hfsm.speechEnded(now);
-        // 璇村畬/琚墦鏂?澶辫触閮借闂槾锛岄伩鍏?璇村畬寮犵潃鍢?锛圓DR 0015 D4.5锛?        this.resetMouthFrame();
-        console.log(`[render] speaking 缁撴潫 utteranceId=${payload.utteranceId} reason=${payload.reason}`);
+        this.resetMouthFrame();
+        console.log(`[render] speaking 结束 utteranceId=${payload.utteranceId} reason=${payload.reason}`);
         break;
       }
       case 'head_patted': {
         const payload = event.payload as { patCount: number };
-        // ADR 0024 D3锛氬洖寮规湡闂翠笉鎺ュ彈鏂扮殑鎽稿ご锛堥噸鏂版嫋鎷介櫎澶栵級
+        // ADR 0024 D3：回弹期间不接受新的摸头（重新拖拽除外）
         if (this.hfsm.snapshot().physics === 'settling') {
-          console.log('[render] settling 鏈熼棿蹇界暐 head_patted锛圓DR 0024 D3锛?);
+          console.log('[render] settling 期间忽略 head_patted（ADR 0024 D3）');
           break;
         }
         const speaking = this.hfsm.snapshot().speakingUtteranceId !== null;
-        // 搂5.3 / ADR 0023 D4锛氳璇濇湡闂存暣韬墖娈典細璁╀綅缁欏彛鍨嬮€氶亾锛岄€€鍥炵▼搴忓寲鎽稿ご
+        // §5.3 / ADR 0023 D4：说话期间整身片段会让位给口型通道，退回程序化摸头
         const played = !speaking && this.playOfficial('pat', 'idle', 'head_patted');
         this.officialPat = played;
         const clipMs = played ? this.oneShotDurationMs() : 0;
         this.hfsm.headPatted(now, clipMs > 0 ? clipMs : undefined);
         console.log(
-          `[render] head_patted 鈫?reacting patCount=${payload.patCount}` +
-            `锛?{played ? '瀹樻柟鐗囨' : '绋嬪簭鍖?}锛塦,
+          `[render] head_patted → reacting patCount=${payload.patCount}` +
+            `（${played ? '官方片段' : '程序化'}）`,
         );
         break;
       }
       case 'drag_started': {
-        // 搂4.1锛歚walking` 鐨勯€€鍑烘潯浠朵箣涓€鏄鎷栨嫿鎵撴柇鈥斺€斿厛璁╃獥鍙ｅ仠姝ワ紝鍐嶈繘 dragged
+        // §4.1：`walking` 的退出条件之一是被拖拽打断
         this.stopWalk('drag_started');
-        // 琚嫀璧锋潵鏃朵笉鍐嶄繚鎸佽璧版湞鍚戯紙ADR 0026 D1.3锛?        this.walkYawTarget = 0;
         this.hfsm.dragStarted(now);
         this.dragStartedAt = now;
         this.dragging = true;
-        // held 鐩存帴灏辨槸"琚嫀鐫€"鐨勬偓绌哄Э鎬侊紙clip-bank: Formation_Pickup 寰幆锛夛紝
-        // 涓嶅啀鍗曠嫭鎾?pickup 璧峰娍锛岄伩鍏嶅悓涓€娈靛姩鐢昏繛鎾袱娆★紙ADR 0023 D3锛?        this.playAnimation('held', DRAG_IN_CROSSFADE_SECONDS, 'drag_started');
+        this.playAnimation('held', DRAG_IN_CROSSFADE_SECONDS, 'drag_started');
         break;
       }
       case 'drag_released': {
-        // D-6 / ADR 0024 D3锛氭澗鎵嬪厛杩涘叆 settling锛屽洖寮硅繃绋嬩腑娣″洖 Idle
+        // D-6 / ADR 0024 D3：松手先进入 settling，回弹过程中淡回 Idle
         this.hfsm.dragReleased(now);
         this.dragging = false;
-        this.walkYawTarget = 0;
-        this.playAnimation('idle', SETTLE_FADE_SECONDS, 'drag_released 鈫?settling锛堝洖寮逛腑锛?);
+        this.playAnimation('idle', SETTLE_FADE_SECONDS, 'drag_released → settling（回弹中）');
         break;
       }
       case 'motion_ended': {
@@ -784,36 +1000,25 @@ class StageRender implements RenderModule {
         const reason = typeof payload.reason === 'string' ? payload.reason : 'unknown';
         if (payload.kind === 'walk') {
           this.walkingPlan = null;
-          // 鍋滀笅鍗宠浆鍥炴闈紙ADR 0026 D1.2锛?          this.walkYawTarget = 0;
+          this.walkYawTarget = 0;
           this.hfsm.walkEnded(now);
           this.playAnimation('idle', WALK_OUT_FADE_SECONDS, `motion_ended(walk,${reason})`);
           break;
         }
         if (payload.kind === 'settle') {
           this.hfsm.settleEnded(now);
-          // 钀藉湴缂撳啿锛氭瀬鐭殑涓嬭共锛圓DR 0024 D3锛夛紝涓嶅弬涓庣獥鍙ｄ綅绉?          this.reaction = {
-            spec: { durationMs: SETTLE_SQUASH_MS, squash: SETTLE_SQUASH_RATIO },
+          // 落地缓冲：极短的下蹲（ADR 0024 D3），不参与窗口位移
+          this.reaction = {
+            spec: { durationMs: 180, squash: 0.06 },
             startedAt: now,
           };
-          console.log(`[render] 鍥炲脊缁撴潫锛?{reason}锛夆啋 钀藉湴缂撳啿 ${SETTLE_SQUASH_MS}ms`);
+          console.log(`[render] 回弹结束（${reason}）→ 落地缓冲 180ms`);
         }
         break;
       }
       case 'intent_resolved': {
         const payload = event.payload as { emotion: Emotion };
-        const previous = this.emotion;
         this.emotion = payload.emotion;
-        // 搂5.2锛氭柊 emotion 浠?0.25s 娣″叆锛坄applyFacial` 鍐呰鏃讹級
-        this.applyFacial(now, true);
-        if (previous !== payload.emotion) {
-          const face = EMOTION_FACE[payload.emotion] ?? EMOTION_FACE.neutral;
-          const eyeLoaded = face.eyes ? this.expressions?.eyes[face.eyes] !== undefined : false;
-          const eyeLabel = face.eyes ? `${face.eyes}:${eyeLoaded ? 'loaded' : 'missing'}` : '-';
-          console.log(
-            `[render] emotion ${previous} 鈫?${payload.emotion} ` +
-              `锛坋yes=${eyeLabel} mouth=${face.mouth} blush=${face.blush}锛塦,
-          );
-        }
         break;
       }
       default:
@@ -821,120 +1026,10 @@ class StageRender implements RenderModule {
     }
   }
 
-  private playAnimation(slot: AnimationSlot, fadeSeconds: number, reason: string): void {
-    if (!this.animations) return;
-    const ok = this.animations.play(slot, fadeSeconds);
-    const current = this.animations.current();
-    if (ok) {
-      console.log(`[render] 鍔ㄤ綔鍒囨崲 ${reason} 鈫?${slot}=${String(current.name)}锛坈rossFade ${fadeSeconds}s锛塦);
-    } else {
-      console.warn(`[render] 鍔ㄤ綔鍒囨崲澶辫触 ${reason} 鈫?${slot}锛堢墖娈电己澶憋紝淇濇寔褰撳墠鍔ㄤ綔锛塦);
-    }
-  }
-
-  /**
-   * ADR 0023锛氫紭鍏堟挱瀹樻柟鐗囨銆?   * 杩斿洖 false 琛ㄧず璧勪骇閲屾病鏈夊搴旂墖娈碉紝璋冪敤鏂瑰簲閫€鍥炵▼搴忓寲闄嶇骇璺緞銆?   */
-  private playOfficial(role: ClipRole, returnTo: AnimationSlot, reason: string): boolean {
-    const animations = this.animations;
-    if (!animations) return false;
-    const ok = animations.playOnce(role, { returnTo });
-    const one = animations.oneShot();
-    if (ok) {
-      console.log(
-        `[render] 瀹樻柟鐗囨 ${reason} 鈫?${role}=${String(one?.name)}` +
-          `锛?{one ? one.duration.toFixed(2) : '?'}s锛屾挱瀹屽洖 ${returnTo}锛塦,
-      );
-    } else {
-      console.log(`[render] 瀹樻柟鐗囨缂哄け ${reason} 鈫?${role}锛岃蛋绋嬪簭鍖栭檷绾);
-    }
-    return ok;
-  }
-
-  /** 涓€娆℃€х墖娈电殑鏃堕暱锛堟绉掞級锛涚敤浜庤 HFSM 鐨?reacting 涓庡姩鐢诲悓瀵垮懡銆?*/
-  private oneShotDurationMs(): number {
-    const one = this.animations?.oneShot();
-    return one ? one.duration * 1000 : 0;
-  }
-
-  /** ADR 0023 D5锛氭帓涓嬩竴娆″緟鏈哄Э鎬佽疆鎹€?*/
-  private scheduleIdleVariant(now: number): void {
-    const span = IDLE_VARIANT_MAX_MS - IDLE_VARIANT_MIN_MS;
-    this.idleVariantAt = now + IDLE_VARIANT_MIN_MS + Math.random() * span;
-  }
-
-  /** ADR 0023 D5锛氬湪寰呮満濮挎€佷箣闂翠氦鍙夋贰鍏ワ紝閬垮厤闀挎椂闂寸湅鍑哄惊鐜€?*/
-  private rotateIdleVariant(now: number): void {
-    this.scheduleIdleVariant(now);
-    const animations = this.animations;
-    if (!animations || IDLE_VARIANT_ROLES.length < 2) return;
-    const candidates = IDLE_VARIANT_ROLES.filter((role) => role !== this.idleVariantRole);
-    if (candidates.length === 0) return;
-    const role = candidates[Math.floor(Math.random() * candidates.length)];
-    if (animations.playRole(role, IDLE_VARIANT_FADE_SECONDS, 'idle')) {
-      this.idleVariantRole = role;
-      console.log(`[render] 寰呮満濮挎€佽疆鎹?鈫?${role}=${String(animations.roles[role].name)}`);
-    }
-  }
-
-  /**
-   * ADR 0024 D1锛氳繘鍏?`walking`銆?   * 浣嶇Щ**涓嶄娇鐢ㄥ姩鐢婚噷鐨?root motion**鈥斺€旂獥鍙ｄ綅缃敱 `cmd:walk` 浜ょ粰 shell 鐨勭函鍑芥暟鐗╃悊锛?   * 杩欓噷鍙礋璐ｆ崲鍔ㄤ綔涓庤褰曡鍒掞紝閬垮厤"鍔ㄧ敾鎺ㄧ潃绐楀彛婕傜Щ"銆?   */
-  private beginWalk(plan: WalkPlan, now: number): void {
-    this.walkingPlan = plan;
-    // ADR 0026 D1锛氳捣韬氨杞悜绉诲姩鏂瑰悜锛埪?0掳锛夛紝鐢?`updateFrame` 鎸囨暟閫艰繎
-    this.walkYawTarget = walkYawFor(plan.direction);
-    this.scheduleIdleVariant(now);
-    const played = this.animations?.playRole('walk', WALK_IN_FADE_SECONDS, 'walk') ?? false;
-    this.options.onWalkRequest?.({
-      phase: 'start',
-      direction: plan.direction,
-      distancePx: plan.distancePx,
-    });
-    console.log(
-      `[render] walking 寮€濮?direction=${plan.direction} distance=${plan.distancePx}px ` +
-        `clip=${played ? String(this.animations?.roles.walk.name) : '(缂哄け锛屽師鍦颁笉鍔?'}`,
-    );
-  }
-
-  /** 鏀舵锛氳姹?shell 鍋滀笅锛屽苟娣″洖 Idle锛堝埌杈?/ 鎾炶竟 / 琚嫋鎷芥墦鏂兘璧拌繖閲岋級銆?*/
-  private stopWalk(reason: string): void {
-    if (!this.walkingPlan) return;
-    this.walkingPlan = null;
-    // ADR 0026 D1.2锛氬仠涓嬪嵆杞洖姝ｉ潰
-    this.walkYawTarget = 0;
-    this.options.onWalkRequest?.({ phase: 'stop' });
-    this.playAnimation('idle', WALK_OUT_FADE_SECONDS, `stopWalk(${reason})`);
-  }
-
-  getState(): RenderState {
-    const snapshot = this.hfsm.snapshot();
-    const pat = this.patState(performance.now());
-    return {
-      base: snapshot.base,
-      overlay: snapshot.overlay,
-      physics: snapshot.physics,
-      // 搂5.3 / 搂4.5锛氳鎽稿ご鏈熼棿涓存椂鎶曞奖涓?shy锛岀粨鏉熷悗鍥炲埌 intent_resolved 鐨?emotion
-      emotion: pat ? 'shy' : this.emotion,
-      speakingUtteranceId: snapshot.speakingUtteranceId,
-      // 濂戠害 搂7.1锛?.3.0 / ADR 0008锛夛細Orch.idle = 缂栨帓灞傛病鏈夊湪閫旇瘽璇€?      orchestrator: 'idle',
-      // 搂7.3锛氬彧鏈夌湡瀹炴ā鍨嬪姞杞芥垚鍔燂紙涓斿叧閿楠奸綈鍏級鎵嶆槸 ready锛涘惁鍒欏崰浣嶈兌鍥婁綋
-      modelReady: this.ready,
-    };
-  }
-
   setCursor(cssX: number, cssY: number, at: number = performance.now()): void {
     this.gaze?.setCursor(cssX, cssY, at);
   }
 
-  /** 鍐呴儴锛堥潪濂戠害锛夛細鑷鎶?20鈥?0s 鐨勮皟搴﹂棿闅斿帇鍒?1.5鈥?s锛岃 搂16.2 鐨勮嚜妫€璇存槑銆?*/
-  setWalkInterval(minIntervalMs: number, maxIntervalMs: number): void {
-    if (!Number.isFinite(minIntervalMs) || !Number.isFinite(maxIntervalMs)) return;
-    if (minIntervalMs <= 0 || maxIntervalMs < minIntervalMs) return;
-    this.hfsm.setWalkSchedule({ minIntervalMs, maxIntervalMs }, performance.now());
-    console.log(`[render] 琛岃蛋璋冨害闂撮殧鏀逛负 ${minIntervalMs}鈥?{maxIntervalMs}ms锛堣嚜妫€鐢級`);
-  }
-
-  /**
-   * 璇煶鍙ｅ瀷锛氬彧鎺ュ彈 0..甯ф暟-1锛岄噸澶嶅抚涓嶉噸缁橈紙ADR 0010 鐨?鈮?0Hz 棰勭畻鐢辨挱鏀惧櫒淇濊瘉锛夈€?   * 鍙ｅ瀷閫氶亾浼樺厛绾ф渶楂橈紙搂5.2锛夛細`applyFacial` 閲屽彛鍨嬪眰姘歌繙鍘嬭繃琛ㄦ儏灞傦紙ADR 0026 D3锛夈€?   */
   setMouthFrame(frame: number): void {
     const count = MOUTH_FRAME_COUNT;
     const clamped = Math.max(0, Math.min(count - 1, Math.round(frame)));
@@ -950,196 +1045,36 @@ class StageRender implements RenderModule {
     this.applyFacial(performance.now());
   }
 
-  /**
-   * 琛ㄦ儏灞傜殑鍞竴瑁呴厤鐐癸紙ADR 0026 D3/D6锛夛細鍏堟寜 搂5.2 鐨勯€氶亾浼樺厛绾х畻鍑?鍢寸敱璋佽礋璐?锛?   * 鍐嶆妸瀹樻柟鐪煎瀷宸垎 / 鍢村瀷 / 绾㈡檿浜ょ粰涓ゆ潯璐村浘閫氶亾銆傜姸鎬佹棤鍙樺寲鏃朵笉閲嶇粯銆?   */
-  private applyFacial(now: number, force = false): void {
-    const facial = this.facial;
-    if (!facial) return;
-
-    const state = this.resolveFacialState(now);
-    const key = [
-      state.face.eyes ?? '-',
-      state.face.mouth,
-      state.face.blush,
-      state.eyeReady ? 'eye' : 'noeye',
-      state.blushReady ? 'blush' : 'noblush',
-      state.owner,
-      state.layer.kind === 'atlas' ? `a${state.layer.frame}/${state.layer.frameCount}` : state.layer.kind,
-      state.alpha.toFixed(3),
-    ].join('|');
-
-    if (!force && key === this.facialKey) return;
-    this.facialKey = key;
-
-    const startedAt = performance.now();
-    facial.setEyes(state.eyeImage, state.alpha);
-    facial.setMouth(state.layer);
-    const painted = facial.repaint();
-    this.blushChannel?.setBlush(state.blushImage, state.face.blush, state.blushAlpha);
-    const blushPainted = this.blushChannel?.repaint() ?? 0;
-    this.facialRepaints += 1;
-    this.facialLastRepaintMs = performance.now() - startedAt;
-    this.facialLastPainted = painted + blushPainted;
+  setWalkInterval(minIntervalMs: number, maxIntervalMs: number): void {
+    if (!Number.isFinite(minIntervalMs) || !Number.isFinite(maxIntervalMs)) return;
+    if (minIntervalMs <= 0 || maxIntervalMs < minIntervalMs) return;
+    this.hfsm.setWalkSchedule({ minIntervalMs, maxIntervalMs }, performance.now());
+    console.log(`[render] 行走调度间隔改为 ${minIntervalMs}–${maxIntervalMs}ms（自检用）`);
   }
 
-  /**
-   * 閫氶亾浠茶锛堢函璁＄畻锛屼笉鏀圭姸鎬侊級锛氬彛鍨?> 鎽稿ご > 琛ㄦ儏 > 闈欐€侀棴鍢达紙搂5.2 / 搂5.3锛夈€?   * 琛ㄦ儏娣″叆杩涘害涔熷湪杩欓噷绠楋紙搂5.2 鐨?0.25s锛夈€?   */
-  private resolveFacialState(now: number): {
-    effective: Emotion;
-    face: EmotionFace;
-    owner: MouthOwner;
-    layer: MouthLayer;
-    alpha: number;
-    blushAlpha: number;
-    eyeImage: PixelImage | null;
-    blushImage: PixelImage | null;
-    eyeReady: boolean;
-    blushReady: boolean;
-  } {
+  getState(): RenderState {
     const snapshot = this.hfsm.snapshot();
-    const pat = this.patState(now);
-    const effective: Emotion = pat ? 'shy' : this.emotion;
-    const face = EMOTION_FACE[effective] ?? EMOTION_FACE.neutral;
-
-    if (effective !== this.appliedEmotion) {
-      this.appliedEmotion = effective;
-      this.emotionFadeStartedAt = now;
-    }
-    const progress = fadeProgress(now - this.emotionFadeStartedAt, EMOTION_FADE_MS);
-    const quantized = Math.round(progress * EMOTION_FADE_STEPS) / EMOTION_FADE_STEPS;
-    // neutral 娌℃湁鍥惧厓锛屾贰鍏ョ郴鏁版棤鎰忎箟锛堢洿鎺ュ洖鍒伴潤鎬佸簳鍥撅級
-    const alpha = effective === 'neutral' ? 1 : quantized;
-
-    const speaking = snapshot.speakingUtteranceId !== null;
-    const owner = resolveMouthOwner({
-      speaking,
-      lipSyncDriven: this.lipSyncDriven,
-      patActive: pat !== null && pat.pose.allowMouthChange,
-      emotionMouth: face.mouth,
-      alpha,
-    });
-    let layer: MouthLayer;
-    if (owner === 'lip-sync') {
-      layer = { kind: 'atlas', frame: this.lipSyncFrame, frameCount: MOUTH_FRAME_COUNT };
-    } else if (owner === 'pat') {
-      layer = { kind: 'atlas', frame: PAT_MOUTH_FRAME, frameCount: MOUTH_FRAME_COUNT };
-    } else if (owner === 'emotion') {
-      layer = { kind: 'glyph', shape: face.mouth };
-    } else {
-      layer = { kind: 'static' };
-    }
-    this.patMouthActive = owner === 'pat';
-
-    // 瀹樻柟宸垎缂哄け 鈫?璇ュ眰缃┖锛堥檷绾э細鍙彉鍢村瀷銆佷繚鎸侀粯璁ょ溂 / 涓嶅彔绾㈡檿锛?    const eyeImage = face.eyes ? this.expressions?.eyes[face.eyes] ?? null : null;
-    const blushImage = this.expressions?.blush ?? null;
-
     return {
-      effective,
-      face,
-      owner,
-      layer,
-      alpha,
-      blushAlpha: face.blush > 0 ? alpha : 0,
-      eyeImage,
-      blushImage,
-      eyeReady: eyeImage !== null,
-      blushReady: blushImage !== null && face.blush > 0,
-    };
-  }
-
-  private facialDiagnostics(now: number, pat: PatState | null): FacialDiagnostics {
-    // 鍙锛氳繖閲屼笉鍚姩娣″叆璁℃椂锛岄伩鍏嶈瘖鏂皟鐢ㄦ敼鍙樿涓?    const effective: Emotion = pat ? 'shy' : this.emotion;
-    const face = EMOTION_FACE[effective] ?? EMOTION_FACE.neutral;
-    const alpha =
-      effective === 'neutral'
-        ? 1
-        : fadeProgress(now - this.emotionFadeStartedAt, EMOTION_FADE_MS);
-    return {
+      base: snapshot.base,
+      overlay: snapshot.overlay,
+      physics: snapshot.physics,
       emotion: this.emotion,
-      effective,
-      eyes: face.eyes,
-      mouthShape: face.mouth,
-      mouthOwner: resolveMouthOwner({
-        speaking: this.hfsm.snapshot().speakingUtteranceId !== null,
-        lipSyncDriven: this.lipSyncDriven,
-        patActive: this.patMouthActive,
-        emotionMouth: face.mouth,
-        alpha,
-      }),
-      blush: face.blush,
-      alpha: Number(alpha.toFixed(3)),
-      fading: alpha < 0.999 && effective !== 'neutral',
-      repaints: this.facialRepaints,
-      lastRepaintMs:
-        this.facialLastRepaintMs === null ? null : Number(this.facialLastRepaintMs.toFixed(2)),
-      channel: this.facial?.diagnostics() ?? null,
-      blushChannel: this.blushChannel?.diagnostics() ?? null,
-      assets: {
-        loadedEyes: Object.keys(this.expressions?.eyes ?? {}) as EyeAssetKey[],
-        blushLoaded: Boolean(this.expressions?.blush),
-        missing: this.expressions?.missing ?? [],
-        eyeImageLabel: this.facial?.eyeImageLabel ?? null,
-      },
+      speakingUtteranceId: snapshot.speakingUtteranceId,
+      // 契约 §7.1（ADR 0008）：Orch.idle = 编排层没有在途话语
+      orchestrator: 'idle',
+      // §7.3：只有真实模型加载成功（且关键骨骼齐全）才是 ready
+      modelReady: this.ready,
     };
   }
-
 
   getDiagnostics(): RenderDiagnostics {
     const model = this.model;
     const now = performance.now();
     const snapshot = this.hfsm.snapshot();
-    const pat = this.patState(now);
-
-    const gaze = this.gaze?.state() ?? {
-      yaw: 0,
-      pitch: 0,
-      targetYaw: 0,
-      targetPitch: 0,
-      idle: true,
-      submitted: false,
-    };
-
-    const animations = this.animations;
-    const animation: AnimationDiagnostics | null = animations
-      ? {
-          clipCount: animations.clipNames.length,
-          clips: animations.clipNames,
-          idle: {
-            name: animations.selection.idle.name,
-            reason: animations.selection.idle.reason,
-            preferred: animations.selection.idle.preferred,
-          },
-          held: {
-            name: animations.selection.held.name,
-            reason: animations.selection.held.reason,
-            preferred: animations.selection.held.preferred,
-          },
-          walk: {
-            name: animations.selection.walk.name,
-            reason: animations.selection.walk.reason,
-            preferred: animations.selection.walk.preferred,
-          },
-          roles: Object.values(animations.roles).map((role) => ({
-            role: role.role,
-            name: role.name,
-            reason: role.reason,
-            preferred: role.preferred,
-            loop: role.loop,
-          })),
-          oneShot: animations.oneShot(),
-          current: animations.current(),
-          actions: animations.actions(),
-          groundCorrectionPx:
-            model && this.groundMinYLocal !== null
-              ? Number((-this.groundMinYLocal * model.pixelsPerUnit).toFixed(1))
-              : null,
-        }
-      : null;
 
     return {
       ready: this.ready,
       loading: this.loading,
-      fallback: !this.ready,
       error: this.error,
       modelId: model?.modelId ?? null,
       loadMs: model?.loadMs ?? null,
@@ -1164,40 +1099,72 @@ class StageRender implements RenderModule {
         atlasLoaded: this.atlasLoaded,
         calibrated: this.facial?.calibrated ?? false,
       },
-      facial: this.facialDiagnostics(now, pat),
+      gaze: this.gaze?.state() ?? {
+        yaw: 0,
+        pitch: 0,
+        targetYaw: 0,
+        targetPitch: 0,
+        idle: true,
+        submitted: false,
+      },
+      animation: this.animations
+        ? {
+            clipCount: this.animations.clipNames.length,
+            clips: this.animations.clipNames,
+            idle: {
+              name: this.animations.selection.idle.name,
+              reason: this.animations.selection.idle.reason,
+              preferred: this.animations.selection.idle.preferred,
+            },
+            held: {
+              name: this.animations.selection.held.name,
+              reason: this.animations.selection.held.reason,
+              preferred: this.animations.selection.held.preferred,
+            },
+            walk: {
+              name: this.animations.selection.walk.name,
+              reason: this.animations.selection.walk.reason,
+              preferred: this.animations.selection.walk.preferred,
+            },
+            current: this.animations.current(),
+            actions: this.animations.actions(),
+            groundCorrectionPx:
+              model && this.groundMinYLocal !== null
+                ? Number((-this.groundMinYLocal * model.pixelsPerUnit).toFixed(1))
+                : null,
+          }
+        : null,
+      facial: this.facialDiagnostics(now, this.patState(now)),
       decal: this.decal?.diagnostics() ?? null,
-      gaze,
-      animation,
       hfsm: snapshot,
       motion: {
         base: snapshot.base,
         physics: snapshot.physics,
         walking: this.walkingPlan,
         nextWalkInMs:
-          this.hfsm.nextWalkAt === null
-            ? null
-            : Math.max(0, Math.round(this.hfsm.nextWalkAt - now)),
-        walkYaw: Number(this.walkYaw.toFixed(4)),
-        walkYawTarget: Number(this.walkYawTarget.toFixed(4)),
+          this.hfsm.nextWalkAt === null ? null : Math.max(0, Math.round(this.hfsm.nextWalkAt - now)),
+        walkYaw: this.walkYaw,
+        walkYawTarget: this.walkYawTarget,
       },
-      pat: {
-        active: pat !== null,
-        weight: pat?.pose.weight ?? 0,
-        allowMouthChange: pat?.pose.allowMouthChange ?? true,
-        mouthFrame: this.patMouthActive ? PAT_MOUTH_FRAME : 0,
-      },
-      speech: {
-        frame: this.lipSyncFrame,
-        driven: this.lipSyncDriven,
-      },
+      pat: (() => {
+        const pat = this.patState(now);
+        return {
+          active: pat !== null,
+          weight: pat?.pose.weight ?? 0,
+          allowMouthChange: pat?.pose.allowMouthChange ?? true,
+          mouthFrame: this.patMouthActive ? PAT_MOUTH_FRAME : 0,
+        };
+      })(),
+      speech: { frame: this.lipSyncFrame, driven: this.lipSyncDriven },
       probePoints: this.computeProbePoints(),
     };
   }
 
   /**
-   * 鑷鐢ㄧ殑鎺㈤拡鐐癸紙涓嶆槸鐢熶骇璺緞锛夛細
-   * - head锛氬彇鏅寘鍥寸洅椤堕儴寰€涓?17%锛堣惤鍦?R-10 鎺╄啘澶撮儴甯﹀唴锛岄伩寮€澶撮《杈圭紭锛夛紱
-   * - body锛氫紭鍏堢敤 Pelvis 楠ㄩ鐨勪笘鐣屼綅缃紝缂哄け鏃堕€€鍥炲彇鏅寘鍥寸洅 45% 楂樺害銆?   */
+   * 自检用的探针点（不是生产路径）：
+   * - head：取景包围盒顶部往下 17%（落在 R-10 掩膜头部带内）；
+   * - body：优先用 Pelvis 骨骼的世界位置，缺失时退回取景包围盒 45% 高度。
+   */
   private computeProbePoints(): {
     head: { x: number; y: number } | null;
     body: { x: number; y: number } | null;
@@ -1230,11 +1197,6 @@ class StageRender implements RenderModule {
     if (this.frameHandle !== null) cancelAnimationFrame(this.frameHandle);
     this.frameHandle = null;
     this.maskCapture.stop();
-    this.animations?.dispose();
-    this.arbiter?.reset();
-    this.gaze?.dispose();
-    this.facial?.dispose();
-    this.blushChannel?.dispose();
     this.model?.dispose();
     this.placeholder?.dispose();
     this.renderer.dispose();
@@ -1245,7 +1207,8 @@ class StageRender implements RenderModule {
     this.updateFrame(now);
     this.renderer.render(this.scene, this.camera);
 
-    // 棣栧抚娓叉煋瀹屾垚鍚庡啀鍙?model_ready锛埪?.3锛?鍔犺浇瀹屾垚涓旈甯у彲娓叉煋"锛?    if (this.readyPending && this.model) {
+    // 首帧渲染完成后再发 model_ready（§6.3："加载完成且首帧可渲染"）
+    if (this.readyPending && this.model) {
       this.readyPending = false;
       const payload = { modelId: this.model.modelId, loadMs: this.model.loadMs };
       this.options.onModelReady?.(payload);
@@ -1257,62 +1220,57 @@ class StageRender implements RenderModule {
     this.frameHandle = requestAnimationFrame(this.handleFrame);
   };
 
-  private patState(now: number): PatState | null {
-    const snapshot = this.hfsm.snapshot();
-    const reaction = snapshot.reaction;
-    if (!reaction) return null;
-    const isPat = reaction.kind === 'head_patted' || reaction.intent === 'pat_react';
-    if (!isPat) return null;
-    const progress = (now - reaction.startedAt) / reaction.durationMs;
-    if (progress >= 1) return null;
-    const speaking = snapshot.speakingUtteranceId !== null;
-    return { pose: patPose(progress, speaking), progress };
-  }
-
   private updateFrame(now: number): void {
     const dt = Math.min(100, Math.max(0, now - this.lastFrameAt)) / 1000;
     this.lastFrameAt = now;
 
-    // HFSM锛氫竴娆℃€у弽搴旀寜鏃堕暱鑷剤 + Base 灞傝璧拌皟搴︼紙搂4.1 / ADR 0024 D1锛?    const hfsmTick = this.hfsm.tick(now);
+    // HFSM：一次性反应自愈 + Base 层行走调度（§4.1 / ADR 0024 D1）
+    const hfsmTick = this.hfsm.tick(now);
     if (hfsmTick.startWalk) this.beginWalk(hfsmTick.startWalk, now);
 
-    // ADR 0023锛氬畼鏂圭墖娈垫槸鍚︽鍦ㄦ壙鎷呮懜澶达紙鏄垯涓嶅啀鍙犲姞绋嬪簭鍖栧ご閮ㄥ亸绉伙級
+    // ADR 0026 D1：行走朝向指数逼近（与 look 共用 Y 轴通道，见第 6 步）
+    this.walkYaw = approach(this.walkYaw, this.walkYawTarget, dt, 9);
+
     const oneShot = this.animations?.oneShot() ?? null;
     this.officialPat = oneShot?.role === 'pat';
+    const snapshot = this.hfsm.snapshot();
 
-    // ADR 0023 D5锛氱┖闂叉椂杞崲寰呮満濮挎€侊紙鎷栨嫿銆佽璧颁笌涓€娆℃€ф紨鍑烘湡闂翠笉鎹級
-    const hfsmSnapshot = this.hfsm.snapshot();
+    // ADR 0023 D5：空闲时轮换待机姿态（拖拽、行走与一次性演出期间不换）
     if (
       !this.dragging &&
       !oneShot &&
-      hfsmSnapshot.base === 'idle' &&
-      hfsmSnapshot.physics === null &&
+      snapshot.base === 'idle' &&
+      snapshot.physics === null &&
       now >= this.idleVariantAt
     ) {
       this.rotateIdleVariant(now);
     }
 
-    // 1) AnimationMixer锛圓DR 0014 D1锛氬叏甯у彧鍏佽鍦ㄨ繖閲?update锛?    this.animations?.update(dt);
+    // 1) AnimationMixer（ADR 0014 D1：全帧只允许在这里 update）
+    this.animations?.update(dt);
 
-    // 2) 楠ㄩ浠茶锛氭姄鍙栨湰甯у姩鐢诲熀搴曞苟娓呴浂鍙犲姞閲?    this.arbiter?.beginFrame();
+    // 2) 骨骼仲裁：抓取本帧动画基底并清零叠加量
+    this.arbiter?.beginFrame();
 
-    // 3) 瑙嗙嚎閫氶亾鍙犲姞锛堝悎鎴愬湪鍔ㄧ敾濮挎€佷箣涓婏紝鑰屼笉鏄鐩栫粦瀹氬Э鎬侊級
+    // 3) 视线通道叠加（合成在动画姿态之上，而不是覆盖绑定姿态）
     if (this.gaze && this.arbiter) {
       this.gaze.update(now, this.width, this.height, this.arbiter);
     }
 
-    // 4) 鍙嶅簲閫氶亾鍙犲姞锛坧at_react 鐨勫ご閮ㄥ悗浠?渚у€撅級
+    // 4) 反应通道叠加（pat_react 的头部后仰/侧倾）
     const pat = this.patState(now);
     const head = this.model?.bones.head ?? null;
-    // 瀹樻柟鐗囨鑷繁浼氬姩澶?鍔ㄨ韩浣擄紝绋嬪簭鍖栧悗浠般€佷晶鍊俱€佸墠鍊惧彧鍦ㄩ檷绾ц矾寰勫彔鍔狅紙ADR 0023 D4锛?    if (pat && head && this.arbiter && !this.officialPat) {
+    // 官方片段自己会动头/动身体，程序化后仰、侧倾只在降级路径叠加（ADR 0023 D4）
+    if (pat && head && this.arbiter && !this.officialPat) {
       this.arbiter.add(head, 0, pat.pose.headPitch, pat.pose.headRoll);
     }
-    this.applyFacial(now);
+    this.syncPatMouth(pat);
 
-    // 5) 鍐欏洖鏈€缁堝洓鍏冩暟锛堟瘡鏍瑰彈鎺ч楠煎彧鍐欎竴娆★級
+    // 5) 写回最终四元数（每根受控骨骼只写一次）
     this.arbiter?.endFrame();
 
-    // 6) Physics / 鍙嶅簲鏍瑰彉鎹?    let hop = 0;
+    // 6) Physics / 反应根变换
+    let hop = 0;
     let tilt = 0;
     let look = 0;
     let squash = 0;
@@ -1342,27 +1300,20 @@ class StageRender implements RenderModule {
     this.dragLiftPx += (liftTarget - this.dragLiftPx) * smooth;
 
     const sway = this.dragSway(now);
-    // ADR 0026 D1锛氳璧版湞鍚?= 鐩爣鍋忚埅鐨勬寚鏁伴€艰繎锛涘仠涓嬭嚜鍔ㄥ洖姝ｏ紙`walkYawTarget = 0`锛?    this.walkYaw = approach(this.walkYaw, this.walkYawTarget, dt, WALK_TURN_RATE);
     this.animationRoot.position.y = -this.height / 2 + hop - this.dragLiftPx;
     this.animationRoot.rotation.z =
       tilt + sway + (this.officialPat ? 0 : (pat?.pose.bodyLean ?? 0));
-    // 杞韩涓?`look` 鍙嶅簲鍏辩敤鍚屼竴涓?Y 杞撮€氶亾锛氬彔鍔犺€屼笉鏄簰鐩歌鐩?    this.animationRoot.rotation.y = look + this.walkYaw;
+    // 转身与 `look` 反应共用同一个 Y 轴通道：叠加而不是互相覆盖
+    this.animationRoot.rotation.y = look + this.walkYaw;
     this.animationRoot.scale.set(1, 1 - squash, 1);
 
-    // 璐磋姳灞傛渶鍚庢洿鏂帮細姝ゆ椂楠ㄩ濮挎€佸凡瀹氾紝璐磋姳璺熺潃澶撮璧帮紙ADR 0026 D7锛?    this.updateBlink(now);
-  }
-
-  /** 鎷栨嫿鏈熼棿鐨勮交寰憞鎽嗭紙ADR 0014 D3 / 鏈疆"鍙互鏁翠綋杞诲井鎽囨憜"锛夈€?*/
-  private dragSway(now: number): number {
-    if (this.dragStartedAt === null || this.dragSwayGain <= 0.001) return 0;
-    const elapsedMs = Math.max(0, now - this.dragStartedAt);
-    const ramp = Math.min(1, elapsedMs / DRAG_SWAY_RAMP_MS);
-    const phase = (elapsedMs / 1000 / DRAG_SWAY_PERIOD_S) * Math.PI * 2;
-    return Math.sin(phase) * DRAG_SWAY_RAD * ramp * this.dragSwayGain;
+    // 7) 面部：表情/口型合成（脏矩形重绘）+ 官方线稿贴花（眨眼）
+    this.applyFacial(now);
+    this.updateBlink(now);
   }
 }
 
-/** 娓叉煋渚т竴娆″垱寤轰袱涓璞★細搂7.3 鐨勫叕鍏辨帴鍙ｏ紝浠ュ強鍐呴儴鐨勬帺鑶滈噰闆嗗櫒銆?*/
+/** 渲染侧一次创建两个对象：§7.3 的公共接口，以及内部的掩膜采集器。 */
 export interface RenderBundle {
   module: RenderModule;
   mask: MaskCapture;
@@ -1375,4 +1326,3 @@ export function createRenderModule(
   const instance = new StageRender(canvas, options);
   return { module: instance, mask: instance.maskCapture };
 }
-
