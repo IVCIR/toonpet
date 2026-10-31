@@ -15,7 +15,7 @@ import { EXPRESSION_FILES } from '../../shared/expression-files';
 import { DEFAULT_FRAME_EXCLUDE } from '../../shared/model-frame';
 
 export const DEFAULT_MODEL_FILE = 'CH0335.glb';
-export const DEFAULT_MOUTH_ATLAS_FILE = 'Character_Mouth_Black-Due3Gpre.png';
+export const DEFAULT_MOUTH_ATLAS_FILE = 'Character_Mouth_High-BgFqI_9W.png';
 /** 官方表情差分目录（ADR 0026 D6）；不存在时表情系统降级为"只变嘴型" */
 export const DEFAULT_EXPRESSIONS_DIR = 'data/expressions';
 
