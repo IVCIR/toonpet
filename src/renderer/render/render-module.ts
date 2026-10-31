@@ -681,13 +681,15 @@ class StageRender implements RenderModule {
     this.facialKey = key;
 
     const startedAt = performance.now();
+    let painted = 0;
     if (eyeKey === null || alpha <= 0.001) {
       // 没有眼型差分（或淡出到 0）→ 精确还原到"原贴图 + 肤色底板 + 静态闭嘴"
       facial.clearEmotion();
+      painted = -1;
     } else {
       facial.setEyes(eyeImage, alpha);
       facial.setMouth(layer);
-      facial.repaint();
+      painted = facial.repaint();
     }
 
     if (this.blushChannel) {
@@ -705,7 +707,8 @@ class StageRender implements RenderModule {
     console.log(
       `[render] emotion ${this.appliedEmotion === effective ? '=' : '→'} ${effective} ` +
         `（eyes=${eyeKey ? `${eyeKey}:${eyeImage ? 'loaded' : 'missing'}` : '-'} ` +
-        `mouth=${owner} blush=${face.blush}）`,
+        `mouth=${owner} blush=${face.blush} painted=${painted} ` +
+        `dist=${facial.diagnostics().faceDistance?.toFixed(4) ?? '-'}）`,
     );
   }
 
@@ -1019,6 +1022,8 @@ class StageRender implements RenderModule {
       case 'intent_resolved': {
         const payload = event.payload as { emotion: Emotion };
         this.emotion = payload.emotion;
+        // 立刻合成一次：自检在读诊断前不等下一帧（表情切换是事件驱动，不是逐帧轮询）
+        this.applyFacial(performance.now(), true);
         break;
       }
       default:
