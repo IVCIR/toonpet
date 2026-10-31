@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <!-- 零出站：输入页不加载任何远程资源，也不允许内联脚本 -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:"
+    />
+    <title>输入</title>
+    <link rel="stylesheet" href="./input.css" />
+  </head>
+  <body>
+    <div class="bar">
+      <input
+        id="text"
+        class="text"
+        type="text"
+        maxlength="200"
+        placeholder="和凯伊说点什么…"
+        autocomplete="off"
+        spellcheck="false"
+        aria-label="输入内容"
+      />
+      <button id="send" class="send" type="button" title="发送（Enter）">发送</button>
+    </div>
+    <script src="./main.js"></script>
+  </body>
+</html>

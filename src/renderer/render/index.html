@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <!-- 渲染层零出站：只放行本地只读 pet-asset: 资产路由，不放开任何网络来源（ADR 0009 D1） -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob: pet-asset:; connect-src pet-asset: blob:"
+    />
+    <title>3D 桌宠</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <canvas id="stage"></canvas>
+    <script src="./main.js"></script>
+  </body>
+</html>

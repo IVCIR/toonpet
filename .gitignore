@@ -1,0 +1,32 @@
+node_modules/
+dist/
+logs/
+.npm-cache/
+.electron-cache/
+.localappdata/
+*.log
+
+# 本机环境配置（ADR 0018 D1）；模板 .env.example 入库
+.env
+.env.local
+
+# 视觉资产由用户自备，不入库（契约 C-4；当前本机放在工程根目录）
+*.glb
+*.vrm
+*.obj
+Character_Mouth_*.png
+
+# 参考音频由用户自备（ADR 0015 D2.4；零成本约束下不自动下载）
+data/ref/
+
+# 本地记忆库由运行期生成，不入库（ADR 0020 D2）
+data/memory.db
+data/memory.db-shm
+data/memory.db-wal
+data/memory.db-journal
+
+# 片段预览的截图产物由 tools/clip-preview/*.cjs 生成，不入库（ADR 0023）
+tools/clip-preview/shots/
+
+# 官方表情图集由 tools/spine-expression-atlas.py 从游戏资产生成，不入库（契约 C-4）
+data/expression/

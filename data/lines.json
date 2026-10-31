@@ -1,0 +1,98 @@
+{
+  "version": 1,
+  "note": "台词池：rules 先于 LLM 匹配（契约 §9.1 ①）；fallbacks 是兜底集合，为空属装配错误（启动时拒绝）。角色只讲日文（ADR 0022），因此所有 reply.text 都是日文；keywords 同时收录中文与日文说法（用户可能用中文提问）。文本约束与 §9.2 一致：1–120 字、单段、无 Markdown/URL/括号动作描写（「」『』不是括号动作，允许）。",
+  "rules": [
+    {
+      "id": "greet",
+      "match": { "keywords": ["你好", "早上好", "早安", "晚上好", "嗨", "おはよう", "こんにちは", "こんばんは"] },
+      "reply": {
+        "text": "……先生、おはようございます。今日もよろしくお願いします。",
+        "emotion": "neutral",
+        "intent": "greet"
+      },
+      "cooldownMs": 8000
+    },
+    {
+      "id": "pat-shy",
+      "match": { "on": "head_patted" },
+      "reply": {
+        "text": "うっ……！ き、急にそんなことしないでください……。慣れませんから。",
+        "emotion": "shy",
+        "intent": "pat_react"
+      },
+      "cooldownMs": 3000
+    },
+    {
+      "id": "health",
+      "match": { "keywords": ["熬夜", "好累", "困", "睡觉", "失眠", "寝不足", "徹夜", "眠い"] },
+      "reply": {
+        "text": "先生、生活リズムは規則正しくしてください。……本当に、心配なんです。",
+        "emotion": "sad",
+        "intent": "shake_head"
+      },
+      "cooldownMs": 6000
+    },
+    {
+      "id": "praise",
+      "match": { "keywords": ["可爱", "好看", "喜欢你", "真厉害", "好棒", "かわいい", "可愛い", "すごい"] },
+      "reply": {
+        "text": "そ、そんなに褒めないでください……。私はもっと、真面目な性格のはずですから。",
+        "emotion": "shy",
+        "intent": "shake_head"
+      },
+      "cooldownMs": 5000
+    },
+    {
+      "id": "game-club",
+      "match": { "keywords": ["游戏", "开发部", "桃井", "部活", "ゲーム", "開発部", "桃井さん"] },
+      "reply": {
+        "text": "テスト作業でしたら、お手伝いします。……桃井さんたちには、内緒にしてくださいね。",
+        "emotion": "neutral",
+        "intent": "nod"
+      },
+      "cooldownMs": 6000
+    },
+    {
+      "id": "meal",
+      "match": { "keywords": ["吃饭", "好饿", "午饭", "晚饭", "早餐", "ご飯", "食事", "お腹"] },
+      "reply": {
+        "text": "ちゃんと食事をしてください。……よかったら、一緒に行きますか？",
+        "emotion": "happy",
+        "intent": "nod"
+      },
+      "cooldownMs": 6000
+    },
+    {
+      "id": "aris",
+      "match": { "keywords": ["爱丽丝", "Aris", "アリス"] },
+      "reply": {
+        "text": "アリスは……とても頑張っています。……わ、私は別に、何も言うことはありません。",
+        "emotion": "happy",
+        "intent": "look_at_user"
+      },
+      "cooldownMs": 8000
+    }
+  ],
+  "fallbacks": [
+    {
+      "id": "fb-ack",
+      "reply": { "text": "……そういうことですか。先生。", "emotion": "neutral", "intent": "nod" }
+    },
+    {
+      "id": "fb-listen",
+      "reply": { "text": "聞いています。続けてください。", "emotion": "neutral", "intent": "look_at_user" }
+    },
+    {
+      "id": "fb-think",
+      "reply": { "text": "うーん……どう答えればいいか、少し考えさせてください。", "emotion": "neutral", "intent": "tilt_head" }
+    },
+    {
+      "id": "fb-offer",
+      "reply": { "text": "先生、何か私にできることはありますか？", "emotion": "neutral", "intent": "none" }
+    },
+    {
+      "id": "fb-hedge",
+      "reply": { "text": "……たぶん。", "emotion": "neutral", "intent": "none" }
+    }
+  ]
+}

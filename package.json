@@ -1,0 +1,33 @@
+{
+  "name": "aa3dpet",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Windows 11 3D desktop pet: transparent always-on-top window, 128x72 alpha mask hit testing, zero metered external calls.",
+  "main": "dist/main/main.js",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "doctor": "node scripts/doctor.mjs",
+    "test": "node build.mjs && node dist/tests/mask.test.mjs && node dist/tests/geometry.test.mjs && node dist/tests/model-frame.test.mjs && node dist/tests/motion.test.mjs && node dist/tests/color.test.mjs && node dist/tests/glb-bounds.test.mjs && node dist/tests/passthrough-fsm.test.mjs && node dist/tests/drag-gesture.test.mjs && node dist/tests/drag-pause.test.mjs && node dist/tests/mask-sampler.test.mjs && node dist/tests/attachments.test.mjs && node dist/tests/hfsm.test.mjs && node dist/tests/pat-react.test.mjs && node dist/tests/facial-texture.test.mjs && node dist/tests/config.test.mjs && node dist/tests/env-file.test.mjs && node dist/tests/reply-validator.test.mjs && node dist/tests/orchestrator.test.mjs && node dist/tests/voice.test.mjs && node dist/tests/speech.test.mjs && node dist/tests/input-bar-geometry.test.mjs && node dist/tests/hotkey.test.mjs && node dist/tests/tray-menu.test.mjs && node dist/tests/subtitle-cue.test.mjs && node scripts/run-electron-test.mjs dist/tests/memory.test.mjs",
+    "test:memory": "node build.mjs && node scripts/run-electron-test.mjs dist/tests/memory.test.mjs",
+    "start": "node build.mjs && node scripts/start.mjs",
+    "selftest": "node build.mjs && node scripts/start.mjs --selftest",
+    "selftest:input": "node build.mjs && node scripts/start.mjs --selftest-input",
+    "selftest:speech": "node build.mjs && node scripts/start.mjs --selftest-speech",
+    "selftest:fallback": "node build.mjs && node scripts/start.mjs --selftest-fallback",
+    "preview:clips": "node tools/clip-preview/serve.mjs",
+    "preview:film": "electron tools/clip-preview/filmstrip.cjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "12.4.1",
+    "three": "0.170.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "9.6.0",
+    "@types/node": "20.17.10",
+    "@types/three": "0.170.0",
+    "electron": "33.4.11",
+    "esbuild": "0.24.2",
+    "typescript": "5.7.2"
+  }
+}

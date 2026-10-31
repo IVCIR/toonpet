@@ -1,0 +1,814 @@
+# 3D 桌宠 · 架构契约（CONTRACTS）
+
+| 项 | 值 |
+|---|---|
+| 契约版本 | 1.8.0 |
+| 生效日期 | 2026-10-31 |
+| 适用平台 | Windows 11 x64（唯一目标平台） |
+| 权威性 | 本文件是唯一事实来源；与代码、口头约定冲突时以本文件为准 |
+| 修改方式 | 先写 ADR → 再改本文件 → 版本号按 §15 递增 |
+| 配套文件 | `docs/MODULE_STATUS.md`、`docs/adr/*.md` |
+
+## 0. 阅读指引
+
+| 你的问题 | 看哪一节 |
+|---|---|
+| 这个项目到底做什么、不做什么 | §1、§13 |
+| 五个模块谁管什么、谁能调谁 | §2 |
+| 窗口、命中、穿透、拖拽的硬规则 | §3 |
+| Windows 上踩过的坑、别再试的错路 | §3.6 |
+| 某个词到底什么意思（状态、情绪、意图） | §4 |
+| "说话时摸头"怎么表现 | §5 |
+| 能不能新增一个事件 / 事件怎么命名 | §6 |
+| 某个模块对外能调什么 | §7 |
+| 数据怎么流动 | §8 |
+| 回复怎么产生、失败怎么办 | §9、§11 |
+| 能不能联网、能不能用云 API | §10 |
+| 接到一半怎么交接 | §16 |
+
+## 1. 项目概述
+
+一个常驻 Windows 11 桌面的 3D 角色（《蔚蓝档案》学生模型，VRM 格式），透明置顶窗口、逐像素命中、可拖拽、可说话、能记住交互历史。参考 Azalea 的表现形态，但**技术上不复用其云端依赖**。
+
+### 1.1 硬约束
+
+| 编号 | 约束 | 说明 | 违反判定 |
+|---|---|---|---|
+| C-1 | 零按次计费 | 默认路径不产生任何按 token / 按次 / 按分钟计费的外部调用 | 出现需要联网且计费的关键路径 |
+| C-2 | 单平台 | 只保证 Windows 11 x64，不为 macOS/Linux 做适配分支 | 出现平台分支代码 |
+| C-3 | 本地优先 | LLM、TTS、记忆全部本地；云端仅作显式关闭的 fallback | 默认配置里出现外部域名 |
+| C-4 | 视觉资产外部提供 | 模型来自 Kivo.wiki，仓库不内嵌模型文件 | 仓库内出现 `.vrm` 二进制 |
+| C-5 | 单实例 | 同一用户会话只允许一个桌宠进程 | 二次启动产生两个窗口 |
+
+### 1.2 目标形态
+
+| 维度 | 目标 |
+|---|---|
+| 窗口 | 无边框、透明背景、置顶、不占任务栏、可点击穿透 |
+| 角色 | 站立锚定在窗口底边中心，窗口默认贴合屏幕工作区底边 |
+| 交互 | 全局热键唤出输入条 → 文本输入 → 角色回话；鼠标可拖拽；可拖到屏幕任意位置 |
+| 表现 | 呼吸 / 眨眼 / 视线跟随常驻；说话有口型；有情绪表情；被摸头有反应 |
+| 记忆 | 交互事件与事实写入本地 SQLite，下次启动可被关键词召回 |
+
+## 2. 模块划分
+
+| 模块 | 一句话职责 | 运行位置 | 明确不负责 |
+|---|---|---|---|
+| `shell` | 让一块透明窗口"像贴在桌面上的玻璃"：窗口、命中、穿透、拖拽、输入条、字幕气泡 | 主进程 + 渲染进程 | 不理解语义；不碰骨骼动画；不决定说什么 |
+| `render` | 把状态与意图变成看得见的动作：VRM 加载、HFSM、混合、口型 | 渲染进程 | 不做决策；不发网络请求；不写数据库 |
+| `orchestrator` | 决定"说什么 / 什么情绪 / 什么动作"，输出统一回复对象 | 主进程 | 不播放音频；不绘制；不拼 TTS URL |
+| `voice` | 文本 → 本地语音 + PCM RMS 口型包络，支持打断 | 主进程（合成）+ 渲染进程（播放与分析） | 不改写文本；不决定情绪；不做字幕 |
+| `memory` | 记住发生过什么，按关键词取回 | 主进程 | 不做语义推理；不引入向量库；不主动调用别人 |
+
+### 2.1 依赖方向（只允许单向）
+
+| 调用方 | 被调用方 | 允许 |
+|---|---|---|
+| `orchestrator` | `memory`、`voice`、`render`、事件总线 | 是 |
+| `render` | 事件总线 | 是 |
+| `shell` | 事件总线、`render.getState()`（只读轮询） | 是 |
+| `voice` | 事件总线 | 是 |
+| `memory` | 无（只被调用） | — |
+| `render` | `orchestrator` | **禁止**（禁止反向依赖） |
+| 任意模块 | 直接 `fetch` 外部域名 | **禁止**（见 §10） |
+
+## 3. 运行边界
+
+### 3.1 进程与外部服务
+
+| 组件 | 位置 | 说明 |
+|---|---|---|
+| `shell` 主进程侧 | Electron main | BrowserWindow、托盘、全局热键、指针轮询器、穿透状态机、拖拽循环 |
+| `shell` 渲染侧 | renderer | alpha 掩膜采集、命中判定、字幕气泡 |
+| `shell` 输入条窗口 | Electron main + 独立渲染页 | 独立非透明小窗，唯一可聚焦窗口（ADR 0003） |
+| `render` | renderer | WebGL/Three.js、three-vrm、动画混合、口型通道 |
+| `voice` 合成侧 | main | HTTP 调本地 GPT-SoVITS，取 WAV |
+| `voice` 播放侧 | renderer | Web Audio 播放 + AnalyserNode 出 RMS 包络 |
+| `orchestrator` | main | 规则池、角色卡、LLM 调用、兜底 |
+| `memory` | main | `better-sqlite3` 同步访问 `data/memory.db`（WAL + FTS5，ADR 0020） |
+| GPT-SoVITS | 外部本地进程 | `http://127.0.0.1:9880`，`api_v2.py`，用户自行启动 |
+| 本地 LLM | 外部本地进程 | Ollama `http://127.0.0.1:11434`，或 OpenVINO 本地推理 |
+
+### 3.2 窗口规格（硬性）
+
+| 项 | 值 | 理由 |
+|---|---|---|
+| `transparent` | `true` | 角色之外必须完全透出桌面 |
+| `frame` | `false` | 无标题栏 |
+| `alwaysOnTop` | `true`，层级 `screen-saver` | 需盖住普通窗口，不抢系统级 UI |
+| `skipTaskbar` | `true` | 不占任务栏 |
+| `hasShadow` | `false` | 透明窗口阴影会画出矩形边 |
+| `resizable` | `false` | 由 DPI 与模型配置决定尺寸 |
+| `backgroundColor` | `#00000000` | 必须显式透明 |
+| `focusable` | **恒为 `false`，运行期禁止修改** | 运行期切换 focusable 在 Windows 上会闪烁、丢置顶、输入法异常（§3.6 P-3、ADR 0003） |
+| 尺寸 | 默认 `480 × 720` CSS px，按模型包围盒 × 1.15 校正 | 保证脚底与头顶留白 |
+| 锚点 | 角色脚底中心 = 窗口内容区底边中心 | "坐在窗口下沿" |
+| 输入条 | **独立窗口**：`260 × 44`、非透明、无边框、置顶、`skipTaskbar`、`show: false` 复用 | 唯一可聚焦窗口，见 ADR 0003 |
+
+### 3.3 命中与点击穿透（规则 R）
+
+| 编号 | 规则 |
+|---|---|
+| R-1 | 窗口内容只有 canvas 与最少 DOM（字幕气泡）；角色命中**不得**依赖 DOM 元素；输入条不在本窗口（§3.2） |
+| R-2 | 命中判定基于 CPU 侧 alpha 掩膜：渲染侧把角色渲染到独立的 `128 × 72` 离屏 RenderTarget，用 `readRenderTargetPixels` 读回。**禁止**对 drawing buffer 调 `readPixels`，**禁止**开启 `preserveDrawingBuffer`（§3.6 P-2） |
+| R-3 | 掩膜以窗口内容坐标系定义并覆盖整个 canvas；光标 CSS 坐标按 canvas 尺寸等比映射到掩膜坐标 |
+| R-4 | 光标处的命中值 = 掩膜双线性插值；`alpha ≥ 0.5` 判为命中。光标停留在同一掩膜单元内时复用缓存结果，不重复计算 |
+| R-5 | 掩膜刷新：光标在窗口矩形内 ≥ 20Hz；光标离开窗口矩形则暂停采集；重新进入且掩膜陈旧 > 100ms 时立即重采一次再判定 |
+| R-6 | 穿透恢复由主进程驱动（Windows 上 `forward` 无效，§3.6 P-1）：主进程以 ~16ms 轮询 `screen.getCursorScreenPoint()`，光标进入窗口矩形 → 发 `cmd:probe` → 渲染侧用最新掩膜判定 → 回 `cmd:interactive{hit}` → `hit=true` 关闭穿透并保持，`hit=false` 维持穿透 |
+| R-7 | 离开判定带迟滞：光标离开窗口矩形**外扩 8px** 才恢复穿透；穿透状态每次切换后 100ms 内不再切换 |
+| R-8 | 拖拽期间强制保持非穿透，直到 `drag_released` 且回弹结束；拖拽期间暂停掩膜采集以省 GPU |
+| R-9 | 掩膜采集或离屏渲染失败（上下文丢失、模型未就绪）→ 退回"窗口内容区矩形"判定，并记录一次降级日志 |
+| R-10 | 头部区域 = 掩膜 alpha 包围盒顶部 22%；掩膜不可用时退回窗口内容区顶部 22%（见 D-1） |
+| R-11 | 禁止使用 CSS `-webkit-app-region: drag`；拖拽由主进程按 §3.4 实现 |
+
+### 3.4 拖拽与摸头判定（规则 D）
+
+| 编号 | 规则 |
+|---|---|
+| D-1 | 头部区域 = 当前掩膜 alpha 包围盒顶部 22% 高度；掩膜不可用时退回窗口内容区顶部 22% |
+| D-2 | 必须先处于交互态（非穿透）才可能进入拖拽；指针在命中区按下后位移 > 4px → 发 `drag_started`，此后不再判摸头 |
+| D-3 | 指针在头部区按下并在 250ms 内抬起且位移 ≤ 4px → 发 `head_patted` |
+| D-4 | `head_patted` 冷却 800ms，冷却期内重复点击不重复发事件（防抖） |
+| D-5 | 拖拽位移由主进程以 `screen.getCursorScreenPoint()` 轮询（约 16ms）驱动窗口位置；**与 R-6 共用同一个轮询器，不允许出现两个定时器** |
+| D-6 | 松手发 `drag_released`，携带末速度；`render` 播回弹，回弹结束交还 Base 层并恢复 R-6 的正常判定 |
+| D-7 | 拖到屏幕外时钳制窗口矩形，至少保留 80px 宽、120px 高在任一显示器工作区内 |
+| D-8 | 渲染侧不得自行把窗口切成穿透（只有主进程能改穿透状态） |
+
+### 3.5 跨进程通道
+
+| 通道 | 方向 | 内容 |
+|---|---|---|
+| `evt:broadcast` | 双向（经主进程转发） | §6 事件白名单，payload 必须是可结构化克隆的纯数据 |
+| `cmd:respond` | renderer → main | 提交 `user_utterance` 文本（来自输入条窗口） |
+| `cmd:render-intent` | main → renderer | `render.handleIntent(intent)` 的跨进程落地；唯一发出者是 `orchestrator`，渲染侧收到即执行 |
+| `cmd:voice` | main → renderer | 语音命令联合体：`{ kind:'speak', utteranceId, audio: ArrayBuffer, mime:'audio/wav' }`（WAV 容器字节，解码与 RMS 在渲染侧）或 `{ kind:'stop', utteranceId }`（打断时立刻停播） |
+| `cmd:speech` | renderer → main | 播放事实：`{ utteranceId, phase:'started' }` / `{ utteranceId, phase:'ended', reason:'completed'\|'failed', durationMs, detail? }`。`interrupted` 不由渲染侧上报（主进程决定） |
+| `cmd:probe` | main → renderer | `{ x, y }`：光标在窗口**内容区**的 CSS 坐标（原点为内容区左上角，由主进程 `getContentBounds()` 换算，页面缩放因子强制为 1），请求一次掩膜命中判定 |
+| `cmd:interactive` | renderer → main | `{ hit: boolean, x, y, head: boolean \| null }`：命中结果，以及该坐标是否落在头部区（R-10 掩膜 alpha 包围盒顶部 22%）；`head` 仅在掩膜可用时非 `null`。主进程据此开关穿透与触发 `head_patted`，**不得**据 `head` 反推手势（ADR 0004 D1） |
+| `cmd:drag` | renderer → main | `{ phase: 'down' \| 'up', x, y, t }`：原始指针事实（按下 / 抬起）。**不承载**位移、速度或任何判定结果——位移与末速度由主进程 16ms 轮询器计算，D-2 / D-3 / D-4 判定全部在主进程（ADR 0004 D2） |
+| `cmd:walk` | renderer → main | `{ phase:'start', direction:'left'\|'right', distancePx }` 或 `{ phase:'stop' }`：`render` 的内部调度器请求窗口行走（**命令**，不是事件）。不承载速度/加速度/弹簧参数——位移物理归 `shell`（ADR 0024 D1） |
+
+### 3.6 Windows 平台事实（已实测，不得再走回头路）
+
+| 编号 | 事实 | 错误做法（禁止） | 正确做法 | 出处 |
+|---|---|---|---|---|
+| P-1 | `setIgnoreMouseEvents(true, { forward: true })` 的 `forward` 只在 macOS 生效；Windows 上一旦穿透，渲染进程收不到 `mousemove` | 靠渲染侧 `mousemove` 自动恢复交互 | 主进程轮询光标 + `cmd:probe` 回判 | ADR 0002 |
+| P-2 | `gl.readPixels` 读 drawing buffer 是同步阻塞；要跨帧读必须 `preserveDrawingBuffer: true` | 逐像素读全分辨率 alpha；或为命中开启 `preserveDrawingBuffer` | `128 × 72` 离屏 RenderTarget + `readRenderTargetPixels` | ADR 0002 |
+| P-3 | 透明窗口运行期切换 `focusable` 会引起闪烁、丢失置顶、输入法异常 | 打开输入条时把主窗口 `focusable` 改 `true` | 独立输入窗口持有焦点 | ADR 0003 |
+
+残余缺陷（已知、接受、不得声称已解决）：从光标进入窗口到掩膜判定返回约 1–2 帧（16–32ms），此窗口内的快速点击会落到桌面。缓解方式是"判定通过才关闭穿透"（宁可落空一次，也不吞掉空白区点击），见 §12。
+
+## 4. 全局词汇表（唯一定义，禁止同义词）
+
+### 4.1 状态词汇
+
+> 状态 = 持续成立的事实，可被 `getState()` 读取；事件 = 瞬时事实，见 §6。状态名用现在分词/形容词，事件名用过去式。
+
+| 词汇 | 所属层 | 类型 | 唯一定义 | 进入条件 | 退出条件 | 唯一置位者 |
+|---|---|---|---|---|---|---|
+| `idle` | Base | 状态 | 站立待机：呼吸、眨眼、视线跟随照常运行；**不等于"没有动画"** | 启动完成 / `walking` 结束 / 回弹结束 | 切入 `walking` 或进入 `dragged` | `render` 内部调度器 |
+| `walking` | Base | 状态 | 沿水平方向做位移的行走循环，脚底贴窗口底边；**行走期间整身朝向移动方向（±90° 平滑转身），停下回正**（ADR 0026 D1） | `idle` 持续 ≥ 20s 后由内部调度器随机触发 | 到达目标点 / 被 `dragged` 打断 | `render` 内部调度器 |
+| `speaking` | Overlay | 状态 | 正在播放语音并且口型由包络驱动 | 收到 `speech_started` | 收到 `speech_ended` | `voice` 的事件（`render` 只跟随） |
+| `reacting` | Overlay | 状态 | 一次性反应动作（摸头、惊讶等）正在播放 | 收到 `head_patted` 或 `intent ∈ {pat_react, happy_hop, nod, shake_head, tilt_head}` | 动作自然播完 / 被同类型新反应替换 | `render` 内部 |
+| `dragged` | Physics | 状态 | 窗口被指针拖动，角色失去地面约束，身体随位移摆动 | 收到 `drag_started` | 收到 `drag_released`（转入 `settling`） | `shell` 的事件（`render` 只跟随） |
+| `settling` | Physics | 状态 | 松手后的回弹：窗口带末速度落回工作区地面线；期间**不接受**新的动作意图与摸头 | 收到 `drag_released` | 收到 `motion_ended{kind:'settle'}`，或被重新 `drag_started` 打断 | `render`（跟随 `motion_ended`；ADR 0024 D3） |
+| `thinking` | 编排 | 状态 | 已收到用户话语、尚未产出回复 | `orchestrator.respond()` 开始 | 产出 `Reply` 或走到兜底 | `orchestrator` |
+| `idle` | 编排 | 状态 | 编排层没有在途话语（**与 Base 层的 `idle` 同名不同层，不是同一个状态**） | 启动完成 / 产出 `Reply` 或走到兜底 / `cancel()` | 收到 `user_utterance` 而进入 `thinking` | `orchestrator` |
+
+### 4.2 禁用同义词（写代码、写文档、写注释都不许用）
+
+| 禁用写法 | 唯一正确写法 |
+|---|---|
+| `talking` / `isSpeaking` / `speak`（作状态） | `speaking` |
+| `dragging` / `isDragging` | `dragged` |
+| `think` / `isThinking` / `loading` | `thinking` |
+| `walk` / `moving`（作状态） | `walking` |
+| `stand` / `normal` / `default`（作状态） | `idle` |
+| `headpat` / `pet` / `pat`（作事件名） | `head_patted` |
+| `voice_start` / `tts_started`（作事件名） | `speech_started` |
+
+> **`idle` 的消歧规则（ADR 0008）**：`idle` 出现在两个层——`Base.idle`（站立待机）与 `Orch.idle`（编排层没有在途话语）。二者同名不同层，**代码里靠字段访问区分**：`getState().base === 'idle'` 是 Base 层，`getState().orchestrator === 'idle'` 是编排层。禁止为区分层次而发明 `orchestratorIdle` / `baseIdle` / `orchIdle` 等别名。
+
+### 4.3 数据词汇
+
+| 词汇 | 类型 | 唯一定义 |
+|---|---|---|
+| `utterance` | 对象 | 一次用户输入：`{ utteranceId, text, input }`；`utteranceId` 全局唯一，用于串联整条链路 |
+| `reply` | 对象 | 一次回复：`{ text, emotion, intent }`，**只有这三个字段** |
+| `replyId` | 字符串 | 一次回复的标识，由 `orchestrator` 生成，用于日志与去重 |
+| `emotion` | 枚举 | 表情基线，见 §4.5 |
+| `intent` | 枚举 | 动作意图，见 §4.4；**有限集合，LLM 不得发明** |
+| `fact` | 对象 | `memory` 的检索结果单元，见 §7.5 |
+| `envelope` | 数值数组 | 语音 PCM 的短时 RMS 序列，用于驱动口型权重；只在渲染进程内存在，不跨进程传输 |
+| `route` | 枚举 | 回复产自哪条路径：`rule` / `llm` / `fallback` |
+
+### 4.4 `intent` 有限集合
+
+| `intent` | 语义 | 产出来源 | `render` 表现要求 |
+|---|---|---|---|
+| `none` | 不做额外动作，只保持 Base 层 | 任意 | 不叠加 Overlay 动作 |
+| `greet` | 打招呼（挥手或点头 + 视线锁定） | 规则池 / LLM | Overlay 一次性播放，可打断 `idle` 的随机视线 |
+| `nod` | 点头（肯定） | 规则池 / LLM | 身体通道短动作，≤ 1.2s |
+| `shake_head` | 摇头（否定） | 规则池 / LLM | 身体通道短动作，≤ 1.2s |
+| `tilt_head` | 歪头（疑惑） | 规则池 / LLM | 保持 1.5s 后回正 |
+| `look_at_user` | 视线锁定光标方向 | 规则池 / LLM | 只影响视线通道，不影响身体 |
+| `pat_react` | 被摸头的反应 | 规则 / `head_patted` | 低权重混合，**不得打断口型**（见 §5.3） |
+| `happy_hop` | 小幅雀跃 | 规则池 / LLM | 有位移的小跳，需回位 |
+
+规则：
+- 该表就是全集。新增一个值 = 契约 minor 升级 + ADR，且必须同时给出 `render` 的表现映射。
+- `render` 遇到未知 `intent` 时降级为 `none`，写一条告警日志，不得抛异常、不得随机播放别的动作。
+- `walking` 不是 `intent`：位移由 `render` 内部调度器自主决定，不接受外部驱动（防止 LLM 让角色乱跑）。
+
+### 4.5 `emotion` 有限集合
+
+| `emotion` | 表情基线 | 说明 |
+|---|---|---|
+| `neutral` | 默认 | 无额外表情权重 |
+| `happy` | 嘴角上扬 + 眼型变化 | 最常用正向 |
+| `sad` | 眉内侧下压 | 与 `speaking` 可共存 |
+| `surprised` | 睁眼 + 张口 | 张口只作用表情，不夺口型通道 |
+| `shy` | 视线下移 + 颊部 | 常与 `pat_react` 搭配 |
+| `angry` | 眉下压 + 嘴形收紧 | 语气重时使用 |
+| `sleepy` | 半闭眼 | 长时间无交互时的默认倾向 |
+
+### 4.6 业务术语
+
+| 术语 | 定义 |
+|---|---|
+| 角色卡 | 一份描述人格、语气、边界、口癖的本地文本，注入 LLM system 段；不含记忆 |
+| 台词池 | 预置的 `{ 触发条件 → reply }` 静态条目，规则路径专用，零延迟 |
+| 规则 | 台词池条目的匹配条件（关键词、事件类型、状态、冷却） |
+| 兜底 | LLM 不可用时必然可用的预设台词集合，保证"永远有话说" |
+| 打断（barge-in） | 新话语到达时终止在途语音与在途 LLM 请求 |
+| 路由 | 一次回复走 ①规则 ②LLM ③兜底 中的哪条 |
+| 命中掩膜 | 以 `128 × 72` 离屏渲染得到的 alpha 概览，命中判定与头部区域估算共用；不参与最终画面 |
+| 交互态 / 穿透态 | 窗口当前是否接收鼠标：交互态 `setIgnoreMouseEvents(false)`，穿透态 `true` |
+| 探针（probe） | 主进程就"当前光标处是否命中角色"向渲染侧发起的一次询问（`cmd:probe` → `cmd:interactive`） |
+| 回弹 | 拖拽松手后角色回到受地面约束姿态的过渡动画 |
+
+## 5. HFSM 分层语义
+
+### 5.1 三层
+
+| 层 | 是否常驻 | 状态集合 | 抢占关系 | 备注 |
+|---|---|---|---|---|
+| Base | 永远运行 | `idle`、`walking` | 优先级最低 | 呼吸、眨眼、视线跟随属于层内常驻通道，不是状态 |
+| Overlay | 按事件叠加 | `speaking`、`reacting` | 高于 Base，低于 Physics；**同类型互斥** | `speaking` 与 `reacting` 可同时存在（见 §5.2 通道） |
+| Physics | 按拖拽接管 | `dragged`、`settling` | 最高 | 接管身体位移与朝向；回弹（`settling`）结束后整层退出，交还 Base |
+
+### 5.2 混合通道（冲突裁决的唯一依据）
+
+| 通道 | 驱动来源 | 优先级 | 冲突规则 |
+|---|---|---|---|
+| 口型通道 | `speech_started` / 包络 | 1（最高） | 任何情况下不被覆盖；`reacting`、`dragged` 都不得降低口型权重 |
+| 身体通道 | Base 动作 + Overlay 动作 + Physics 摆动 | 2 | `dragged` 期间由 Physics 独占；否则 Base 提供底噪、Overlay 以权重叠加 |
+| 表情通道 | `emotion` | 3 | 新 `emotion` 以 0.25s 淡入；`reacting` 可临时覆盖为 `surprised`/`shy`，动作结束后回到 `emotion`。表情由**贴图合成**实现（无 blendshape）：眼型 / 嘴型 / 红晕三层，其中**眼型与红晕必须来自外部官方差分贴图**（`data/expressions/`），**口型通道优先于表情嘴型**（ADR 0026 D3/D6） |
+| 视线通道 | Base 常驻 + `look_at_user` | 4 | `dragged` 期间视线锁定指针；否则 `look_at_user` 优先于随机漂移 |
+
+### 5.3 必测组合（实现与测试都以此为准）
+
+| 场景 | 口型通道 | 身体通道 | 表情通道 | 结论 |
+|---|---|---|---|---|
+| 说话时被摸头 | 保持 `speaking`，权重 1.0 | `pat_react` 以 ≤ 0.4 权重叠加，**不整体切换到反应动画** | 临时 `shy` | 语音不中断，仅有轻微身体反应 |
+| 说话时被拖拽 | 保持 | Physics 独占，抖动导致的身体位移不改变口型 | 保持 | 语音不中断 |
+| 行走时说话 | 保持 | Base 继续 `walking` | 按 `emotion` | 边走边说合法 |
+| 行走时被摸头 | 无 | `reacting` 以 ≤ 0.4 权重叠加，`walking` 继续 | 临时 `shy` | 不强制停下 |
+| `thinking` 期间任意动作 | 不受影响 | 不受影响 | 不受影响 | `thinking` 只驱动轻量表现（视线/微动），不新增动画层 |
+| 拖拽松手 | 无 | 播回弹（`settling`），结束后回到 `idle` | 保持 | 松手不重置 `emotion` |
+| 回弹期间收到 `intent` | 无 | 被拒（不切动作、不进 `reacting`） | 保持 | 回弹只有"重新拖拽"能打断（ADR 0024 D3） |
+| 回弹期间被摸头 | 无 | 被拒（不切动作、不改嘴型） | 保持 | 同上 |
+
+### 5.4 禁止
+
+| 编号 | 禁止项 |
+|---|---|
+| H-1 | 用完整身体动画打断正在播放的语音 |
+| H-2 | Overlay 状态互相嵌套（`speaking` 里套 `reacting` 状态）——只允许通道级混合 |
+| H-3 | 在代码中出现 §4.1 以外的第六个状态名 |
+| H-4 | `render` 自行进入或退出 `dragged` / `speaking`（这两个状态只能由事件驱动） |
+| H-5 | 由 `orchestrator` 直接指定动画片段名或骨骼名 |
+
+## 6. 事件契约
+
+### 6.1 定义
+
+事件是**已经发生的客观事实**的广播，不是命令、不是请求、不是回调。想让人做事 → 调用接口（§7）；想告诉别人"某事已经发生了" → 发事件。
+
+### 6.2 命名规范
+
+| 编号 | 规则 |
+|---|---|
+| N-1 | 结构：`<主体>_<过去式动词>`，全小写 `snake_case`，如 `speech_started` |
+| N-2 | 禁止命令式与将来式：不得出现 `open_`、`play_`、`show_`、`request_`、`should_`、`on_` 前缀 |
+| N-3 | 禁止否定式：不得出现 `not_`、`no_`；否定信息放载荷里 |
+| N-4 | 一个事件只有一个生产者（见 §6.3）；消费者不得重发同名事件 |
+| N-5 | 事件名全局唯一，不加模块前缀（写 `speech_started`，不写 `voice_speech_started`） |
+| N-6 | 载荷字段用 `camelCase`；事件名用 `snake_case`（前者是 TS 对象，后者是跨进程字符串契约） |
+| N-7 | 载荷必须是可结构化克隆的纯数据：无函数、无 DOM、无 Three 对象、无 Buffer 大对象；单条 ≤ 4KB |
+| N-8 | 新增事件 = 契约 minor 升级 + ADR；删除或改名 = major 升级 |
+
+### 6.3 事件清单（全量，禁止私自扩充）
+
+| 事件 | 唯一生产者 | 载荷 | 消费者 | 触发时机 |
+|---|---|---|---|---|
+| `speech_started` | `voice` | `{ utteranceId, text }` | `render`、`shell` | 首帧音频开始播放的同一帧 |
+| `speech_ended` | `voice` | `{ utteranceId, reason: 'completed'\|'interrupted'\|'failed', durationMs }` | `render`、`shell`、`orchestrator` | 播放自然结束 / 被打断 / 失败 |
+| `drag_started` | `shell` | `{ x, y }` | `render` | 指针位移超过 4px 且已判定为拖拽 |
+| `drag_released` | `shell` | `{ x, y, vx, vy }` | `render` | 拖拽松手（`vx/vy` 单位 px/s） |
+| `head_patted` | `shell` | `{ patCount }` | `orchestrator`、`render` | 头部区短按抬起且通过冷却判定；头部区由 `cmd:interactive.head` 派生，4px / 250ms / 800ms 判定在主进程（ADR 0004 D1） |
+| `user_utterance` | `shell` | `{ utteranceId, text, input: 'keyboard'\|'hotkey' }` | `orchestrator` | 输入条提交 |
+| `intent_resolved` | `orchestrator` | `{ replyId, text, emotion, intent, route }` | `render`、`shell` | 产出合法 `Reply` 之后 |
+| `llm_failed` | `orchestrator` | `{ replyId, reason: 'unavailable'\|'timeout'\|'invalid_output'\|'aborted', detail? }` | `render`、`shell` | LLM 路径失败、即将走兜底 |
+| `model_ready` | `render` | `{ modelId, loadMs }` | `shell` | VRM 加载完成且首帧可渲染 |
+| `motion_ended` | `shell` | `{ kind: 'walk'\|'settle', reason: 'arrived'\|'edge'\|'interrupted'\|'rest' }` | `render` | 窗口位移结束：行走到达/撞边/被打断，或回弹收敛到地面线（ADR 0024 D5） |
+
+### 6.4 发布 / 订阅规则
+
+| 编号 | 规则 |
+|---|---|
+| E-1 | 进程内使用类型化事件总线；跨进程只转发 §6.3 白名单，`evt:broadcast` 单通道 |
+| E-2 | 同一生产者的事件保持发出顺序；不同生产者之间不保证顺序 |
+| E-3 | 消费者只读载荷，不得修改；需要派生数据请自行拷贝 |
+| E-4 | 事件处理函数内同步耗时 ≤ 8ms；长任务必须 `queueMicrotask` / 异步派发 |
+| E-5 | `memory` **不订阅**任何事件；所有写入由 `orchestrator` 单点调用 `memory.write()`，避免重复记录 |
+| E-6 | 事件可以没有消费者；不得为了"以后可能用"而新增事件 |
+
+### 6.5 明确不设的事件（防止有人补）
+
+| 想要的东西 | 正确做法 |
+|---|---|
+| `state_changed` | 状态由 `render.getState()` 拉取，`shell` 以 ≤ 4Hz 轮询 |
+| `emotion_changed` | `emotion` 只随 `intent_resolved` 到达 |
+| `play_animation` / `set_state` | 这是命令，走 `render.handleIntent()` |
+| `memory_written` | 无需广播，写入方自己知道 |
+| `window_moved` | 窗口几何由 `shell` 内部维护 |
+| `mouse_entered` / `mouse_left` | 指针进出由主进程轮询内部处理，不成为事件（§3.6 P-1） |
+
+## 7. 模块接口契约
+
+### 7.1 公共类型（`src/shared/types.ts` 的契约形态）
+
+```ts
+export type ModuleId = 'shell' | 'render' | 'orchestrator' | 'voice' | 'memory';
+
+export type BaseState = 'idle' | 'walking';
+export type OverlayState = 'speaking' | 'reacting';
+export type PhysicsState = 'dragged' | 'settling';
+export type OrchestratorState = 'thinking' | 'idle';
+
+export type Emotion =
+  | 'neutral' | 'happy' | 'sad' | 'surprised' | 'shy' | 'angry' | 'sleepy';
+
+export type Intent =
+  | 'none' | 'greet' | 'nod' | 'shake_head'
+  | 'tilt_head' | 'look_at_user' | 'pat_react' | 'happy_hop';
+
+/** 编排层唯一输出物，不允许增删字段 */
+export interface Reply {
+  text: string;
+  emotion: Emotion;
+  intent: Intent;
+}
+
+/** render.getState() 的返回，只读 */
+export interface RenderState {
+  base: BaseState;
+  overlay: OverlayState | null;
+  physics: PhysicsState | null;
+  emotion: Emotion;
+  speakingUtteranceId: string | null;
+  orchestrator: OrchestratorState; // 只读镜像
+  modelReady: boolean;
+}
+```
+
+### 7.2 `shell`
+
+| 方法 | 签名 | 说明 |
+|---|---|---|
+| `start` | `start(opts?: { hotkey?: string }): Promise<void>` | 创建窗口、托盘、热键、指针轮询器，装入渲染页 |
+| `stop` | `stop(): Promise<void>` | 释放窗口、热键、托盘、轮询器 |
+| `getBounds` | `getBounds(): { x: number; y: number; width: number; height: number }` | 只读诊断用 |
+
+规则：
+- `shell` 是 `drag_*` / `head_patted` / `user_utterance` 的唯一生产者；命中与穿透判定不对外暴露方法，只体现为事件与窗口行为。
+- 主进程持有唯一的指针轮询器与穿透状态机；它是全进程**唯一**可以调用 `setIgnoreMouseEvents` 的地方（§3.3 R-6、D-8）。
+- **字幕显示时机（ADR 0021）**：渲染侧的字幕气泡收到 `intent_resolved` 只登记待显示文本、**不显示**；收到 `speech_started` 才显示完整字幕；收到 `speech_ended{reason:'failed'}` 立即显示作为兜底。字幕在语音播放期间不自动隐藏，`speech_ended` 后留 1.2s 尾巴淡出；15s 内未等到 `speech_started` 则由 failsafe 提前显示。**不得**为此新增事件或 IPC 通道，也**不得**回到"收到 `intent_resolved` 就显示"。
+
+### 7.3 `render`
+
+| 方法 | 签名 | 说明 |
+|---|---|---|
+| `handleIntent` | `handleIntent(intent: Intent): void` | 立即执行动作意图；未知值降级 `none`；重复 `intent` 在 200ms 内去重 |
+| `getState` | `getState(): RenderState` | 同步返回，供 `shell` 轮询；不得触发渲染或 IO |
+
+订阅：`speech_started`、`speech_ended`（口型通道）、`drag_started`、`drag_released`（Physics 层）、`head_patted`（低权重 `pat_react`）、`intent_resolved`（**只取 `emotion`**，不触发动作——动作只由 `handleIntent` 触发）。
+
+规则：
+- `handleIntent` 与 `intent_resolved` 是双轨：前者是命令，后者是事实。同一次回复只执行一次动作，不得因两条路径而播两遍。
+- `render` 不产生任何除 `model_ready` 以外的事件。
+- 模型缺失或骨骼缺失时，`getState().modelReady = false`，并渲染一个占位胶囊体，不得白屏。
+- `render` 内部负责掩膜采集与 `cmd:probe` 应答（§3.3 R-2/R-4），但掩膜不是公共接口。
+
+**表情表现（ADR 0026）**：
+
+| 项 | 规定 |
+|---|---|
+| 实现路线 | **只走贴图合成**（ADR 0026）：以模型自带面部贴图为底做 Canvas **局部**合成；**禁止**整体替换面部贴图；**禁止**屏幕空间叠加面片（会盖在刘海之上）；**禁止**依赖 blendshape |
+| 眼型与红晕 | **必须来自外部官方差分贴图**（`data/expressions/eyes_*.png`、`blush.png`，经只读 `pet-asset://asset/expr/<file>` 白名单路由）；**禁止**在运行期用 Canvas 程序化绘制眼型、瞳孔、眼睑、红晕（ADR 0026 D6，一次失败的尝试） |
+| 嘴型与口型 | 口型 = 图集帧；表情嘴型允许极简图元（一条弧线 / 一个小口），**不得**因此影响口型通道 |
+| 优先级 | 嘴部贴图唯一优先级是 §5.2 的口型通道（口型 > 摸头 > 表情 > 静态闭嘴），表情不得夺口型 |
+| 降级 | 差分缺失 → 该层不生效（缺眼型保持默认眼、缺红晕不叠），**只变嘴型**，记一条 WARN；缺材质/缺几何 → 表情整体不生效，动作与说话照常（§11） |
+| 还原 | 情绪结束必须**完全还原**默认眼（用 `ImageData` 快照写回，不做插值拷贝） |
+| 字段 | `RenderState` **不因表情增删字段**；表情细节只进内部诊断 |
+
+### 7.4 `voice`
+
+| 方法 | 签名 | 说明 |
+|---|---|---|
+| `speak` | `speak(text: string, utteranceId: string): Promise<SpeechOutcome>` | 合成并播放；`SpeechOutcome = 'completed' \| 'interrupted' \| 'failed'` |
+| `stopSpeaking` | `stopSpeaking(reason?: 'interrupt' \| 'shutdown'): void` | 幂等；无在途语音时为空操作 |
+
+规则：
+- `speak` 永不 reject，一切异常折算为 `'failed'`，并已发 `speech_ended{reason:'failed'}`。
+- 同一时刻只允许一个在途语音；新的 `speak` 会先以 `'interrupted'` 结束旧的。
+- 合成首字节超时 3000ms、整段超时 30000ms 均判 `'failed'`。CPU 非流式部署可用 `PET_TTS_FIRST_BYTE_TIMEOUT_MS` / `PET_TTS_TOTAL_TIMEOUT_MS` 放宽（默认值不变，见 ADR 0015 D2.5）。
+- 文本长度 > 120 字 → 直接 `'failed'`（不截断，由编排层保证长度）。
+- 帧级包络不跨进程：主进程只回传 WAV 容器字节（含 RIFF 头），播放、解码与 RMS 计算在渲染进程内完成。
+- `speech_started` / `speech_ended` 的唯一生产者是 `voice`（主进程）。播放事实由渲染侧经 `cmd:speech` 上报；打断时先发 `cmd:voice{kind:'stop'}` 再发 `speech_ended{reason:'interrupted'}`。
+- `speak()` 在**终态**（`completed` / `interrupted` / `failed`）兑现，不是"开始播放"时；调用方不得为了等播放完成而阻塞 `thinking` 出口。
+
+### 7.5 `memory`
+
+| 方法 | 签名 | 说明 |
+|---|---|---|
+| `init` | `init(dbPath: string): Promise<void>` | 建表、迁移（`PRAGMA user_version`）、打开 WAL、尽力建 FTS5 索引 |
+| `retrieve` | `retrieve(query: string, limit?: number): MemoryFact[]` | 同步，目标 ≤ 50ms，失败返回 `[]` |
+| `write` | `write(event: MemoryWrite): void` | 同步落盘，失败只记日志，不抛给调用方 |
+| `prune` | `prune(): number` | 按 `at` 升序淘汰超出上限的行，返回本次删除行数；单次有界（ADR 0025） |
+
+```ts
+export interface MemoryFact {
+  id: number;
+  at: number;
+  kind: 'user' | 'pet' | 'system';
+  text: string;
+  tags: string[];
+  score?: number; // retrieve 命中时填充
+}
+
+export interface MemoryWrite {
+  kind: MemoryFact['kind'];
+  text: string;
+  tags?: string[];
+  at?: number;
+  refId?: string;
+}
+```
+
+规则：检索只允许字面关键词（SQLite FTS5 或 `LIKE`），**不调用任何网络或嵌入模型**；排序 = 关键词命中数优先、时间新近次之；`limit` 默认 5、上限 20。
+
+实现补充（ADR 0020，逐条可执行）：
+
+| 项 | 规定 |
+|---|---|
+| 存储 | 单文件 `data/memory.db`（`PET_MEMORY_DB` 可覆盖），`journal_mode=WAL`、`synchronous=NORMAL`、`busy_timeout=2000`；文件已在 `.gitignore` |
+| 表结构 | `memories(id, at, kind, text, tags, ref_id)`；`kind ∈ {user, pet, system}`；`tags` 是 JSON 数组字符串；`ref_id` 关联 `utteranceId` / `replyId` |
+| 迁移 | `PRAGMA user_version` 单调递增，迁移**只增不改**，每个迁移一个事务，失败整体回滚 |
+| 检索 | FTS5 `trigram` 索引（子串匹配，≥3 字符）；查询词 < 3 字符或 FTS 不可用时走 `LIKE` 降级；CJK 长串按三字滑窗切词 |
+| 写入时机 | `orchestrator` 在**发布完成之后**用异步调度写 `kind='user'` 与 `kind='pet'` 各一条（同一 `at`）；**不得**阻塞 `voice.speak()` 的下发；摸头等无用户输入的合成话语不写 |
+| 事实标签 | `write` 自动提取「喜欢/不喜欢/好き/嫌い」句式，产出 `like:X` / `dislike:X` 标签（否定优先），与手传 `tags` 合并去重 |
+| 降级 | 文件库打不开 → 自动改 `:memory:`（本次会话可写可检索）；再失败 → `disabled`（`retrieve→[]`、`write` 空操作）；任何失败都不得阻断对话 |
+| 段 ③ 格式 | 每条一行 `[MM-DD] 用户|凯伊|系统: 文本`，最多 5 条、单条 ≤120 字；为空或失败时**必须**输出 `记忆片段：（无）` |
+| 保留（ADR 0025） | 上限 `MEMORY_MAX_ROWS=2000`；超出按 `at ASC, id ASC` 删最旧，单次 ≤`MEMORY_PRUNE_BATCH_MAX=200` 行；`write` 之后用 `setImmediate` 排期（不阻塞调用方）；FTS5 由既有的 `AFTER DELETE` 触发器同步，**不得**手工删索引行 |
+
+### 7.6 `orchestrator`
+
+| 方法 | 签名 | 说明 |
+|---|---|---|
+| `respond` | `respond(input: { text: string; utteranceId: string }): Promise<Reply>` | **永不 reject**，内部走完 §9 分流必定返回合法 `Reply` |
+| `cancel` | `cancel(): void` | 中断在途 LLM 请求；已发出的回复不回滚 |
+
+规则：`orchestrator` 是 `user_utterance` 的唯一消费者、`intent_resolved` / `llm_failed` 的唯一生产者、`memory.write` 的唯一调用方；它调 `voice.speak` 与 `render.handleIntent`，但不直接操作窗口、音频设备、数据库连接。
+
+### 7.7 接口禁令
+
+| 编号 | 禁令 |
+|---|---|
+| I-1 | 任何模块不得暴露"内部状态对象"给外部改写 |
+| I-2 | 任何模块不得提供 `setXxx` 风格的多余 setter；状态只能由契约规定的路径改变 |
+| I-3 | 任何模块不得在同步接口里做网络请求或磁盘全表扫描 |
+| I-4 | 不得为了测试在公共接口上加 `_forTest` 参数；测试用依赖注入的子类/桩，桩必须实现同一接口 |
+
+## 8. 数据流
+
+### 8.1 主链路
+
+```mermaid
+sequenceDiagram
+  participant U as 用户
+  participant S as shell
+  participant O as orchestrator
+  participant M as memory
+  participant V as voice
+  participant R as render
+
+  U->>S: 热键 → 输入条窗口 → 提交
+  S-->>O: user_utterance{utteranceId,text}
+  O->>O: thinking = true
+  O->>M: retrieve(text)
+  M-->>O: facts（≤5 条）
+  O->>O: ①规则池 → ②本地LLM → ③兜底
+  O-->>R: handleIntent(intent)
+  O-->>R: intent_resolved{emotion,intent,route}
+  O-->>S: intent_resolved → 字幕**只登记不显示**（ADR 0021）
+  O->>V: speak(text, utteranceId)
+  O->>M: write(user) / write(pet)（异步，发布之后）
+  O->>O: thinking = false
+  V-->>R: speech_started
+  R->>R: overlay=speaking，口型由包络驱动
+  V-->>S: speech_started → 字幕显示完整文本（同一帧）
+  V-->>R: speech_ended{reason}
+  R->>R: overlay=null
+  V-->>S: speech_ended{completed|interrupted} → 留 1.2s 尾巴；{failed} → 立即显示兜底字幕
+```
+
+> 图中"播放"的进程内细节（`cmd:voice{kind:'speak'}` 下发、渲染侧解码/播放、`cmd:speech` 上报 started/ended）见 §3.5 与 §7.4；`voice` 仍是 `speech_started` / `speech_ended` 的唯一发出点。
+
+### 8.2 指针链路
+
+```mermaid
+flowchart LR
+  P["主进程 16ms 轮询光标"] --> Q{"在窗口矩形内?"}
+  Q -- "否，超出外扩 8px" --> C["保持/恢复穿透"]
+  Q -- "是" --> D["cmd:probe 带坐标"]
+  D --> E["渲染侧掩膜双线性采样"]
+  E -- "alpha < 0.5" --> C
+  E -- "alpha ≥ 0.5" --> F["cmd:interactive hit=true，关闭穿透"]
+  F --> G{"按下且位移超过 4px?"}
+  G -- "是" --> H["drag_started，Physics 接管"]
+  H --> I["同一轮询器移动窗口"]
+  I --> J["drag_released，回弹后交还 Base"]
+  G -- "否，头部区，250ms 内，位移 ≤ 4px" --> K["head_patted，低权重 pat_react"]
+```
+
+### 8.3 降级链路
+
+```mermaid
+flowchart TD
+  Q[user_utterance] --> R1{规则命中?}
+  R1 -- 是 --> OUT[Reply route=rule]
+  R1 -- 否 --> R2{本地 LLM 可用?}
+  R2 -- 是 --> R3{输出合法?}
+  R3 -- 是 --> OUT2[Reply route=llm]
+  R3 -- 否 --> F[llm_failed → 兜底台词]
+  R2 -- 否 --> F
+  F --> OUT3[Reply route=fallback]
+  OUT --> V{voice 可用?}
+  OUT2 --> V
+  OUT3 --> V
+  V -- 否 --> T[字幕气泡 + speech_ended failed]
+  V -- 是 --> S[正常播报]
+```
+
+## 9. 编排分流
+
+### 9.1 三条路径
+
+| 顺序 | 条件 | 延迟预算 | 产出 `route` | 失败处理 |
+|---|---|---|---|---|
+| ① 规则 | 台词池条目命中（关键词 / 事件 / 状态 / 冷却全部满足） | ≤ 5ms | `rule` | 命中即返回，不进入 ② |
+| ② LLM | ①未命中，且本地 LLM 健康检查通过 | p95 ≤ 6s，硬超时 8s | `llm` | 超时 / 连接失败 / 输出非法 → `llm_failed` → ③ |
+| ③ 兜底 | ①未命中且 ②不可用或失败 | ≤ 5ms | `fallback` | 兜底集合为空属于装配错误，启动时校验并拒绝启动 |
+
+### 9.2 LLM 输出校验（不合格即视为 `invalid_output`）
+
+| 检查项 | 规则 |
+|---|---|
+| 结构 | 必须能解析出 `{ text, emotion, intent }` 三个字段 |
+| `intent` | 必须严格属于 §4.4 集合；大小写、空格、近义词一律不接受 |
+| `emotion` | 必须严格属于 §4.5 集合 |
+| `text` | 1–120 个字符；单段；不含 Markdown、URL、代码块、括号动作描写 |
+| 越界处理 | 先剥离**装饰性包裹**（代码块围栏、Markdown 粗斜体/行内代码、括号动作描写），再从纯文本、围栏内容或前后废话中**提取** JSON（结构性提取，不改写可朗读正文）；随后尝试一次"仅修复字段"的本地纠正（如 `intent` 未知则置 `none`、`emotion` 未知则置 `neutral`）；剥离/修复后仍按本表 `text` 规则**严格**校验，残留 Markdown、括号、URL 仍不合法 → `llm_failed`。装饰剥离的边界见 ADR 0018 D2 |
+| 语言 | **不做**语言硬校验（不要求"必须含假名"）：语言是内容策略，由提示词段 1、角色卡与台词池保证（ADR 0022）。长度按**码点**计，全角标点（`、。！？…「」『』・〜ー`）合法 |
+| 中日文空格 | 折行产生的半角空格只在"两个中日文字符之间"删除（`はい わかりました` → `はいわかりました`）；ASCII 与 CJK 之间保留（`OK 了解`） |
+
+### 9.3 提示词装配顺序（固定，不可调换）
+
+| 段 | 内容 | 来源 |
+|---|---|---|
+| 1 | 输出格式约束（JSON schema + 枚举全集） | 硬编码 |
+| 2 | 角色卡 | `data/character-card.md` |
+| 3 | 记忆片段（≤ 5 条，纯文本） | `memory.retrieve()` |
+| 4 | 最近 6 轮对话 | 内存环形缓冲，不写库 |
+| 5 | 当前用户话语 | `user_utterance` |
+
+> 段 3 在 `memory` 为空或不可用时**恒为** `记忆片段：（无）`（不得整段消失，也不得改成空字符串）；每条的格式与上限见 §7.5 的实现补充（ADR 0020 D8）。段 1 自本轮起含语言硬约束（ADR 0022）。
+
+### 9.4 配置
+
+| 项 | 默认值 |
+|---|---|
+| 后端 | Ollama；可选 OpenVINO |
+| 地址 | `http://127.0.0.1:11434` |
+| 模型 | `qwen3:4b`（Q4_K_M 量级；`PET_LLM_MODEL` 可覆盖，必须事先 `ollama pull` 到本地，应用不自动拉取；见 ADR 0015 D1.2） |
+| 温度 | 0.8 |
+| 流式 | 关闭（v1 需要完整文本做 schema 校验与整段合成） |
+
+> 上述配置项（以及 §7.4 的 TTS 超时、参考音频/参考文本）都可由工程根目录的 `.env` 提供：**进程环境变量 > `.env` > 代码默认值**，`.env` 只补空缺，不引入第三方依赖（ADR 0018 D1）。`scripts/doctor.mjs` 读同一份 `.env`。
+
+## 10. 成本原则（红线）
+
+### 10.1 红线
+
+| 编号 | 红线 |
+|---|---|
+| $1 | 默认路径（冷启动 → 交互 → 退出）不得产生任何按次计费的外部调用 |
+| $2 | 不得引入需要 API Key 才能启动的组件；缺 Key 必须仍能完整运行 |
+| $3 | 不得在启动、空闲、定时任务中做任何外部网络探测 |
+| $4 | 云端能力只能是显式开关、默认关闭、严格限流的 fallback，且不得进入 ①②③ 的默认链 |
+| $5 | 不得引入 Embedding / 向量数据库 / 云端记忆服务 |
+| $6 | 不得使用按分钟计费的托管 TTS；语音必须来自本地进程 |
+| $7 | 新增任何依赖前必须回答："它会在运行时产生计费调用吗？"答不上来就不加 |
+
+### 10.2 允许的出站目标（白名单，全部是本机回环）
+
+| 目标 | 端口 | 用途 | 协议 |
+|---|---|---|---|
+| `127.0.0.1` | 9880 | GPT-SoVITS `api_v2.py` 合成 | HTTP POST |
+| `127.0.0.1` | 11434 | Ollama 推理 | HTTP POST |
+| `127.0.0.1` | 自定义 | OpenVINO 本地服务（可选） | HTTP POST |
+
+除此之外的出站连接一律视为缺陷。
+
+### 10.3 免费云 API 的准入条件（同时满足才允许存在）
+
+| 条件 | 要求 |
+|---|---|
+| 默认状态 | 关闭；配置文件显式写入 `"allowCloudFallback": true` 才生效 |
+| 调用位置 | 仅能插在 ② 与 ③ 之间，且 ③ 兜底仍然存在 |
+| 限流 | 每分钟 ≤ 2 次，每日 ≤ 50 次；超限立即回落 ③ |
+| 预算 | 硬编码日调用上限常量，达到即熔断到进程退出前不再尝试 |
+| 可观测 | 每次调用写一条 `kind='system'` 的记忆记录，含时间与原因 |
+| 失败策略 | 任一错误（含限流、余额不足）→ 永久降级到 ③，本次会话不再重试 |
+| 文案 | 首次启用时必须在界面上明确提示"已启用外部服务" |
+
+### 10.4 成本验收（每次发版前手测）
+
+| 检查 | 方法 | 通过标准 |
+|---|---|---|
+| 断网可运行 | 禁用所有网络适配器后冷启动并完成一轮对话 | 有回复、有语音、有动作 |
+| 无外部连接 | 任务管理器 / `netstat -ano` 观察进程 | 无外部地址的 ESTABLISHED |
+| 零账单 | 月末核对所有云服务账单 | 全部为 0 |
+| 依赖审计 | 检查 `package.json` 与本地服务清单 | 无计费 SDK |
+
+## 11. 失败与降级矩阵
+
+| 故障 | 检测方式 | 用户可见表现 | 系统行为 | 相关事件 |
+|---|---|---|---|---|
+| 本地 LLM 未启动 | 健康检查失败 / 连接拒绝 | 角色正常回话（兜底台词） | 直接走 ③，本次会话不再探测 ② | `llm_failed{unavailable}` |
+| LLM 超时 | 8s 硬超时 | 同上 | 放弃本次结果，走 ③ | `llm_failed{timeout}` |
+| LLM 输出不合法 | schema / 枚举校验 | 同上 | 同上 | `llm_failed{invalid_output}` |
+| TTS 服务未启动 | 连接拒绝 | 字幕气泡显示文本；嘴型回到闭嘴帧（无口型驱动） | 不重试本次；下次回复再试 | `speech_ended{failed}` |
+| TTS 未配置（参考音频/提示文本缺失） | 启动期检查 | 同上 | 不发起任何 HTTP，直接判失败；日志写明缺失项 | `speech_ended{failed}` |
+| 合成超时 | 首字节 3s / 总 30s（可覆盖） | 同上 | 中止请求 | `speech_ended{failed}` |
+| 播放设备丢失 | Web Audio 异常 | 语音中断，字幕保留 | 释放音频上下文，下次重建 | `speech_ended{failed}` |
+| VRM 缺失 / 解析失败 | 加载异常 | 占位胶囊体 + 托盘提示 | 禁用 `intent` 的动作表现，仍可对话 | 无（`model_ready` 不发） |
+| 骨骼缺失 | humanoid 映射校验 | 同上，并在日志列出缺失骨骼 | 缺失部位不动，其余正常 | 无 |
+| 表情缺失 | blendshape 校验 | 表情不生效，动作正常 | 记录一次告警 | 无 |
+| 表情贴图合成不可用（缺 `EyeMouth` 材质/原贴图/UV 三角形） | 通道创建期校验 | 表情不生效（嘴回到静态闭嘴帧），动作与说话正常 | 通道空转 + 一条 WARN（ADR 0026 D5/D6） | 无 |
+| **官方表情差分缺失**（`data/expressions/` 为空或缺某张） | 加载期逐文件校验 | 对应 emotion 只变嘴型、保持默认睁眼；不叠红晕 | 每个缺失文件一条 WARN，`missing` 进诊断；不得报错、不得阻断启动（ADR 0026 D6.2/D6.4） | 无 |
+| 行走转身（ADR 0026 D1） | — | 走路时朝向移动方向、停下回正 | 指数插值 ≈0.3s；被拖拽/回弹时强制回正，不残留偏航 | 无 |
+| SQLite 打开失败（权限/目录/锁） | `init` 内部捕获 | 无感知 | 自动改用 `:memory:`（同 schema）：本次会话可写可检索，重启即丢 | 无 |
+| SQLite 原生模块缺失 / ABI 不匹配 | `init` 再次失败 | 无感知 | `memory` 置 `disabled`：`retrieve→[]`、`write` 空操作，段 ③ 恒为「（无）」 | 无 |
+| SQLite 写入失败 | 异常 | 无感知 | 记 `lastError` 与 WARN 日志，继续 | 无 |
+| SQLite 检索失败 / 超时 | 异常 | 无感知 | 返回 `[]`，段 ③ 输出「（无）」，回复路由不变 | 无 |
+| 掩膜采集失败 | 上下文丢失 / RT 创建失败 | 命中变粗糙（矩形级） | 退回矩形判定，继续运行 | 无 |
+| DPI / 分辨率变化 | `display-metrics-changed` | 角色短暂错位后复位 | 重建窗口尺寸、锚点与掩膜映射 | 无 |
+| 第二实例启动 | 单实例锁 | 前一个窗口获得焦点 | 新实例直接退出 | 无 |
+
+## 12. 并发与时序
+
+| 场景 | 规定 |
+|---|---|
+| 在途话语数 | 同一时刻最多 1 条 |
+| 新 `user_utterance` 到达 | 先 `orchestrator.cancel()`，再 `voice.stopSpeaking('interrupt')`，再开始新的 `respond`（实现上由 `respond()` 开头执行同一序列，顺序不变） |
+| 打断后的旧语音 | 必须发 `speech_ended{reason:'interrupted'}`，`render` 才退出 `speaking` |
+| `head_patted` 冷却 | 800ms |
+| `handleIntent` 去重 | 同一 `intent` 200ms 内只执行一次 |
+| `thinking` 上限 | 8s；超时按 `llm_failed{timeout}` 处理 |
+| 语音与拖拽 | 互不打断：拖拽只接管身体通道 |
+| 指针轮询 | 单一定时器 ~16ms，同时服务穿透状态机与拖拽位移；不得再开第二个 |
+| 窗口位移 | `walking` / `settling` 复用**同一个** 16ms 轮询器（先推进位移、再读窗口矩形判定穿透）；不得新开定时器（ADR 0024 D6） |
+| 穿透恢复延迟 | 光标进入窗口到可交互约 1–2 帧（16–32ms）；此间快速点击会落空，属已知残余缺陷 |
+| 掩膜刷新 | 窗口内 ≥ 20Hz；窗口外暂停；陈旧阈值 100ms |
+| 穿透切换迟滞 | 离开判定外扩 8px；每次切换后冷却 100ms |
+| 事件派发 | 异步派发，不阻塞 IPC 回包 |
+
+## 13. 非目标（本期明确不做）
+
+| 编号 | 不做 | 原因 |
+|---|---|---|
+| X-1 | 语音识别（ASR） | 本地 ASR 成本与体积高，本期输入只有键盘 |
+| X-2 | 多角色 / 角色切换 | 状态与记忆模型会翻倍，先做单角色 |
+| X-3 | 寻路、碰撞、重力物理 | `walking` 只是水平循环位移 |
+| X-4 | 云 TTS / 云 LLM 作为默认路径 | 违反 §10.1 |
+| X-5 | 向量检索与 Embedding | 违反 §10.1 $5 |
+| X-6 | 流式 LLM 输出 | 与 schema 校验和整段合成冲突 |
+| X-7 | macOS / Linux 适配 | 违反 C-2 |
+| X-8 | 自动更新、安装包签名 | 与桌宠核心无关，单独立项 |
+| X-9 | 亚像素级精确命中 | `128 × 72` 掩膜 + 双线性插值即精度上限（ADR 0002） |
+
+## 14. 规划目录（尚未创建，仅作契约投影）
+
+| 路径 | 归属 | 说明 |
+|---|---|---|
+| `src/main/shell/` | shell | 窗口、托盘、热键、指针轮询器、穿透状态机 |
+| `src/main/orchestrator/` | orchestrator | 规则、角色卡、LLM 客户端、兜底 |
+| `src/main/voice/` | voice | GPT-SoVITS HTTP 客户端 |
+| `src/main/memory/` | memory | schema、迁移、检索 |
+| `src/renderer/render/` | render | VRM、HFSM、混合、口型、掩膜采集 |
+| `src/renderer/shell/` | shell | 命中判定应答、字幕气泡 |
+| `src/renderer/input/` | shell | 输入条独立窗口页面 |
+| `src/shared/` | 全员 | `types.ts`、事件名常量、枚举常量 |
+| `data/` | 内容 | `character-card.md`、`lines.json`、`rules.json`、`memory.db` |
+| `assets/vrm/` | 资产 | 用户自行放模型，不入库 |
+| `docs/` | 文档 | 本文件、`MODULE_STATUS.md`、`adr/` |
+
+## 15. 变更流程
+
+| 变更类型 | 例子 | 要求 |
+|---|---|---|
+| patch（1.1.x） | 措辞澄清、补表格、修错别字 | 直接改，记一行变更说明 |
+| minor（1.x.0） | 新增 `intent` 值、新增事件、新增接口方法、修正实现规则 | 先 ADR，再改文件，同步 `MODULE_STATUS` |
+| major（x.0.0） | 改名状态/事件、删除接口、改变层语义、改变零成本红线 | ADR + 全模块回归 + 更新所有引用 |
+
+任何情况下都不允许：代码先合入、文档后补。
+
+### 版本历史
+
+| 版本 | 日期 | 摘要 | 依据 |
+|---|---|---|---|
+| 1.0.0 | 2026-10-27 | 初版：模块划分、状态与事件契约、接口、成本原则 | — |
+| 1.1.0 | 2026-10-27 | 命中改为 128×72 alpha 掩膜（禁 readPixels drawing buffer / preserveDrawingBuffer）；穿透恢复改为主进程轮询 + `cmd:probe`；输入条改为独立窗口、主窗口 `focusable` 恒 false；新增 §3.6 平台事实 | ADR 0002、ADR 0003 |
+| 1.2.0 | 2026-10-27 | 补全 shell 手势与探针载荷：`cmd:interactive` 增 `head`（头部区派生布尔，判定权在主进程）；`cmd:drag` 明确只承载 `{phase,x,y,t}`，位移/速度/判定归主进程；`cmd:probe` 明确内容区 CSS 坐标、`getContentBounds()` 与缩放因子为 1；`head_patted` 触发条件补判定归属 | ADR 0004 |
+| 1.2.1 | 2026-10-27 | 仅改 §16.1 的工程根目录占位：`D:\aa3dpet` → `D:\aa3dpet-app`（原目录下 Electron 无法启动，见 ADR 0006/0007）。不改任何规则、状态、事件、接口 | ADR 0007 |
+| 1.3.0 | 2026-10-27 | `OrchestratorState` 增加 `idle` 取值（编排层"没有在途话语"）；§4.1 单列一行并标注与 `Base.idle` 同名不同层；§4.2 增加消歧规则（靠字段访问区分，禁止别名） | ADR 0008 |
+| 1.4.0 | 2026-10-29 | 编排与语音接线：§3.5 改写 `cmd:voice` 为 speak/stop 命令联合体、新增 `cmd:speech` 播放事实通道、明确 `cmd:render-intent` 发出者；§7.4 补 WAV 容器、打断序列、终态兑现与超时覆盖；§9.4 写明默认模型 `qwen3:4b`；§11 补"TTS 未配置"与嘴型归零 | ADR 0015 |
+| 1.4.1 | 2026-10-30 | patch 澄清：§9.2 明确"越界处理"可先剥离装饰性包裹（围栏 / Markdown / 括号动作）再提取与严格校验；§9.4 补 `.env` 配置来源与优先级。不新增/删除字段、事件、状态、`intent`/`emotion`，不改任何模块接口；系统托盘按 §3.1 / §7.2 既有归属落地 | ADR 0018 |
+| 1.5.0 | 2026-10-30 | ① `memory` 落地：§7.5 补实现规则（单文件 WAL、`user_version` 迁移、FTS5 `trigram` + 短词 `LIKE` 降级、CJK 三字滑窗、发布后异步写 user/pet、事实标签、三层降级、段 ③ 格式）；§3.1 更新工具描述；§11 重写 SQLite 失败行。② 字幕显示时机固定为"`intent_resolved` 只登记、`speech_started` 显示、`speech_ended{failed}` 兜底、`completed/interrupted` 留尾巴、15s failsafe"（§7.2）。③ §9.2 补"语言不做硬校验"与"中日文之间不留半角空格"；§8.1 时序图同步。**未新增/删除事件、状态、`intent`、`emotion`、接口方法或字段** | ADR 0020、ADR 0021、ADR 0022 |
+| 1.6.0 | 2026-10-31 | ① **walking 与窗口位移**：§3.5 新增 `cmd:walk`（render → main 命令）、§6.3 新增 `motion_ended`（shell 唯一生产者）；§12 明确位移复用唯一 16ms 轮询器。② **真实回弹**：§4.1 新增 `settling`、`dragged` 退出条件改为"转 `settling`"；§5.1 Physics 层状态集合补 `settling`；§5.3 补两条"回弹期间 intent/摸头被拒"；§7.1 `PhysicsState` 扩为 `'dragged' \| 'settling'`。③ **记忆保留**：§7.5 新增 `prune()` 接口与保留规则（上限 2000、按 `at` 升序、单次 ≤200、`setImmediate` 排期、FTS 触发器同步） | ADR 0024、ADR 0025 |
+| 1.7.0 | 2026-10-31 | ① **walking 朝向**：§4.1 `walking` 的定义补"行走期间整身朝向移动方向（±90° 平滑转身），停下回正"；§11 补一行"行走转身"的降级/行为说明。② **emotion 视觉映射**：§5.2 表情通道补"由贴图合成实现（眼型/嘴型/红晕三层），口型通道优先于表情嘴型"；§7.3 规则补"表情只走贴图合成"的四条禁令与降级要求；§11 补"表情贴图合成不可用"一行。**未新增/删除状态、事件、`intent`、`emotion`、接口方法或 `RenderState` 字段** | ADR 0026 |
+| 1.8.0 | 2026-10-31 | **表情实现路线反转**：§5.2 表情通道与 §7.3 规则改为"眼型与红晕**必须来自外部官方差分贴图**（`data/expressions/`），**禁止**运行期程序化绘制眼型/瞳孔/眼睑/红晕"；补"还原必须用 ImageData 快照写回、差分缺失只变嘴型"两条；§11 新增"官方表情差分缺失"降级行。ADR 0026 第 1 版的程序化重绘（D2/D4 的图元部分）被 D6 取代。**未新增/删除状态、事件、`intent`、`emotion`、接口方法或 `RenderState` 字段** | ADR 0026 D6 |
+
+## 16. 如何在新对话中接续
+
+### 16.1 启动流程（每个模块对话照抄）
+
+1. 只读三份文件：`docs/CONTRACTS.md`、`docs/MODULE_STATUS.md`、`docs/adr/` 下与本次相关的 ADR。
+2. 用下面这段开场白发起对话（替换方括号）：
+
+```text
+工程根目录：D:\aa3dpet-app
+请先读 docs/CONTRACTS.md、docs/MODULE_STATUS.md，以及 docs/adr/ 下相关 ADR（尤其 0002 命中与穿透、0003 焦点策略）。
+本轮只做【模块名】模块，目标是【一句话目标】。
+动手前先输出三件事，等我确认：
+1) 该模块的对外接口与消费事件（照抄契约，不要改写）；
+2) 与契约的潜在冲突或缺口（没有就写"无"）；
+3) 不超过 5 步的实施计划。
+红线：不新增状态名/事件名/依赖；不引入任何按次计费调用；需要改契约时先出 ADR 草稿。
+另外：§3.6 列出的三条 Windows 事实已是定论，不要再尝试被禁的写法。
+```
+
+3. 确认后开始实现；实现过程中每完成一步，回头对照 §5.3 与 §7 的禁令自查。
+4. 若发现契约确实有缺口：暂停编码 → 写 ADR 草案 → 等确认 → 改契约 → 再继续。
+
+### 16.2 收尾流程（每个模块对话必须执行）
+
+| 步骤 | 动作 | 落点 |
+|---|---|---|
+| 1 | 更新该模块的六节内容 | `MODULE_STATUS.md` |
+| 2 | 若做了关键技术决策，补一份 ADR | `docs/adr/NNNN-*.md` |
+| 3 | 若改了契约，升版本并写变更说明 | `CONTRACTS.md` §15 |
+| 4 | 输出三段结论文本：变更摘要 / 新增坑位 / 下一步建议 | 对话回复 |
+
+### 16.3 模块开发顺序（建议）
+
+| 阶段 | 模块 | 完成标志 |
+|---|---|---|
+| 1 | `shell` + `render` | 透明窗口里有一个能呼吸眨眼、可拖拽、点击穿透正确的 VRM |
+| 2 | `voice` | 给一段固定文本能出声，口型跟着动，能被打断 |
+| 3 | `memory` | 交互能落库，重启后能按关键词取回 |
+| 4 | `orchestrator` | 三条路径齐备，LLM 关闭时仍能对话 |
+
+### 16.4 跨对话禁则
+
+| 编号 | 禁则 |
+|---|---|
+| T-1 | 不得在新对话里重新定义状态、事件、`intent`、`emotion` |
+| T-2 | 不得因为"更方便"而让 `render` 反向调用 `orchestrator` |
+| T-3 | 不得在没有 ADR 的情况下新增运行时依赖 |
+| T-4 | 不得把"以后可能要"的抽象写进代码（本契约已刻意保持最小） |
+| T-5 | 不得跳过 §16.2 的收尾，否则下一个对话必然从零猜测 |
+| T-6 | 不得重试 §3.6 中被标记为"禁止"的写法 |

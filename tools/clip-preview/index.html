@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>CH0335 官方片段预览</title>
+    <style>
+      :root { color-scheme: dark; }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; height: 100vh; display: flex; overflow: hidden;
+        font: 13px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+        background: #14161a; color: #e6e8eb;
+      }
+      #stage { flex: 1; position: relative; }
+      canvas { display: block; }
+      #hud {
+        position: absolute; left: 12px; bottom: 12px; padding: 8px 10px;
+        background: #000a; border-radius: 6px; font-variant-numeric: tabular-nums;
+        pointer-events: none; white-space: pre;
+      }
+      aside {
+        width: 320px; border-left: 1px solid #2a2e35; display: flex;
+        flex-direction: column; background: #181b20;
+      }
+      header { padding: 10px 12px; border-bottom: 1px solid #2a2e35; }
+      header h1 { margin: 0 0 6px; font-size: 14px; font-weight: 600; }
+      header .hint { color: #8b93a1; font-size: 11px; }
+      .controls { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid #2a2e35; }
+      .controls label { display: flex; gap: 4px; align-items: center; color: #b6bdc9; }
+      .controls input[type="range"] { width: 90px; }
+      #list { overflow: auto; flex: 1; padding: 4px 0; }
+      .clip {
+        display: flex; justify-content: space-between; gap: 8px; width: 100%;
+        padding: 5px 12px; border: 0; background: transparent; color: inherit;
+        font: inherit; text-align: left; cursor: pointer;
+      }
+      .clip:hover { background: #22262d; }
+      .clip.active { background: #2b3a55; color: #fff; }
+      .clip .dur { color: #8b93a1; font-variant-numeric: tabular-nums; }
+      .clip.active .dur { color: #c8d4e6; }
+      .clip .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #status { padding: 8px 12px; border-top: 1px solid #2a2e35; color: #8b93a1; font-size: 11px; }
+      #error { padding: 12px; color: #ff8080; white-space: pre-wrap; }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/node_modules/three/build/three.module.js",
+          "three/addons/": "/node_modules/three/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="stage"><div id="hud"></div></div>
+    <aside>
+      <header>
+        <h1>CH0335 官方片段</h1>
+        <div class="hint">点片段试听；空格暂停；↑/↓ 切换；拖拽旋转，滚轮缩放。</div>
+      </header>
+      <div class="controls">
+        <label><input id="loop" type="checkbox" checked />循环</label>
+        <label>裁剪 <input id="trim" type="range" min="0" max="6" step="0.1" value="0" /> <span id="trimVal">整段</span></label>
+      </div>
+      <div id="list"></div>
+      <div id="status">加载中…</div>
+    </aside>
+    <script type="module">
+      import * as THREE from 'three';
+      import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+      import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+      const stage = document.getElementById('stage');
+      const hud = document.getElementById('hud');
+      const listEl = document.getElementById('list');
+      const statusEl = document.getElementById('status');
+      const loopEl = document.getElementById('loop');
+      const trimEl = document.getElementById('trim');
+      const trimValEl = document.getElementById('trimVal');
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.setClearColor(0x1b1e23, 1);
+      stage.appendChild(renderer.domElement);
+
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(35, 1, 0.01, 100);
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.target.set(0, 0.9, 0);
+
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x444a55, 2.4));
+      const key = new THREE.DirectionalLight(0xffffff, 2.0);
+      key.position.set(1.5, 3, 2.5);
+      scene.add(key);
+      const rim = new THREE.DirectionalLight(0x99bbff, 1.0);
+      rim.position.set(-2, 1.5, -2);
+      scene.add(rim);
+
+      const grid = new THREE.GridHelper(4, 8, 0x3a4150, 0x262b33);
+      scene.add(grid);
+
+      let mixer = null;
+      let actions = new Map();
+      let clips = [];
+      let current = null;
+      let playing = false;
+      let clock = new THREE.Clock();
+
+      function resize() {
+        const w = stage.clientWidth;
+        const h = stage.clientHeight;
+        renderer.setSize(w, h, false);
+        renderer.domElement.style.width = w + 'px';
+        renderer.domElement.style.height = h + 'px';
+        camera.aspect = w / Math.max(1, h);
+        camera.updateProjectionMatrix();
+      }
+      new ResizeObserver(resize).observe(stage);
+
+      // 与 src/renderer/render/clip-bank.ts 的 trimClip 同构（按时间裁关键帧）
+      function trimClip(clip, maxSeconds) {
+        if (!(maxSeconds > 0) || clip.duration <= maxSeconds) return clip;
+        const tracks = clip.tracks.map((track) => {
+          const times = track.times;
+          if (times.length < 2) return track;
+          const stride = track.values.length / times.length;
+          let count = 0;
+          while (count < times.length && times[count] <= maxSeconds) count += 1;
+          if (count >= times.length) return track;
+          count = Math.max(2, count);
+          const clone = track.clone();
+          clone.times = times.slice(0, count);
+          clone.values = track.values.slice(0, count * stride);
+          return clone;
+        });
+        return new THREE.AnimationClip(`${clip.name}@${maxSeconds}s`, maxSeconds, tracks);
+      }
+
+      function play(name) {
+        const action = actions.get(name);
+        if (!action) return;
+        const fade = 0.2;
+        if (current && current !== action) {
+          action.reset().setEffectiveWeight(1).play();
+          action.crossFadeFrom(current, fade, false);
+        } else {
+          action.reset().setEffectiveWeight(1).play();
+        }
+        action.setLoop(loopEl.checked ? THREE.LoopRepeat : THREE.LoopOnce, Infinity);
+        action.clampWhenFinished = !loopEl.checked;
+        current = action;
+        playing = true;
+        for (const el of listEl.children) el.classList.toggle('active', el.dataset.name === name);
+        const clip = action.getClip();
+        statusEl.textContent = `${name}  ${clip.duration.toFixed(2)}s  ${clip.tracks.length} tracks`;
+      }
+
+      function applyTrim() {
+        const value = Number(trimEl.value);
+        trimValEl.textContent = value > 0 ? `${value.toFixed(1)}s` : '整段';
+        if (!clips.length) return;
+        const name = current ? current.getClip().name.replace(/@[\d.]+s$/, '') : null;
+        actions.clear();
+        mixer.stopAllAction();
+        for (const clip of clips) {
+          const use = value > 0 ? trimClip(clip, value) : clip;
+          actions.set(clip.name, mixer.clipAction(use));
+        }
+        current = null;
+        if (name && actions.has(name)) play(name);
+      }
+      trimEl.addEventListener('input', applyTrim);
+      loopEl.addEventListener('change', () => { if (current) play(current.getClip().name.replace(/@[\d.]+s$/, '')); });
+
+      addEventListener('keydown', (e) => {
+        if (e.code === 'Space') {
+          e.preventDefault();
+          playing = !playing;
+          mixer.timeScale = playing ? 1 : 0;
+        }
+        if (e.code === 'ArrowDown' || e.code === 'ArrowUp') {
+          e.preventDefault();
+          const items = [...listEl.children];
+          const index = items.findIndex((el) => el.classList.contains('active'));
+          const next = (index + (e.code === 'ArrowDown' ? 1 : items.length - 1)) % items.length;
+          items[next]?.click();
+        }
+      });
+
+      new GLTFLoader().load(
+        '/CH0335.glb',
+        (gltf) => {
+          scene.add(gltf.scene);
+          gltf.scene.updateMatrixWorld(true);
+
+          // 这段 GLB 的世界尺度只有 ~1.4cm（根节点带 0.01 缩放），而且部分网格的
+          // Box3.setFromObject 会退化成空盒。这里逐网格用 geometry.boundingBox 求并集，
+          // 再整体缩放到 1.6 单位高，预览才看得清、相机参数也不会出现 near=0。
+          const raw = new THREE.Box3();
+          gltf.scene.traverse((object) => {
+            if (!object.isMesh || !object.geometry) return;
+            const geometry = object.geometry;
+            if (!geometry.boundingBox) geometry.computeBoundingBox();
+            if (!geometry.boundingBox) return;
+            const local = geometry.boundingBox.clone().applyMatrix4(object.matrixWorld);
+            if (!Number.isFinite(local.min.x) || !Number.isFinite(local.max.x)) return;
+            raw.union(local);
+          });
+          if (raw.isEmpty()) raw.set(new THREE.Vector3(-0.01, -0.01, -0.01), new THREE.Vector3(0.01, 0.01, 0.01));
+
+          const rawSize = raw.getSize(new THREE.Vector3());
+          const rawCenter = raw.getCenter(new THREE.Vector3());
+          const targetHeight = 1.6;
+          const scale = targetHeight / Math.max(1e-6, rawSize.y);
+          gltf.scene.scale.setScalar(scale);
+          gltf.scene.position.set(-rawCenter.x * scale, -raw.min.y * scale, -rawCenter.z * scale);
+
+          controls.target.set(0, targetHeight * 0.55, 0);
+          camera.position.set(targetHeight * 0.6, targetHeight * 0.75, targetHeight * 1.9);
+          camera.near = 0.01;
+          camera.far = 50;
+          camera.updateProjectionMatrix();
+          grid.position.y = 0;
+          window.__previewFit = {
+            rawSize: rawSize.toArray(),
+            rawCenter: rawCenter.toArray(),
+            scale,
+            height: targetHeight,
+            near: camera.near,
+            far: camera.far,
+          };
+
+          mixer = new THREE.AnimationMixer(gltf.scene);
+          clips = [...gltf.animations].sort((a, b) => a.name.localeCompare(b.name));
+          for (const clip of clips) actions.set(clip.name, mixer.clipAction(clip));
+
+          for (const clip of clips) {
+            const button = document.createElement('button');
+            button.className = 'clip';
+            button.dataset.name = clip.name;
+            button.innerHTML = `<span class="name"></span><span class="dur">${clip.duration.toFixed(2)}s</span>`;
+            button.querySelector('.name').textContent = clip.name;
+            button.addEventListener('click', () => play(clip.name));
+            listEl.appendChild(button);
+          }
+          statusEl.textContent = `${clips.length} 段片段已加载`;
+          resize();
+          play(clips[0].name);
+        },
+        undefined,
+        (error) => {
+          statusEl.textContent = '加载失败';
+          const pre = document.createElement('pre');
+          pre.id = 'error';
+          pre.textContent = String(error?.message ?? error);
+          listEl.appendChild(pre);
+        },
+      );
+
+      renderer.setAnimationLoop(() => {
+        const dt = clock.getDelta();
+        if (mixer && playing) mixer.update(dt);
+        controls.update();
+        renderer.render(scene, camera);
+        if (current) {
+          const clip = current.getClip();
+          hud.textContent = `${clip.name}\n${current.time.toFixed(2)} / ${clip.duration.toFixed(2)}s`;
+        }
+      });
+      resize();
+
+      // 诊断钩子：离屏截图/自动化用（不影响页面行为）
+      window.__previewDiag = () => ({
+        calls: renderer.info.render.calls,
+        triangles: renderer.info.render.triangles,
+        canvas: [renderer.domElement.width, renderer.domElement.height],
+        stage: [stage.clientWidth, stage.clientHeight],
+        camera: camera.position.toArray().map((v) => Number(v.toFixed(3))),
+        target: controls.target.toArray().map((v) => Number(v.toFixed(3))),
+        sceneChildren: scene.children.length,
+        clipCount: clips.length,
+      });
+
+      // 胶片条：同一片段的多个时间点拼成一张图，用来决定"裁到第几秒"。
+      // 返回 PNG dataURL；纯本地渲染，不发网络请求。
+      window.__filmstrip = (clipName, times, tileWidth = 520) => {
+        const action = actions.get(clipName);
+        if (!action || !mixer) return null;
+        const canvas = renderer.domElement;
+        const tileHeight = Math.round((tileWidth * canvas.height) / canvas.width);
+        const cols = Math.min(3, times.length);
+        const rows = Math.ceil(times.length / cols);
+        const sheet = document.createElement('canvas');
+        sheet.width = cols * tileWidth;
+        sheet.height = rows * tileHeight;
+        const ctx = sheet.getContext('2d');
+        ctx.fillStyle = '#1b1e23';
+        ctx.fillRect(0, 0, sheet.width, sheet.height);
+
+        const previous = current;
+        mixer.stopAllAction();
+        action.reset();
+        action.setLoop(THREE.LoopOnce, 1);
+        action.clampWhenFinished = true;
+        action.enabled = true;
+        action.setEffectiveWeight(1);
+        action.play();
+        action.paused = true;
+
+        times.forEach((time, index) => {
+          action.time = Math.min(time, action.getClip().duration);
+          mixer.update(0);
+          renderer.render(scene, camera);
+          ctx.drawImage(
+            canvas,
+            (index % cols) * tileWidth,
+            Math.floor(index / cols) * tileHeight,
+            tileWidth,
+            tileHeight,
+          );
+          ctx.fillStyle = '#9fb3d1';
+          ctx.font = '16px "Segoe UI", sans-serif';
+          ctx.fillText(
+            `${clipName.replace('CH0335_', '')} @ ${time.toFixed(2)}s`,
+            (index % cols) * tileWidth + 10,
+            Math.floor(index / cols) * tileHeight + 22,
+          );
+        });
+
+        action.paused = false;
+        current = previous;
+        if (previous) {
+          previous.reset().play();
+          previous.setEffectiveWeight(1);
+        }
+        return sheet.toDataURL('image/png');
+      };
+    </script>
+  </body>
+</html>
