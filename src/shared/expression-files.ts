@@ -21,8 +21,11 @@ export const EYE_ASSET_FILES: Record<EyeAssetKey, string> = {
 export const BLUSH_ASSET_FILE = 'blush.png';
 
 /**
- * 官方线稿贴花（ADR 0026 D7）：来自 `FX_TEX_CH0335_Img_Face_01.png` 的 3×3 线稿，
- * 由 `tools/` 的切图脚本按连通域裁出。贴花层只读这几张，不参与眼型 UV 合成。
+ * 官方线稿贴花（ADR 0026 D7，**已否决**）。
+ *
+ * 保留常量只是为了文档可追溯：`Cafe_Idle` 动画自带眼皮骨骼平移（`bone_eye_D_*`），
+ * 眨眼不需要任何贴花。这些文件仍在 `data/expressions/` 里作为储备，
+ * 但**没有任何代码会读取它们**（不在 `EXPRESSION_FILES` 白名单内）。
  */
 export const DECAL_FACE_FILES = {
   eyesClosed: 'eyes_closed.png',
@@ -36,6 +39,5 @@ export const DECAL_FACE_FILES = {
 /** 协议放行的全部文件名。 */
 export const EXPRESSION_FILES: readonly string[] = [
   ...Object.values(EYE_ASSET_FILES),
-  ...Object.values(DECAL_FACE_FILES),
   BLUSH_ASSET_FILE,
 ];

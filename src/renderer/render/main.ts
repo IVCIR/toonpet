@@ -22,8 +22,6 @@ const query = new URLSearchParams(window.location.search);
 const frameExclude = query.get('frameExclude') ?? undefined;
 const hideAttachments = query.get('hideAttachments') ?? undefined;
 const modelId = query.get('modelId') ?? undefined;
-// 视觉调试（ADR 0027 D3）：贴花平面用纯色 + 隐藏 EyeMouth，用于核对位置/尺寸
-const decalDebug = query.get('decalDebug') ?? undefined;
 // 自检模式：只接受脚本合成的 PointerEvent，忽略真实鼠标（否则用户动一下鼠标就会打乱场景）
 const ignoreTrustedPointer = query.get('selftest') === '1';
 
@@ -31,7 +29,6 @@ const { module, mask } = createRenderModule(stage, {
   frameExclude,
   hideAttachments,
   modelId,
-  ...(decalDebug ? { decalDebug } : {}),
   // ADR 0024 D5：行走是命令，不是事件——位移物理在主进程，这里只发"往哪边走"
   onWalkRequest: (command) => {
     window.petShell.requestWalk(command);

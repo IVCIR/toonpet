@@ -190,7 +190,6 @@ log('launch', {
   env: {
     ELECTRON_RUN_AS_NODE: env['ELECTRON_RUN_AS_NODE'] ?? null,
     PET_SELFTEST: env['PET_SELFTEST'] ?? null,
-    PET_DECAL_DEBUG: env['PET_DECAL_DEBUG'] ?? null,
     PET_SELFTEST_FALLBACK: env['PET_SELFTEST_FALLBACK'] ?? null,
     PET_SELFTEST_SPEECH: env['PET_SELFTEST_SPEECH'] ?? null,
     PET_SELFTEST_INPUT: env['PET_SELFTEST_INPUT'] ?? null,

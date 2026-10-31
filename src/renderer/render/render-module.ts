@@ -31,8 +31,6 @@ import { approach, walkYawFor, EMOTION_FACE, EMOTION_FADE_MS, fadeProgress, reso
 import type { BlushLevel, EmotionFace, EyeAssetKey, MouthOwner, MouthShape } from './emotion-face';
 import { loadExpressionAssets } from './expression-assets';
 import type { ExpressionAssets, PixelImage } from './expression-assets';
-import { createFaceDecal } from './face-decal';
-import type { FaceDecal, FaceDecalDiagnostics } from './face-decal';
 import { collectFacialGeometry } from './facial-geometry';
 import {
   CH0335_MOUTH_LAYOUT,
@@ -46,7 +44,6 @@ import type {
   FacialChannelDiagnostics,
   MouthLayer,
 } from './facial-texture';
-import { DECAL_FACE_FILES } from '../../shared/expression-files';
 import { createGazeController } from './gaze';
 import type { GazeController, GazeState } from './gaze';
 import { createHfsm } from './hfsm';
@@ -124,22 +121,19 @@ const REQUIRED_BONES = ['head', 'eyeL', 'eyeR'] as const;
 const MOUTH_FRAME_COUNT = CH0335_MOUTH_LAYOUT.columns * CH0335_MOUTH_LAYOUT.rows;
 
 /**
- * 表情嘴型用的**官方图集帧**（High 图集 8×8，行优先）。
- * 只取"看得出情绪"的几帧：轻微张口 / 小口 / 张口。
+ * 表情嘴型用的**官方图集帧**（High 图集 8×8，行优先）。全部来自
+ * `Character_Mouth_High-BgFqI_9W.png`，不是画出来的：
+ *   7 = 嘴角上扬，0 = 细线（抿嘴），4 = 张口，9 = 小口。
  */
-const EMOTION_MOUTH_FRAME = 1;
-
-/** 贴花调试色（`PET_DECAL_DEBUG=red` 等）：只用于核对平面位置，不进生产。 */
-const DEBUG_DECAL_COLORS: Record<string, number> = {
-  red: 0xff0000,
-  green: 0x00ff00,
-  blue: 0x0000ff,
-  yellow: 0xffff00,
+const EMOTION_MOUTH_FRAMES: Record<MouthShape, number> = {
+  none: 0,
+  smile: 7,
+  frown: 0,
+  open: 4,
+  small: 9,
 };
 
-/** 眼皮骨骼 `bone_eye_D_*` 的 X 平移：静止 / 闭眼（取自 `Cafe_Idle` t≈2.5s 的眨眼帧）。 */
-const EYELID_REST_X = 0.000262;
-const EYELID_CLOSED_X = 0.000435;
+
 
 export interface AnimationDiagnostics {
   clipCount: number;
@@ -219,8 +213,6 @@ export interface RenderDiagnostics {
   animation: AnimationDiagnostics | null;
   /** 面部贴图通道（ADR 0026）；null = 未启用 */
   facial: FacialDiagnostics | null;
-  /** 官方线稿贴花层（ADR 0026 D7）；null = 未启用 */
-  decal: FaceDecalDiagnostics | null;
   hfsm: HfsmSnapshot;
   /** ADR 0024：行走 / 回弹状态 + ADR 0026 D1 的行走朝向 */
   motion: {
@@ -272,11 +264,6 @@ export interface RenderModuleOptions {
     direction: 'left' | 'right';
     distancePx: number;
   }) => void;
-  /**
-   * 视觉调试（ADR 0027 D3 的"破坏性实验"）：`red` / `green` / `blue` 时，
-   * 贴花平面改用纯色渲染，并隐藏原 EyeMouth 网格——用来核对平面位置与尺寸。
-   */
-  decalDebug?: string;
 }
 
 class StageRender implements RenderModule {
@@ -347,12 +334,6 @@ class StageRender implements RenderModule {
   /** 上一次重绘的状态指纹（避免无变化时重复上传贴图） */
   private facialKey = '';
 
-  /** 官方线稿贴花层（ADR 0026 D7）：眨眼线 + 嘴线，挂在头骨上 */
-  private decal: FaceDecal | null = null;
-  /** 眨眼是动画自带的（`Cafe_Idle` t≈2.5s）；这里只记录眼皮骨骼供调试摆姿势 */
-  private eyelidBones: { l: THREE.Bone | null; r: THREE.Bone | null } = { l: null, r: null };
-  /** 当前眨眼量 0..1（仅调试摆姿势用；正常播放动画时由 AnimationMixer 驱动） */
-  private blinkAmount = 0;
 
   private ready = false;
   private loading = true;
@@ -429,25 +410,7 @@ class StageRender implements RenderModule {
       }
       this.gaze = createGazeController(loaded.bones);
 
-      // 眨眼用模型自带的眼骨（官方骨骼）；找不到就退化为"不眨眼"
-      const eyeNames: string[] = [];
-      loaded.root.traverse((object) => {
-        if (!object.name.includes('bone_eye_D_')) return;
-        eyeNames.push(object.name);
-        if (object.name.endsWith('bone_eye_D_L')) this.eyelidBones.l = object as THREE.Bone;
-        else if (object.name.endsWith('bone_eye_D_R')) this.eyelidBones.r = object as THREE.Bone;
-      });
-      if (this.eyelidBones.l || this.eyelidBones.r) {
-        console.log(
-          `[render] 眼皮骨骼 eyeL=${String(Boolean(this.eyelidBones.l))} ` +
-            `eyeR=${String(Boolean(this.eyelidBones.r))} candidates=${eyeNames.join('|')}`,
-        );
-      } else {
-        console.warn(`[render] 未找到眼皮骨骼（候选=${eyeNames.join('|') || '(none)'}）`);
-      }
-
       void this.attachFacialChannel();
-      void this.attachFaceDecal();
 
       this.ready = true;
       this.readyPending = true;
@@ -713,7 +676,11 @@ class StageRender implements RenderModule {
     } else if (owner === 'emotion') {
       // 表情嘴型改用**官方高清图集帧**，不再用 Canvas 画的 `glyph`
       // （ADR 0026 D6.6：嘴型/眼型/腮红的每个像素都必须来自图片）
-      layer = { kind: 'atlas', frame: EMOTION_MOUTH_FRAME, frameCount: MOUTH_FRAME_COUNT };
+      layer = {
+        kind: 'atlas',
+        frame: EMOTION_MOUTH_FRAMES[face.mouth] ?? 0,
+        frameCount: MOUTH_FRAME_COUNT,
+      };
     } else {
       layer = { kind: 'static' };
     }
@@ -806,103 +773,6 @@ class StageRender implements RenderModule {
         eyeImageLabel: facial.eyeImageLabel,
       },
     };
-  }
-
-  /**
-   * 官方线稿贴花层（ADR 0026 D7）。
-   *
-   * 线稿来自 `FX_TEX_CH0335_Img_Face_01.png`（官方给 3D 小人做表情用的 3×3 线稿），
-   * 挂在头骨下、参与深度测试，因此随动画走且会被刘海正确遮挡。
-   * 贴图缺失时整层不生效，只记一条 WARN（§11）。
-   */
-  private async attachFaceDecal(): Promise<void> {
-    const model = this.model;
-    if (!model) return;
-
-    const load = async (file: string): Promise<HTMLImageElement | null> => {
-      try {
-        const image = new Image();
-        image.src = `pet-asset://asset/expr/${file}`;
-        await image.decode();
-        return image;
-      } catch {
-        return null;
-      }
-    };
-    const [eyesClosed, mouthLine, mouthOpen, eyeMask] = await Promise.all([
-      load(DECAL_FACE_FILES.eyesClosed),
-      load(DECAL_FACE_FILES.mouthLine),
-      load(DECAL_FACE_FILES.mouthOpen),
-      load(DECAL_FACE_FILES.eyeMask),
-    ]);
-
-    if (!eyesClosed && !mouthLine) {
-      console.warn('[render] 面部线稿贴图缺失，贴花层不启用（§11）');
-      return;
-    }
-
-    this.decal = createFaceDecal({
-      headBone: model.bones.head,
-      root: model.root,
-      meshes: model.meshes,
-      assets: { eyesClosed, mouthLine, mouthOpen, blush: null, eyeMask },
-      skinColor: model.skinColor,
-      debugColor: DEBUG_DECAL_COLORS[this.options.decalDebug ?? ''] ?? null,
-    });
-
-    // 调试：隐藏原 EyeMouth，只留贴花平面，便于核对位置/尺寸
-    if (this.options.decalDebug === 'blink') {
-      // 只为了截图：强制闭眼（眼骨缩放），不叠加线稿贴花
-      this.applyBlink(1);
-      console.log(`[render] 贴花调试：强制闭眼（眼骨缩放）`);
-    } else if (this.options.decalDebug) {
-      const mouthMaterial = this.model?.mouthMaterial ?? null;
-      if (mouthMaterial) mouthMaterial.visible = false;
-      const world = new THREE.Vector3();
-      this.decal.debugWorldPositions().forEach((entry, index) => {
-        console.log(
-          `[render] 贴花平面#${index} world=(${entry.map((v) => v.toFixed(2)).join(',')})`,
-        );
-      });
-      console.log(`[render] 贴花调试平面详情 ${this.decal.debugPlaneInfo()}`);
-      console.log(`[render] 贴花调试模式 decalDebug=${this.options.decalDebug}（已隐藏 EyeMouth）`);
-    }
-
-    const diag = this.decal.diagnostics();
-    console.log(
-      `[render] 面部贴花 ready=${String(diag.ready)} eyePlanes=${diag.eyePlanes} ` +
-        `mouth=${String(diag.mouth)} blush=${String(diag.blush)} ` +
-        `eyeCenter=${diag.eyeCenter?.map((value) => value.toFixed(6)).join(',') ?? '(none)'} ` +
-        `eyePatch=${diag.eyePatch ? `${diag.eyePatch[0].toFixed(1)}x${diag.eyePatch[1].toFixed(1)}` : '-'} ` +
-        `mouthPatch=${diag.mouthPatch ? `${diag.mouthPatch[0].toFixed(1)}x${diag.mouthPatch[1].toFixed(1)}` : '-'} ` +
-        `reason=${diag.reason ?? '-'}`,
-    );
-  }
-
-  /** 每帧推进眨眼：三角包络 0→1→0，总时长 140ms。 */
-  private updateBlink(now: number): void {
-    // 眨眼是**动画自带的**：`Cafe_Idle` 在 t≈2.5s 把眼皮骨骼 `bone_eye_D_*`
-    // 的 X 平移从 0.000262 拉到 0.000435（0.3s 后回落）。
-    // 正常播放时**绝不写这两根骨骼**——写了就会把动画自带的眨眼覆盖掉。
-    // 只有调试模式才摆出"闭眼"那一帧，便于截图核对。
-    if (this.options.decalDebug === 'blink') {
-      this.applyBlink(1);
-    }
-    this.decal?.update();
-  }
-
-  /**
-   * 把眼皮骨骼摆到"闭眼"位置（仅调试用；正常播放动画时由 AnimationMixer 驱动）。
-   * `bone_eye_D_*` 的 X 平移：静止 0.000262 → 闭眼 0.000435。
-   */
-  private applyBlink(amount: number): void {
-    const next = Math.min(1, Math.max(0, amount));
-    this.blinkAmount = next;
-    const x = EYELID_REST_X + (EYELID_CLOSED_X - EYELID_REST_X) * next;
-    for (const bone of [this.eyelidBones.l, this.eyelidBones.r]) {
-      if (!bone) continue;
-      bone.position.x = x;
-    }
   }
 
   /** 拖拽期间的轻微摇摆（ADR 0014 D3）。 */
@@ -1199,7 +1069,6 @@ class StageRender implements RenderModule {
           }
         : null,
       facial: this.facialDiagnostics(now, this.patState(now)),
-      decal: this.decal?.diagnostics() ?? null,
       hfsm: snapshot,
       motion: {
         base: snapshot.base,
@@ -1370,10 +1239,6 @@ class StageRender implements RenderModule {
     // 转身与 `look` 反应共用同一个 Y 轴通道：叠加而不是互相覆盖
     this.animationRoot.rotation.y = look + this.walkYaw;
     this.animationRoot.scale.set(1, 1 - squash, 1);
-
-    // 7) 面部：表情/口型合成（脏矩形重绘）+ 官方线稿贴花（眨眼）
-    this.applyFacial(now);
-    this.updateBlink(now);
   }
 }
 
