@@ -29,6 +29,8 @@ export const DECAL_FACE_FILES = {
   eyesHalf: 'eyes_half.png',
   mouthLine: 'mouth_line.png',
   mouthOpen: 'mouth_open.png',
+  /** 官方遮罩转成的 alpha 图（白 = 盖住原生睁眼） */
+  eyeMask: 'eye_mask_alpha.png',
 } as const;
 
 /** 协议放行的全部文件名。 */

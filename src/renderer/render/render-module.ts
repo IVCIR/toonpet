@@ -808,10 +808,11 @@ class StageRender implements RenderModule {
         return null;
       }
     };
-    const [eyesClosed, mouthLine, mouthOpen] = await Promise.all([
+    const [eyesClosed, mouthLine, mouthOpen, eyeMask] = await Promise.all([
       load(DECAL_FACE_FILES.eyesClosed),
       load(DECAL_FACE_FILES.mouthLine),
       load(DECAL_FACE_FILES.mouthOpen),
+      load(DECAL_FACE_FILES.eyeMask),
     ]);
 
     if (!eyesClosed && !mouthLine) {
@@ -823,7 +824,8 @@ class StageRender implements RenderModule {
       headBone: model.bones.head,
       root: model.root,
       meshes: model.meshes,
-      assets: { eyesClosed, mouthLine, mouthOpen, blush: null },
+      assets: { eyesClosed, mouthLine, mouthOpen, blush: null, eyeMask },
+      skinColor: model.skinColor,
       debugColor: DEBUG_DECAL_COLORS[this.options.decalDebug ?? ''] ?? null,
     });
 
@@ -831,17 +833,17 @@ class StageRender implements RenderModule {
     if (this.options.decalDebug === 'blink') {
       // 只为了截图：强制闭眼线稿常亮，不隐藏原眼（用于判断"叠在原眼上"的观感）
       this.decal.setBlink(1);
-      console.log('[render] 贴花调试：强制眨眼');
+      console.log(`[render] 贴花调试：强制眨眼 ${this.decal.debugPlaneInfo()}`);
     } else if (this.options.decalDebug) {
       const mouthMaterial = this.model?.mouthMaterial ?? null;
       if (mouthMaterial) mouthMaterial.visible = false;
       const world = new THREE.Vector3();
       this.decal.debugWorldPositions().forEach((entry, index) => {
-        world.set(entry[0], entry[1], entry[2]);
         console.log(
           `[render] 贴花平面#${index} world=(${entry.map((v) => v.toFixed(2)).join(',')})`,
         );
       });
+      console.log(`[render] 贴花调试平面详情 ${this.decal.debugPlaneInfo()}`);
       console.log(`[render] 贴花调试模式 decalDebug=${this.options.decalDebug}（已隐藏 EyeMouth）`);
     }
     this.scheduleBlink(performance.now());

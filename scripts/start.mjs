@@ -106,9 +106,12 @@ if (selftest) {
   const fixtureDir = path.join(process.cwd(), 'data', 'expressions.fixtures');
   const officialFiles = ['eyes_happy.png', 'eyes_shy.png', 'eyes_sad.png', 'eyes_surprised.png'];
   const hasOfficial = officialFiles.every((file) => existsSync(path.join(officialDir, file)));
-  if (!env['PET_EXPRESSIONS_DIR'] && !hasOfficial && existsSync(fixtureDir)) {
+  // fixture 默认**不启用**（ADR 0026 D8）：自检截图必须等于真机效果，
+  // 假眼/假腮红曾经被误当成产品效果。需要验证"图片 → 贴图"管线时才显式开启。
+  const wantFixtures = env['PET_SELFTEST_FIXTURES'] === '1';
+  if (wantFixtures && !env['PET_EXPRESSIONS_DIR'] && !hasOfficial && existsSync(fixtureDir)) {
     env['PET_EXPRESSIONS_DIR'] = fixtureDir;
-    console.log('[selftest] 表情差分改用 fixture（非官方美术）：data/expressions.fixtures');
+    console.log('[selftest] 显式启用 fixture（非官方美术，仅验证管线）：data/expressions.fixtures');
   }
 }
 

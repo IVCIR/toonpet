@@ -17,6 +17,8 @@ export interface FaceDecalAssets {
   mouthLine: CanvasImageSource | null;
   mouthOpen: CanvasImageSource | null;
   blush: CanvasImageSource | null;
+  /** 官方遮罩（`FX_TEX_CH0335_Img_Face_02` 转成的 alpha 图）：白 = 盖住，透明 = 不盖 */
+  eyeMask: CanvasImageSource | null;
 }
 
 export interface FaceDecalDiagnostics {
@@ -48,6 +50,8 @@ export interface FaceDecal {
   diagnostics(): FaceDecalDiagnostics;
   /** 调试：各平面的世界坐标（顺序：左眼、右眼、嘴、左腮红、右腮红） */
   debugWorldPositions(): Array<[number, number, number]>;
+  /** 调试：每个平面的可见性/不透明度/贴图状态 */
+  debugPlaneInfo(): string;
   dispose(): void;
 }
 
@@ -63,6 +67,8 @@ export interface FaceDecalOptions {
    * 用来确认"平面在哪、多大、朝哪"——比看线稿直观得多。
    */
   debugColor?: number | null;
+  /** 肤色（遮盖平面用）；缺失时用默认肤色 */
+  skinColor?: { r: number; g: number; b: number } | null;
 }
 
 interface SurfacePatch {
@@ -70,6 +76,8 @@ interface SurfacePatch {
   /** 世界空间的尺寸 */
   width: number;
   height: number;
+  /** 包围盒最靠前（+Z）的坐标：贴花必须放在它前面，否则会被脸自身挡住 */
+  frontZ: number;
 }
 
 /** 贴花平面相对脸皮的抬升量（模型单位）。太小会 z-fighting，太大会浮起来。 */
@@ -91,6 +99,10 @@ const BLUSH_PLANE_SCALE_X = 0.42;
 const BLUSH_PLANE_SCALE_Y = 0.5;
 const BLUSH_OFFSET_Y = 0.35; // 眼睛中心往下多少（相对整块高度）
 const BLUSH_OFFSET_X = 1.35; // 眼睛中心往外多少（相对半宽）
+
+/** 官方遮罩图（493×155）的宽高比与相对眼块的放大倍数。 */
+const EYE_MASK_ASPECT = 155 / 493;
+const EYE_MASK_SCALE_X = 1.33;
 /** 平面尺寸相对 UV 岛包围盒的放大（线稿比几何略大一圈，避免边缘被裁）。 */
 const PATCH_SCALE = 1.25;
 
@@ -143,7 +155,7 @@ function measurePatches(mesh: THREE.Mesh): { eye: SurfacePatch | null; mouth: Su
     if (box.isEmpty()) return null;
     const size = box.getSize(new THREE.Vector3());
     const center = box.getCenter(new THREE.Vector3());
-    return { center, width: size.x, height: size.y };
+    return { center, width: size.x, height: size.y, frontZ: box.max.z };
   };
   return { eye: toPatch(eyeBox), mouth: toPatch(mouthBox) };
 }
@@ -184,6 +196,8 @@ function makePlane(
   mesh.renderOrder = 2;
   mesh.frustumCulled = false;
   mesh.visible = false;
+  // 调试期强制关闭深度测试（贴花必须压在脸上，不能被脸自身挡掉）
+  material.depthTest = false;
   return mesh;
 }
 
@@ -234,6 +248,7 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
       update() {},
       diagnostics: () => diagnostics,
       debugWorldPositions: () => [],
+      debugPlaneInfo: () => 'decal-unavailable',
       dispose() {},
     };
   }
@@ -248,6 +263,7 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
       update() {},
       diagnostics: () => diagnostics,
       debugWorldPositions: () => [],
+      debugPlaneInfo: () => 'decal-unavailable',
       dispose() {},
     };
   }
@@ -257,6 +273,7 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
   const mouthLineTexture = toTexture(assets.mouthLine);
   const mouthOpenTexture = toTexture(assets.mouthOpen);
   const blushTexture = toTexture(assets.blush);
+  const maskTexture = toTexture(assets.eyeMask);
 
   // 量出来的面片是**世界坐标**（模型根带 pixelsPerUnit 缩放，世界单位≈像素）；
   // 贴花挂在头骨下，必须换算回骨骼局部空间，否则尺寸会差 5 万倍。
@@ -266,8 +283,9 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
 
   const halfEyeWidthWorld = patches.eye.width / 4;
   const eyeYWorld = patches.eye.center.y + patches.eye.height * EYE_PLANE_OFFSET_Y;
-  // 所有平面共用同一个 Z（眼睛那块脸的表面），不要用嘴底板自己的 Z——实测它靠前 18px
-  const faceZWorld = patches.eye.center.z + liftWorld;
+  // 所有平面共用同一个 Z：取**包围盒最前面**（眼睛几何有 0.001 的厚度，
+  // 用中心会被脸自身挡住——实测遮盖层完全不显示）
+  const faceZWorld = patches.eye.frontZ + liftWorld;
 
   const leftEyePos = toLocal(new THREE.Vector3(-halfEyeWidthWorld, eyeYWorld, faceZWorld));
   const rightEyePos = toLocal(new THREE.Vector3(halfEyeWidthWorld, eyeYWorld, faceZWorld));
@@ -334,11 +352,39 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
   );
 
   group.add(leftEye, rightEye, mouth, leftBlush, rightBlush);
+
+  // 中层：肤色遮盖平面（官方遮罩 → alpha）。眨眼时把原生睁眼盖成肤色，
+  // 否则闭眼线会叠在睁眼上，出现"重瞳"。
+  const skin = options.skinColor ?? { r: 249, g: 241, b: 236 };
+  const coverWidth = (patches.eye.width * EYE_MASK_SCALE_X) / worldScale;
+  const coverHeight = (coverWidth * EYE_MASK_ASPECT) / 1;
+  const coverMaterial = new THREE.MeshBasicMaterial({
+    color: new THREE.Color(`rgb(${skin.r}, ${skin.g}, ${skin.b})`),
+    alphaMap: maskTexture,
+    transparent: true,
+    opacity: 0,
+    depthTest: true,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+    toneMapped: false,
+  });
+  coverMaterial.polygonOffset = true;
+  coverMaterial.polygonOffsetFactor = -1;
+  coverMaterial.polygonOffsetUnits = -1;
+  const cover = new THREE.Mesh(new THREE.PlaneGeometry(coverWidth, coverHeight), coverMaterial);
+  cover.renderOrder = 1;
+  cover.frustumCulled = false;
+  cover.visible = false;
+  cover.position.copy(
+    toLocal(new THREE.Vector3(patches.eye.center.x, eyeYWorld, faceZWorld)),
+  );
+  group.add(cover);
+
   headBone.add(group);
 
   // 调试模式：所有平面立刻可见（生产路径下由 setBlink / setMouthOpen 控制）
   if (debugColor !== null) {
-    for (const plane of [leftEye, rightEye, mouth, leftBlush, rightBlush]) {
+    for (const plane of [leftEye, rightEye, mouth, leftBlush, rightBlush, cover]) {
       plane.visible = true;
     }
   }
@@ -347,7 +393,7 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
   const headQuat = new THREE.Quaternion();
   headBone.getWorldQuaternion(headQuat);
   const cancel = headQuat.clone().invert();
-  for (const plane of [leftEye, rightEye, mouth, leftBlush, rightBlush]) {
+  for (const plane of [leftEye, rightEye, mouth, leftBlush, rightBlush, cover]) {
     plane.quaternion.copy(cancel);
   }
 
@@ -372,13 +418,17 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
       const next = Math.min(1, Math.max(0, amount));
       blink = next;
       diagnostics.blink = next;
-      // 用不透明度做交叉淡入：线稿是细线，直接切换会闪
+      // 三层同时显隐：肤色遮盖（中层）先盖住原生睁眼，闭眼线稿（顶层）再画上去。
+      // 只做透明度交叉淡入——线稿是细线，直接切换会闪。
       const leftMaterial = leftEye.material as THREE.MeshBasicMaterial;
       const rightMaterial = rightEye.material as THREE.MeshBasicMaterial;
       leftMaterial.opacity = next;
       rightMaterial.opacity = next;
       leftEye.visible = next > 0.02;
       rightEye.visible = next > 0.02;
+      // 遮盖层跟着一起出现/消失；`alphaMap` 保证只盖眼形区域
+      coverMaterial.opacity = next;
+      cover.visible = next > 0.02;
     },
 
     setMouthOpen(amount: number): void {
@@ -414,7 +464,7 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
       if (!headBone.parent) return;
       headBone.getWorldQuaternion(headQuat);
       cancel.copy(headQuat).invert();
-      for (const plane of [leftEye, rightEye, mouth, leftBlush, rightBlush]) {
+      for (const plane of [leftEye, rightEye, mouth, leftBlush, rightBlush, cover]) {
         plane.quaternion.copy(cancel);
       }
     },
@@ -431,6 +481,24 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
         out.push([world.x, world.y, world.z]);
       }
       return out;
+    },
+
+    debugPlaneInfo(): string {
+      const parts: string[] = [];
+      const names = ['eyeL', 'eyeR', 'mouth', 'blushL', 'blushR', 'cover'];
+      const planes = [leftEye, rightEye, mouth, leftBlush, rightBlush, cover];
+      for (let i = 0; i < planes.length; i += 1) {
+        const plane = planes[i];
+        const material = plane.material as THREE.MeshBasicMaterial;
+        const world = new THREE.Vector3();
+        plane.getWorldPosition(world);
+        parts.push(
+          `${names[i]}:vis=${plane.visible} op=${material.opacity.toFixed(2)} ` +
+            `map=${material.map ? `${material.map.image ? 'img' : 'empty'}` : 'null'} ` +
+            `z=${world.z.toFixed(1)} w=${(plane.geometry as THREE.PlaneGeometry).parameters.width.toFixed(3)}`,
+        );
+      }
+      return parts.join(' | ');
     },
 
     dispose(): void {
