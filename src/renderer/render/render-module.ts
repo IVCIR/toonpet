@@ -137,6 +137,9 @@ const DEBUG_DECAL_COLORS: Record<string, number> = {
   yellow: 0xffff00,
 };
 
+/** 眨眼时眼骨 Y 缩放压到多少（0.94 = 几乎压平）。 */
+const BLINK_EYE_SCALE = 0.97;
+
 export interface AnimationDiagnostics {
   clipCount: number;
   clips: string[];
@@ -345,6 +348,10 @@ class StageRender implements RenderModule {
 
   /** 官方线稿贴花层（ADR 0026 D7）：眨眼线 + 嘴线，挂在头骨上 */
   private decal: FaceDecal | null = null;
+  /** 眨眼：直接缩放模型自带的眼骨（`Bip001 Xtra_eyeL/R`），不贴图 */
+  private eyeBones: { l: THREE.Bone | null; r: THREE.Bone | null } = { l: null, r: null };
+  /** 当前眨眼量 0..1 */
+  private blinkAmount = 0;
   /** 下一次眨眼的时刻 */
   private nextBlinkAt = 0;
   /** 当前眨眼动画的起点；null = 不在眨眼 */
@@ -424,6 +431,26 @@ class StageRender implements RenderModule {
         if (bone) this.arbiter.register(bone);
       }
       this.gaze = createGazeController(loaded.bones);
+
+      // 眨眼用模型自带的眼骨（官方骨骼）；找不到就退化为"不眨眼"
+      const eyeNames: string[] = [];
+      loaded.root.traverse((object) => {
+        if (!object.name.toLowerCase().includes('xtra_eye')) return;
+        eyeNames.push(object.name);
+        if (object.name.includes('eyeL') || object.name.includes('eye_L')) {
+          this.eyeBones.l = object as THREE.Bone;
+        } else if (object.name.includes('eyeR') || object.name.includes('eye_R')) {
+          this.eyeBones.r = object as THREE.Bone;
+        }
+      });
+      if (this.eyeBones.l || this.eyeBones.r) {
+        console.log(
+          `[render] 眨眼骨骼 eyeL=${String(Boolean(this.eyeBones.l))} eyeR=${String(Boolean(this.eyeBones.r))} ` +
+            `candidates=${eyeNames.join('|')}`,
+        );
+      } else {
+        console.warn(`[render] 未找到眼骨，眨眼不可用（候选=${eyeNames.join('|') || '(none)'}）`);
+      }
 
       void this.attachFacialChannel();
       void this.attachFaceDecal();
@@ -831,9 +858,9 @@ class StageRender implements RenderModule {
 
     // 调试：隐藏原 EyeMouth，只留贴花平面，便于核对位置/尺寸
     if (this.options.decalDebug === 'blink') {
-      // 只为了截图：强制闭眼线稿常亮，不隐藏原眼（用于判断"叠在原眼上"的观感）
-      this.decal.setBlink(1);
-      console.log(`[render] 贴花调试：强制眨眼 ${this.decal.debugPlaneInfo()}`);
+      // 只为了截图：强制闭眼（眼骨缩放），不叠加线稿贴花
+      this.applyBlink(1);
+      console.log(`[render] 贴花调试：强制闭眼（眼骨缩放）`);
     } else if (this.options.decalDebug) {
       const mouthMaterial = this.model?.mouthMaterial ?? null;
       if (mouthMaterial) mouthMaterial.visible = false;
@@ -866,19 +893,19 @@ class StageRender implements RenderModule {
 
   /** 每帧推进眨眼：三角包络 0→1→0，总时长 140ms。 */
   private updateBlink(now: number): void {
-    const decal = this.decal;
-    if (!decal) return;
-
-    // 调试：强制闭眼常亮，绕过状态机（否则 140ms 后就被设回 0，截图永远是睁眼）
+    // 调试：强制闭眼常亮（绕过状态机，否则 140ms 后就被设回 0）
     if (this.options.decalDebug === 'blink') {
-      decal.setBlink(1);
-      decal.update();
+      this.applyBlink(1);
+      this.decal?.update();
       return;
     }
 
+    // 眨眼 = 缩放模型自带的眼骨（官方骨骼），把眼睛压成一条线。
+    // 实测 44 段动画里没有任何一段是真眨眼，`Cafe_Reaction` 只是把眼骨缩到 0.73（眯眼）。
     if (this.blinkStartedAt === null) {
       if (now < this.nextBlinkAt) {
-        decal.update();
+        this.applyBlink(0);
+        this.decal?.update();
         return;
       }
       this.blinkStartedAt = now;
@@ -887,14 +914,25 @@ class StageRender implements RenderModule {
     const elapsed = now - this.blinkStartedAt;
     const duration = 140;
     if (elapsed >= duration) {
-      decal.setBlink(0);
+      this.applyBlink(0);
       this.blinkStartedAt = null;
       this.scheduleBlink(now);
     } else {
       const progress = elapsed / duration;
-      decal.setBlink(progress < 0.5 ? progress * 2 : (1 - progress) * 2);
+      this.applyBlink(progress < 0.5 ? progress * 2 : (1 - progress) * 2);
     }
-    decal.update();
+    this.decal?.update();
+  }
+
+  /** 把眨眼量写进眼骨缩放（1 = 睁眼，0 = 闭眼）。 */
+  private applyBlink(amount: number): void {
+    const next = Math.min(1, Math.max(0, amount));
+    this.blinkAmount = next;
+    const scaleY = 1 - next * BLINK_EYE_SCALE;
+    for (const bone of [this.eyeBones.l, this.eyeBones.r]) {
+      if (!bone) continue;
+      bone.scale.y = scaleY;
+    }
   }
 
   /** 拖拽期间的轻微摇摆（ADR 0014 D3）。 */
