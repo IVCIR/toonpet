@@ -90,9 +90,9 @@ const SURFACE_LIFT = 0.00012;
  * 直接铺满会盖住鼻子；线稿本身只画了眼睛那一条弧。所以宽高各乘一个手调系数，
  * 并整体上移一点。换模型必须重标（写进 MODULE_STATUS 坑位）。
  */
-const EYE_PLANE_SCALE_X = 1.0; // 相对"半宽"（一只眼）
-const EYE_PLANE_SCALE_Y = 0.62; // 相对整块高度
-const EYE_PLANE_OFFSET_Y = 0.12; // 相对整块高度，正值向上
+const EYE_PLANE_SCALE_X = 0.82; // 相对"半宽"（一只眼）
+const EYE_PLANE_SCALE_Y = 0.62; // 相对整块高度（保留：仅用于未提供贴图宽高比时）
+const EYE_PLANE_OFFSET_Y = -0.08; // 相对整块高度，正值向上；负值下移（包围盒含眉毛，眼珠偏下）
 const MOUTH_PLANE_SCALE_X = 0.95;
 const MOUTH_PLANE_SCALE_Y = 1.0;
 const BLUSH_PLANE_SCALE_X = 0.42;
@@ -276,9 +276,10 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
   const maskTexture = toTexture(assets.eyeMask);
 
   // 量出来的面片是**世界坐标**（模型根带 pixelsPerUnit 缩放，世界单位≈像素）；
-  // 贴花挂在头骨下，必须换算回骨骼局部空间，否则尺寸会差 5 万倍。
-  const worldScale = headBone.getWorldScale(new THREE.Vector3()).x || 1;
-  const toLocal = (world: THREE.Vector3): THREE.Vector3 => headBone.worldToLocal(world.clone());
+  // 贴花挂在根节点下（**不挂骨骼**：骨骼子 Mesh 的包围盒不会被正确重算，实测整层不出画），
+  // 所以位置要换算回根节点局部空间。
+  const worldScale = options.root.getWorldScale(new THREE.Vector3()).x || 1;
+  const toLocal = (world: THREE.Vector3): THREE.Vector3 => options.root.worldToLocal(world.clone());
   const liftWorld = SURFACE_LIFT * worldScale;
 
   const halfEyeWidthWorld = patches.eye.width / 4;
@@ -291,10 +292,16 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
   const rightEyePos = toLocal(new THREE.Vector3(halfEyeWidthWorld, eyeYWorld, faceZWorld));
 
   const debugColor = options.debugColor ?? null;
+  // 线稿贴图的宽高比：平面必须按它来，否则弧线会被拉成"香蕉"（实测 3:1 的弧贴到 1.6:1 上）
+  const closedSource = assets.eyesClosed as { width?: number; height?: number } | null;
+  const closedAspect =
+    closedSource?.width && closedSource?.height ? closedSource.width / closedSource.height : 3.1;
+  const eyePlaneWidth = (patches.eye.width / 2) * EYE_PLANE_SCALE_X;
+  const eyePlaneHeight = eyePlaneWidth / closedAspect;
   const leftEye = makePlane(
     eyeTexture,
-    ((patches.eye.width / 2) * EYE_PLANE_SCALE_X) / worldScale,
-    (patches.eye.height * EYE_PLANE_SCALE_Y) / worldScale,
+    eyePlaneWidth / worldScale,
+    eyePlaneHeight / worldScale,
     1,
     debugColor,
   );
@@ -302,8 +309,8 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
 
   const rightEye = makePlane(
     eyeTextureMirrored,
-    ((patches.eye.width / 2) * EYE_PLANE_SCALE_X) / worldScale,
-    (patches.eye.height * EYE_PLANE_SCALE_Y) / worldScale,
+    eyePlaneWidth / worldScale,
+    eyePlaneHeight / worldScale,
     1,
     debugColor,
   );
@@ -356,11 +363,13 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
   // 中层：肤色遮盖平面（官方遮罩 → alpha）。眨眼时把原生睁眼盖成肤色，
   // 否则闭眼线会叠在睁眼上，出现"重瞳"。
   const skin = options.skinColor ?? { r: 249, g: 241, b: 236 };
-  const coverWidth = (patches.eye.width * EYE_MASK_SCALE_X) / worldScale;
-  const coverHeight = (coverWidth * EYE_MASK_ASPECT) / 1;
+  const coverWidth = (eyePlaneWidth * 1.15) / worldScale;
+  const coverHeight = coverWidth * EYE_MASK_ASPECT;
   const coverMaterial = new THREE.MeshBasicMaterial({
     color: new THREE.Color(`rgb(${skin.r}, ${skin.g}, ${skin.b})`),
-    alphaMap: maskTexture,
+    // 用 `map` 而不是 `alphaMap`：遮罩形状存在**alpha 通道**里，
+    // 而 `alphaMap` 读的是绿通道（我们这张图绿通道恒为 255 → 整块不透明，实测盖成大方块）。
+    map: maskTexture,
     transparent: true,
     opacity: 0,
     depthTest: true,
@@ -380,7 +389,9 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
   );
   group.add(cover);
 
-  headBone.add(group);
+  // 挂根节点（不挂骨骼）：骨骼子 Mesh 的包围盒不会被正确重算，实测整层不出画。
+  // 头骨的世界位移在 `update()` 里逐帧同步到 group 上，所以看起来仍然"跟着头走"。
+  options.root.add(group);
 
   // 调试模式：所有平面立刻可见（生产路径下由 setBlink / setMouthOpen 控制）
   if (debugColor !== null) {
@@ -389,13 +400,19 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
     }
   }
 
-  // 贴花随头骨走，但朝向"世界 +Z"（面朝镜头）：把头的世界朝向抵消掉
-  const headQuat = new THREE.Quaternion();
-  headBone.getWorldQuaternion(headQuat);
-  const cancel = headQuat.clone().invert();
+  // 朝向"世界 +Z"（面朝镜头）：抵消根节点的世界朝向
+  const rootQuat = new THREE.Quaternion();
+  options.root.getWorldQuaternion(rootQuat);
+  const cancel = rootQuat.clone().invert();
   for (const plane of [leftEye, rightEye, mouth, leftBlush, rightBlush, cover]) {
     plane.quaternion.copy(cancel);
   }
+
+  // 头骨在"装配那一刻"的世界位置：之后每帧用它算位移增量
+  const headBaseWorld = headBone.getWorldPosition(new THREE.Vector3());
+  const headNowWorld = new THREE.Vector3();
+  const groupBaseLocal = group.position.clone();
+  const delta = new THREE.Vector3();
 
   diagnostics.ready = Boolean(eyeTexture);
   diagnostics.eyePlanes = [leftEye, rightEye].filter((plane) => plane.material).length;
@@ -460,13 +477,12 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
     },
 
     update(): void {
-      // 贴花是头骨的子节点，骨骼动画会自动带着它走；这里只保持朝向镜头
+      // 贴花挂在根节点上（不挂骨骼），所以每帧把头骨的世界位移增量同步过来：
+      // 视觉上仍然"跟着头走"，但避开了骨骼子 Mesh 被剔除的坑。
       if (!headBone.parent) return;
-      headBone.getWorldQuaternion(headQuat);
-      cancel.copy(headQuat).invert();
-      for (const plane of [leftEye, rightEye, mouth, leftBlush, rightBlush, cover]) {
-        plane.quaternion.copy(cancel);
-      }
+      headBone.getWorldPosition(headNowWorld);
+      delta.copy(headNowWorld).sub(headBaseWorld).divideScalar(worldScale);
+      group.position.copy(groupBaseLocal).add(delta);
     },
 
     diagnostics(): FaceDecalDiagnostics {
@@ -502,7 +518,7 @@ export function createFaceDecal(options: FaceDecalOptions): FaceDecal {
     },
 
     dispose(): void {
-      headBone.remove(group);
+      options.root.remove(group);
       for (const plane of [leftEye, rightEye, mouth, leftBlush, rightBlush]) {
         plane.geometry.dispose();
         const material = plane.material as THREE.MeshBasicMaterial;

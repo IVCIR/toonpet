@@ -869,6 +869,13 @@ class StageRender implements RenderModule {
     const decal = this.decal;
     if (!decal) return;
 
+    // 调试：强制闭眼常亮，绕过状态机（否则 140ms 后就被设回 0，截图永远是睁眼）
+    if (this.options.decalDebug === 'blink') {
+      decal.setBlink(1);
+      decal.update();
+      return;
+    }
+
     if (this.blinkStartedAt === null) {
       if (now < this.nextBlinkAt) {
         decal.update();
