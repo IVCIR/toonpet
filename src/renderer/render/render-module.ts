@@ -137,8 +137,9 @@ const DEBUG_DECAL_COLORS: Record<string, number> = {
   yellow: 0xffff00,
 };
 
-/** 眨眼时眼骨 Y 缩放压到多少（0.94 = 几乎压平）。 */
-const BLINK_EYE_SCALE = 0.97;
+/** 眼皮骨骼 `bone_eye_D_*` 的 X 平移：静止 / 闭眼（取自 `Cafe_Idle` t≈2.5s 的眨眼帧）。 */
+const EYELID_REST_X = 0.000262;
+const EYELID_CLOSED_X = 0.000435;
 
 export interface AnimationDiagnostics {
   clipCount: number;
@@ -348,14 +349,10 @@ class StageRender implements RenderModule {
 
   /** 官方线稿贴花层（ADR 0026 D7）：眨眼线 + 嘴线，挂在头骨上 */
   private decal: FaceDecal | null = null;
-  /** 眨眼：直接缩放模型自带的眼骨（`Bip001 Xtra_eyeL/R`），不贴图 */
-  private eyeBones: { l: THREE.Bone | null; r: THREE.Bone | null } = { l: null, r: null };
-  /** 当前眨眼量 0..1 */
+  /** 眨眼是动画自带的（`Cafe_Idle` t≈2.5s）；这里只记录眼皮骨骼供调试摆姿势 */
+  private eyelidBones: { l: THREE.Bone | null; r: THREE.Bone | null } = { l: null, r: null };
+  /** 当前眨眼量 0..1（仅调试摆姿势用；正常播放动画时由 AnimationMixer 驱动） */
   private blinkAmount = 0;
-  /** 下一次眨眼的时刻 */
-  private nextBlinkAt = 0;
-  /** 当前眨眼动画的起点；null = 不在眨眼 */
-  private blinkStartedAt: number | null = null;
 
   private ready = false;
   private loading = true;
@@ -435,21 +432,18 @@ class StageRender implements RenderModule {
       // 眨眼用模型自带的眼骨（官方骨骼）；找不到就退化为"不眨眼"
       const eyeNames: string[] = [];
       loaded.root.traverse((object) => {
-        if (!object.name.toLowerCase().includes('xtra_eye')) return;
+        if (!object.name.includes('bone_eye_D_')) return;
         eyeNames.push(object.name);
-        if (object.name.includes('eyeL') || object.name.includes('eye_L')) {
-          this.eyeBones.l = object as THREE.Bone;
-        } else if (object.name.includes('eyeR') || object.name.includes('eye_R')) {
-          this.eyeBones.r = object as THREE.Bone;
-        }
+        if (object.name.endsWith('bone_eye_D_L')) this.eyelidBones.l = object as THREE.Bone;
+        else if (object.name.endsWith('bone_eye_D_R')) this.eyelidBones.r = object as THREE.Bone;
       });
-      if (this.eyeBones.l || this.eyeBones.r) {
+      if (this.eyelidBones.l || this.eyelidBones.r) {
         console.log(
-          `[render] 眨眼骨骼 eyeL=${String(Boolean(this.eyeBones.l))} eyeR=${String(Boolean(this.eyeBones.r))} ` +
-            `candidates=${eyeNames.join('|')}`,
+          `[render] 眼皮骨骼 eyeL=${String(Boolean(this.eyelidBones.l))} ` +
+            `eyeR=${String(Boolean(this.eyelidBones.r))} candidates=${eyeNames.join('|')}`,
         );
       } else {
-        console.warn(`[render] 未找到眼骨，眨眼不可用（候选=${eyeNames.join('|') || '(none)'}）`);
+        console.warn(`[render] 未找到眼皮骨骼（候选=${eyeNames.join('|') || '(none)'}）`);
       }
 
       void this.attachFacialChannel();
@@ -873,7 +867,6 @@ class StageRender implements RenderModule {
       console.log(`[render] 贴花调试平面详情 ${this.decal.debugPlaneInfo()}`);
       console.log(`[render] 贴花调试模式 decalDebug=${this.options.decalDebug}（已隐藏 EyeMouth）`);
     }
-    this.scheduleBlink(performance.now());
 
     const diag = this.decal.diagnostics();
     console.log(
@@ -886,52 +879,29 @@ class StageRender implements RenderModule {
     );
   }
 
-  /** 眨眼间隔 2.6–6s（随机，避免机械感）。 */
-  private scheduleBlink(now: number): void {
-    this.nextBlinkAt = now + 2600 + Math.random() * 3400;
-  }
-
   /** 每帧推进眨眼：三角包络 0→1→0，总时长 140ms。 */
   private updateBlink(now: number): void {
-    // 调试：强制闭眼常亮（绕过状态机，否则 140ms 后就被设回 0）
+    // 眨眼是**动画自带的**：`Cafe_Idle` 在 t≈2.5s 把眼皮骨骼 `bone_eye_D_*`
+    // 的 X 平移从 0.000262 拉到 0.000435（0.3s 后回落）。
+    // 正常播放时**绝不写这两根骨骼**——写了就会把动画自带的眨眼覆盖掉。
+    // 只有调试模式才摆出"闭眼"那一帧，便于截图核对。
     if (this.options.decalDebug === 'blink') {
       this.applyBlink(1);
-      this.decal?.update();
-      return;
-    }
-
-    // 眨眼 = 缩放模型自带的眼骨（官方骨骼），把眼睛压成一条线。
-    // 实测 44 段动画里没有任何一段是真眨眼，`Cafe_Reaction` 只是把眼骨缩到 0.73（眯眼）。
-    if (this.blinkStartedAt === null) {
-      if (now < this.nextBlinkAt) {
-        this.applyBlink(0);
-        this.decal?.update();
-        return;
-      }
-      this.blinkStartedAt = now;
-    }
-
-    const elapsed = now - this.blinkStartedAt;
-    const duration = 140;
-    if (elapsed >= duration) {
-      this.applyBlink(0);
-      this.blinkStartedAt = null;
-      this.scheduleBlink(now);
-    } else {
-      const progress = elapsed / duration;
-      this.applyBlink(progress < 0.5 ? progress * 2 : (1 - progress) * 2);
     }
     this.decal?.update();
   }
 
-  /** 把眨眼量写进眼骨缩放（1 = 睁眼，0 = 闭眼）。 */
+  /**
+   * 把眼皮骨骼摆到"闭眼"位置（仅调试用；正常播放动画时由 AnimationMixer 驱动）。
+   * `bone_eye_D_*` 的 X 平移：静止 0.000262 → 闭眼 0.000435。
+   */
   private applyBlink(amount: number): void {
     const next = Math.min(1, Math.max(0, amount));
     this.blinkAmount = next;
-    const scaleY = 1 - next * BLINK_EYE_SCALE;
-    for (const bone of [this.eyeBones.l, this.eyeBones.r]) {
+    const x = EYELID_REST_X + (EYELID_CLOSED_X - EYELID_REST_X) * next;
+    for (const bone of [this.eyelidBones.l, this.eyelidBones.r]) {
       if (!bone) continue;
-      bone.scale.y = scaleY;
+      bone.position.x = x;
     }
   }
 
