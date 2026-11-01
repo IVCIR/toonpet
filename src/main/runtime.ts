@@ -4,7 +4,8 @@
  * 只做装配与 IPC 桥接，不写业务规则：
  * - `cmd:respond`（渲染页/输入条）→ 合成 `user_utterance` 事件 → orchestrator（§6.3 唯一入口）；
  * - `cmd:speech`（渲染侧播放事实）→ voice；
- * - `head_patted`（shell 发）→ orchestrator 的规则池（§9.1 的事件条件）。
+ * - `head_patted`（shell 发）→ orchestrator 的规则池（§9.1 的事件条件）；
+ * - `model_ready`（render 发）→ 生命周期心跳立刻预热一次（ADR 0033 D2）。
  *
  * 启动期校验（§9.1 ③）：`lines.json` 不合法或兜底为空 → 抛错，由 bootstrap 退出进程。
  */
@@ -19,10 +20,18 @@ import { createMemory } from './memory';
 import type { Memory, MemorySnapshot } from './memory';
 import { attachUtteranceHandler, createOrchestrator } from './orchestrator';
 import type { Orchestrator, OrchestratorSnapshot } from './orchestrator';
+import { createHeartbeat } from './orchestrator/heartbeat';
+import type { Heartbeat, HeartbeatSnapshot } from './orchestrator/heartbeat';
 import { createLlmClient } from './orchestrator/llm-client';
 import type { LlmClient } from './orchestrator/llm-client';
 import { createRulePool, parseLinesFile } from './orchestrator/rule-pool';
 import type { RulePool } from './orchestrator/rule-pool';
+import { createPresence } from './presence';
+import type { PresencePort } from '../shared/world-types';
+import { resolveHeartbeatGate } from './heartbeat-config';
+import { onModelReady, readModelReadyAt, resetModelReady } from './model-ready';
+import { resetProactiveStats } from './proactive-stats';
+import { resolveProactiveEnabled } from './proactive-config';
 import { createVoice } from './voice';
 import type { Voice, VoiceSnapshot } from './voice';
 import { createTtsClient } from './voice/gpt-sovits-client';
@@ -41,6 +50,17 @@ export interface RuntimeSnapshot {
   llm: { model: string; baseUrl: string; requestTimeoutMs: number };
   tts: { enabled: boolean; disabledReason: string | null; baseUrl: string };
   data: { cardChars: number; ruleCount: number; fallbackCount: number; dataDir: string };
+  /** ADR 0031 D6：主动性开关的最终裁决结果（自检据此断言"默认硬关"） */
+  proactive: {
+    enabled: boolean;
+    reason: string;
+    thresholds: Record<string, number | undefined>;
+  };
+  /**
+   * ADR 0033：生命周期心跳与冷启动预热的诊断读数。
+   * 自检据此断言"零后台推理"（`enabled === false && running === false && attempts === 0`）。
+   */
+  warmup: HeartbeatSnapshot;
 }
 
 export interface Runtime {
@@ -111,9 +131,13 @@ function makeRuntime(deps: RuntimeDeps): Runtime {
   let tts: TtsClient | null = null;
   let rules: RulePool | null = null;
   let memory: Memory | null = null;
+  let presence: PresencePort | null = null;
+  let proactiveGate = { enabled: false, reason: 'not-started', thresholds: {} };
+  let heartbeat: Heartbeat | null = null;
   let cardChars = 0;
   let offUtterance: (() => void) | null = null;
   let offPat: (() => void) | null = null;
+  let offModelReady: (() => void) | null = null;
 
   const onSpeech = (_event: IpcMainEvent, report: unknown): void => {
     if (!isSpeechReport(report)) {
@@ -183,6 +207,31 @@ function makeRuntime(deps: RuntimeDeps): Runtime {
         logWarn('memory', '记忆已被 PET_MEMORY_DISABLE 关闭（段 3 恒为"（无）"）');
       }
 
+      // ADR 0030：在场感（Win32 只读）。它自己 2s 节流、懒采样，不开定时器。
+      presence = createPresence({
+        log: (level, message, data) =>
+          level === 'warn' ? logWarn('presence', message, data) : logInfo('presence', message, data),
+      });
+      // 启动时先采一次：让第一条日志就能看出"读不读得到空闲毫秒"，而不是等到 90s 后
+      const firstPresence = presence.getSnapshot();
+      logInfo('presence', '在场感首采', {
+        userIdleMs: firstPresence.userIdleMs,
+        foregroundTitle: firstPresence.foregroundTitle,
+        foregroundClass: firstPresence.foregroundClass,
+        // ADR 0032 D1：进提示词的是这一个，原始标题只留在上一行给诊断
+        foregroundCategory: firstPresence.foregroundCategory,
+      });
+
+      // ADR 0032 D4：托盘的两行诊断是"本进程内"的读数，装配时清零（重启即归零）
+      resetProactiveStats();
+
+      proactiveGate = resolveProactiveEnabled();
+      if (proactiveGate.enabled) {
+        logInfo('orchestrator', '主动性已启用（ADR 0031）', { gate: proactiveGate.reason });
+      } else {
+        logInfo('orchestrator', '主动性已关闭（ADR 0031）', { gate: proactiveGate.reason });
+      }
+
       orchestrator = createOrchestrator({
         bus: appBus,
         voice,
@@ -190,6 +239,10 @@ function makeRuntime(deps: RuntimeDeps): Runtime {
         rules,
         card,
         memory,
+        // ADR 0030：在场感只读端口。koffi 缺失时它自己降级成"读不到"，不阻断启动
+        presence: presence ?? undefined,
+        // ADR 0031：主动性。自检默认硬关（PET_SELFTEST=1），阈值可用 PET_PROACTIVE_* 覆盖
+        proactive: { enabled: proactiveGate.enabled, thresholds: proactiveGate.thresholds },
         log: (level, message, data) =>
           level === 'warn' ? logWarn('orchestrator', message, data) : logInfo('orchestrator', message, data),
       });
@@ -198,6 +251,49 @@ function makeRuntime(deps: RuntimeDeps): Runtime {
       offPat = appBus.subscribe('head_patted', (payload) => {
         orchestrator?.handleHeadPatted(payload.patCount);
       });
+
+      // ADR 0033 D1：生命周期心跳与主动性**彻底解耦**。它是独立的一个 15s 节拍，
+      // 目前只做冷启动预热；`PET_PROACTIVE_DISABLE=1` 关掉的是"要不要打扰"，不是"把模型热好"。
+      const warmupGate = resolveHeartbeatGate();
+      heartbeat = createHeartbeat({
+        llm,
+        presence,
+        enabled: warmupGate.enabled,
+        reason: warmupGate.reason,
+        // 只读两个事实：心跳不改编排状态，也不替它做决定（§7.7 I-1）
+        host: {
+          isBusy: () => {
+            const snapshot = orchestrator?.snapshot();
+            // 编排层还没装配好 → 按"忙"处理：别在启动窗口里跟模型加载抢 CPU
+            if (!snapshot) return true;
+            return snapshot.state !== 'idle' || snapshot.inflightUtteranceId !== null || snapshot.voiceBusy;
+          },
+          isLlmDisabled: () => orchestrator?.snapshot().llmDisabled === true,
+        },
+        log: (level, message, data) =>
+          level === 'warn'
+            ? logWarn('heartbeat', message, data)
+            : logInfo('heartbeat', message, data),
+      });
+
+      // 总闸的裁决结果由 heartbeat.start() 自己记一条（关闭时连定时器都不建，ADR 0033 D1.1）
+
+      // ADR 0033 D2：她站上桌面（`model_ready`）的那一瞬间就发一次预热 ——
+      // 这样"她出现"与"模型热好"同时发生，首问不再撞 8s 冷启动预算。
+      // 走 `model-ready` 的观察者而不是 `appBus`：后者会把事件回环转发给渲染侧（见该文件注释）。
+      offModelReady = onModelReady(() => {
+        heartbeat?.warmUpNow('model-ready');
+      });
+
+      heartbeat.start();
+
+      // 渲染进程可能比 runtime 装配得更快（自检里实测会发生）：`model_ready` 早到的那一次
+      // 由 shell 落的闩锁补回来，否则"最该预热的那一次"恰好会被丢掉（ADR 0033 D2.2）。
+      const earlyReadyAt = readModelReadyAt();
+      if (earlyReadyAt !== null) {
+        logInfo('heartbeat', 'model_ready 早于编排装配完成，补发一次预热', { readyAt: earlyReadyAt });
+        heartbeat.warmUpNow('model-ready');
+      }
 
       ipcMain.on(IPC_CHANNELS.speech, onSpeech);
 
@@ -217,11 +313,18 @@ function makeRuntime(deps: RuntimeDeps): Runtime {
       ipcMain.removeListener(IPC_CHANNELS.speech, onSpeech);
       offUtterance?.();
       offPat?.();
+      offModelReady?.();
       offUtterance = null;
       offPat = null;
+      offModelReady = null;
+      // ADR 0033：心跳先停（不再发任何预热请求），再拆编排/语音
+      heartbeat?.stop();
+      heartbeat = null;
+      resetModelReady();
       voice?.dispose();
       orchestrator?.dispose();
       memory?.close();
+      presence = null;
       voice = null;
       orchestrator = null;
       memory = null;
@@ -229,7 +332,7 @@ function makeRuntime(deps: RuntimeDeps): Runtime {
     },
 
     snapshot(): RuntimeSnapshot {
-      if (!orchestrator || !voice || !llm || !tts || !rules || !config || !memory) {
+      if (!orchestrator || !voice || !llm || !tts || !rules || !config || !memory || !heartbeat) {
         throw new Error('runtime 尚未 start');
       }
       return {
@@ -244,6 +347,8 @@ function makeRuntime(deps: RuntimeDeps): Runtime {
           fallbackCount: rules.fallbacks.length,
           dataDir: config.dataDir,
         },
+        proactive: { ...proactiveGate, thresholds: { ...proactiveGate.thresholds } },
+        warmup: heartbeat.snapshot(),
       };
     },
   };

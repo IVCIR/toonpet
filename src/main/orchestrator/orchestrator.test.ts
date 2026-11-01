@@ -3,9 +3,11 @@ import test from 'node:test';
 import type { EventName, EventPayloads } from '../../shared/events';
 import { IPC_CHANNELS } from '../../shared/ipc';
 import type { MemoryFact, MemoryPort, MemoryWrite } from '../../shared/memory-types';
+import type { PresencePort } from '../../shared/world-types';
 import type { EventBus, RendererSink } from '../event-bus';
-import { createOrchestrator } from './index';
-import type { Orchestrator, VoicePort } from './index';
+import { readProactiveStats, resetProactiveStats } from '../proactive-stats';
+import { PROACTIVE_HISTORY_USER, PROACTIVE_PROMPT_USER, createOrchestrator } from './index';
+import type { Orchestrator, ProactiveOptions, VoicePort } from './index';
 import type { LlmChatRequest, LlmChatResult, LlmClient, LlmHealth } from './llm-client';
 import { buildPrompt, formatMemoryFacts } from './prompt';
 import { createRulePool, parseLinesFile } from './rule-pool';
@@ -104,6 +106,8 @@ function makeLlm(options: {
       return { ok: true, content: '{"text":"老师，我在。","emotion":"neutral","intent":"nod"}' };
     },
   };
+  // ADR 0033：预热已迁到 `heartbeat.ts`，编排层的桩不再需要 `warmup`
+  // （不实现它恰好也验证了"客户端没有预热能力时心跳静默跳过"）。
   return llm;
 }
 
@@ -121,6 +125,12 @@ const LINES = {
       match: { on: 'head_patted' },
       reply: { text: '规则回复：请不要这样。', emotion: 'shy', intent: 'pat_react' },
       cooldownMs: 0,
+    },
+    {
+      id: 'idle',
+      match: { on: 'idle' },
+      reply: { text: '空闲台词：……先生、还在吗。', emotion: 'neutral', intent: 'look_at_user' },
+      cooldownMs: 900000,
     },
   ],
   fallbacks: [
@@ -172,13 +182,21 @@ async function flushImmediate(): Promise<void> {
 }
 
 function setup(
-  options: { llm?: Parameters<typeof makeLlm>[0]; voice?: Partial<VoicePort>; memory?: FakeMemory | null } = {},
+  options: {
+    llm?: Parameters<typeof makeLlm>[0];
+    voice?: Partial<VoicePort>;
+    memory?: FakeMemory | null;
+    now?: () => number;
+    presence?: PresencePort;
+    proactive?: ProactiveOptions;
+    lines?: typeof LINES;
+  } = {},
 ): Harness {
   const bus = new FakeBus();
   const voice = makeVoice(options.voice);
   const llm = makeLlm(options.llm);
   const memory = options.memory === null ? makeMemory() : (options.memory ?? makeMemory());
-  const rules = createRulePool(parseLinesFile(LINES));
+  const rules = createRulePool(parseLinesFile(options.lines ?? LINES));
   const orchestrator = createOrchestrator({
     bus,
     voice,
@@ -186,7 +204,9 @@ function setup(
     rules,
     card: '测试角色卡',
     ...(options.memory === null ? {} : { memory }),
-    now: () => Date.now(),
+    ...(options.presence ? { presence: options.presence } : {}),
+    ...(options.proactive ? { proactive: options.proactive } : {}),
+    now: options.now ?? (() => Date.now()),
     newReplyId: (utteranceId) => `r-${utteranceId}`,
     log: () => undefined,
   });
@@ -437,8 +457,9 @@ test('§9.3 段 3：retrieve 结果注入提示词，查询词就是用户话语
   const system = llm.lastRequest?.messages[0]?.content ?? '';
   assert.match(system, /记忆片段：/);
   assert.match(system, /我喜欢喝咖啡。/);
-  assert.match(system, /\[10-30\] 用户: /);
-  assert.match(system, /\[10-30\] 凯伊: /);
+  // 段 3 的时间标签自 ADR 0030 D4 起是相对时间（`[今日]` / `[3日前]`），这里只断言"有标签"
+  assert.match(system, /^- \[[^\]]+\] 用户: /mu);
+  assert.match(system, /^- \[[^\]]+\] 凯伊: /mu);
   assert.ok(!system.includes('（无）'), '有记忆时不得出现空段占位');
 });
 
@@ -526,3 +547,329 @@ test('formatMemoryFacts：条数上限 5、超出截断、坏时间戳被跳过'
   assert.ok((long[0] ?? '').endsWith('…'));
   assert.ok((long[0] ?? '').length < 200);
 });
+
+// ---------------------------------------------------------------------------
+// 主动性 idle-drive（ADR 0031）
+// ---------------------------------------------------------------------------
+
+/** 没有 `on:'idle'` 台词的台词池：用来验证"规则未命中 → 才走 LLM"这一级 */
+const LINES_NO_IDLE = {
+  version: 1,
+  rules: LINES.rules.filter((rule) => rule.match.on !== 'idle'),
+  fallbacks: LINES.fallbacks,
+};
+
+interface ProactiveHarness extends Harness {
+  /** 手动触发一次"15s 节拍"（真实定时器被替换成了这个） */
+  tick(): void;
+  setNow(value: number): void;
+  setUserIdle(value: number | null): void;
+}
+
+/** 假 presence：空闲值可变，类别固定（段 3.5 用得到，但这里只关心"有无"） */
+function makePresence(initial: number | null): { port: PresencePort; setIdle(value: number | null): void } {
+  const state = { idle: initial };
+  return {
+    port: {
+      getSnapshot: () => ({
+        userIdleMs: state.idle,
+        foregroundTitle: 'main.ts - aa3dpet - Visual Studio Code',
+        foregroundClass: 'Chrome_WidgetWin_1',
+        // ADR 0032 D1：段 3.5 只认归一化类别
+        foregroundCategory: 'coding',
+        at: 0,
+      }),
+    },
+    setIdle(value: number | null): void {
+      state.idle = value;
+    },
+  };
+}
+
+const PROACTIVE_T0 = new Date(2026, 10, 1, 21, 0, 0).getTime();
+/** 默认"用户已经离开键盘 2 分钟" */
+const PROACTIVE_IDLE_MS = 120_000;
+
+function setupProactive(
+  options: {
+    llm?: Parameters<typeof makeLlm>[0];
+    memory?: FakeMemory | null;
+    presence?: { port: PresencePort; setIdle(value: number | null): void };
+    lines?: typeof LINES;
+  } = {},
+): ProactiveHarness {
+  let clock = PROACTIVE_T0;
+  const presence = options.presence ?? makePresence(PROACTIVE_IDLE_MS);
+  let tickCallback: (() => void) | null = null;
+  const harness = setup({
+    ...(options.llm ? { llm: options.llm } : {}),
+    ...(options.memory === undefined ? {} : { memory: options.memory }),
+    ...(options.lines ? { lines: options.lines } : {}),
+    now: () => clock,
+    presence: presence.port,
+    proactive: {
+      enabled: true,
+      intervalMs: 15_000,
+      schedule: (callback) => {
+        tickCallback = callback;
+        return 1;
+      },
+      cancel: () => {
+        tickCallback = null;
+      },
+    },
+  });
+  return {
+    ...harness,
+    tick(): void {
+      // 每次"节拍"都先推进时钟到下一次评估点，模拟真实节拍器
+      clock += 15_000;
+      tickCallback?.();
+    },
+    setNow(value: number): void {
+      clock = value;
+    },
+    setUserIdle(value: number | null): void {
+      presence.setIdle(value);
+    },
+  };
+}
+
+/** 让"距上次交互"足够久：直接跳过 90s 门槛 */
+function passGap(harness: ProactiveHarness): void {
+  harness.setNow(PROACTIVE_T0 + 120_000);
+}
+
+test('ADR 0031 D3：空闲 → 规则命中 → route=rule 主动开口，进历史、不写记忆', async () => {
+  const memory = makeMemory();
+  const h = setupProactive({ memory });
+  passGap(h);
+  h.tick();
+  await flushImmediate();
+
+  const resolved = h.bus.named('intent_resolved');
+  assert.equal(resolved.length, 1);
+  assert.equal(resolved[0]?.route, 'rule');
+  assert.equal(resolved[0]?.intent, 'look_at_user');
+  assert.match(resolved[0]?.text ?? '', /空闲台词/);
+  assert.equal(h.voice.speaks.length, 1, '主动话语走同一条语音链路（§7.4）');
+  assert.equal(h.orchestrator.snapshot().proactiveCount, 1);
+  assert.equal(h.orchestrator.snapshot().historyTurns, 1, 'ADR 0031 D5：必须进对话历史');
+  assert.equal(memory.writes.length, 0, 'ADR 0031 D5.2：自言自语绝不写 memory.db');
+});
+
+test('ADR 0031 D2：用户还在操作（空闲 10s）时一个字都不说', () => {
+  const h = setupProactive();
+  passGap(h);
+  h.setUserIdle(10_000);
+  h.tick();
+
+  assert.equal(h.bus.named('intent_resolved').length, 0);
+  assert.equal(h.voice.speaks.length, 0);
+  assert.equal(h.orchestrator.snapshot().lastProactiveSkip, 'user-active');
+});
+
+test('ADR 0031 D2.2：用户离开超过 5 分钟 → 不打扰（对空房间说话不算灵魂感）', () => {
+  const h = setupProactive();
+  passGap(h);
+  h.setUserIdle(6 * 60_000);
+  h.tick();
+  assert.equal(h.bus.named('intent_resolved').length, 0);
+  assert.equal(h.orchestrator.snapshot().lastProactiveSkip, 'user-away');
+});
+
+test('ADR 0031 D4.1：LLM 未做过健康检查时，规则未命中就保持沉默（不擅自探测）', async () => {
+  const h = setupProactive({ lines: LINES_NO_IDLE });
+  passGap(h);
+  h.tick();
+  await flushImmediate();
+
+  assert.equal(h.llm.chatCalls, 0, 'LLM 从未健康检查过时，主动路径不得擅自发起推理');
+  assert.equal(h.bus.named('intent_resolved').length, 0);
+  assert.equal(h.voice.speaks.length, 0);
+  // 判定通过但"没有台词 + LLM 不可用"：托盘必须看到 no-lines，而不是"已开口"（ADR 0032 D4）
+  assert.equal(readProactiveStats().lastReason, 'no-lines');
+  assert.equal(readProactiveStats().firedCount, 0);
+});
+
+test('ADR 0031 D4.2：主动路径 LLM 失败 → 完全沉默（不发 llm_failed、不播兜底）', async () => {
+  const h = setupProactive({
+    lines: LINES_NO_IDLE,
+    llm: {
+      chat: async (request) => {
+        // 先让用户那轮成功，把 llmHealthChecked 打开
+        const isProactive = request.messages[request.messages.length - 1]?.content === PROACTIVE_PROMPT_USER;
+        if (isProactive) return { ok: false, reason: 'timeout', detail: '3000ms' };
+        return { ok: true, content: '{"text":"我在。","emotion":"neutral","intent":"nod"}' };
+      },
+    },
+  });
+
+  await h.orchestrator.respond({ text: '今天的天气如何', utteranceId: 'u1' });
+  assert.equal(h.llm.chatCalls, 1);
+  h.bus.emit('speech_ended', { utteranceId: 'u1', reason: 'completed', durationMs: 10 });
+  h.setNow(PROACTIVE_T0 + 120_000);
+  h.tick();
+  await flushImmediate();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(h.llm.chatCalls, 2, '确实尝试过主动推理');
+  assert.equal(
+    h.bus.named('intent_resolved').length,
+    1,
+    '只有用户那一轮；主动失败不得发布任何回复',
+  );
+  assert.equal(h.bus.named('llm_failed').length, 0, '主动失败不广播 llm_failed（§6.3 的失败语义属于用户话语）');
+  assert.equal(h.voice.speaks.length, 1, '不得播兜底台词');
+  assert.equal(h.orchestrator.snapshot().proactiveCount, 0, '失败不计入预算');
+  // 主动推理失败也要在托盘上如实显示"为什么没开口"（ADR 0032 D4）
+  assert.equal(readProactiveStats().lastReason, 'llm-failed');
+  assert.equal(readProactiveStats().firedCount, 0);
+});
+
+test('ADR 0031 D4.3：主动路径 LLM 成功 → route=llm，历史里是"她自己开的口"', async () => {
+  const h = setupProactive({
+    lines: LINES_NO_IDLE,
+    llm: {
+      chat: async (request) => {
+        const isProactive = request.messages[request.messages.length - 1]?.content === PROACTIVE_PROMPT_USER;
+        return {
+          ok: true,
+          content: isProactive
+            ? '{"text":"先生、少し休みませんか。","emotion":"happy","intent":"tilt_head"}'
+            : '{"text":"我在。","emotion":"neutral","intent":"nod"}',
+        };
+      },
+    },
+  });
+
+  await h.orchestrator.respond({ text: '今天的天气如何', utteranceId: 'u1' });
+  // 桩 voice 不会自己发 speech_ended；手动收尾，否则 voiceBusy 会一直是 true（idle-drive 判 busy）
+  h.bus.emit('speech_ended', { utteranceId: 'u1', reason: 'completed', durationMs: 10 });
+  h.setNow(PROACTIVE_T0 + 120_000);
+  h.tick();
+  await flushImmediate();
+
+  const resolved = h.bus.named('intent_resolved');
+  assert.equal(resolved.length, 2);
+  assert.equal(resolved[1]?.route, 'llm');
+  assert.equal(resolved[1]?.text, '先生、少し休みませんか。');
+  assert.equal(h.orchestrator.snapshot().proactiveCount, 1);
+
+  // 下一轮请求的 system 段 3.5 + 历史里能看到她刚说过的话
+  await h.orchestrator.respond({ text: '嗯？', utteranceId: 'u2' });
+  const messages = h.llm.lastRequest?.messages ?? [];
+  const flat = messages.map((message) => `${message.role}:${message.content}`).join('\n');
+  assert.match(flat, new RegExp(PROACTIVE_HISTORY_USER));
+  assert.match(flat, /先生、少し休みませんか。/);
+});
+
+test('ADR 0031 D4.5：主动推理期间用户开口 → 让位，一个字都不发', async () => {
+  const h = setupProactive({
+    lines: LINES_NO_IDLE,
+    llm: {
+      chat: (request) => {
+        const isProactive = request.messages[request.messages.length - 1]?.content === PROACTIVE_PROMPT_USER;
+        if (!isProactive) {
+          return Promise.resolve({ ok: true, content: '{"text":"你好。","emotion":"neutral","intent":"greet"}' });
+        }
+        return new Promise<LlmChatResult>((resolve) => {
+          const abort = (): void => resolve({ ok: false, reason: 'aborted' });
+          if (request.signal?.aborted) return abort();
+          request.signal?.addEventListener('abort', abort, { once: true });
+        });
+      },
+    },
+  });
+
+  // 打开健康检查
+  await h.orchestrator.respond({ text: '今天的天气如何', utteranceId: 'u1' });
+  // 桩 voice 不会自己发 speech_ended；手动收尾，否则 voiceBusy 会一直是 true（idle-drive 判 busy）
+  h.bus.emit('speech_ended', { utteranceId: 'u1', reason: 'completed', durationMs: 10 });
+  h.setNow(PROACTIVE_T0 + 120_000);
+  h.tick();
+  await until(() => h.llm.chatCalls === 2);
+
+  // 用户突然说话（命中规则：不需要再进 LLM）
+  const reply = await h.orchestrator.respond({ text: '你好', utteranceId: 'u2' });
+  assert.equal(reply.text, '规则回复：老师好。');
+  await flushImmediate();
+
+  const resolved = h.bus.named('intent_resolved');
+  assert.equal(resolved.length, 2, '用户那轮 + 更早的 LLM 轮，主动那轮被丢弃');
+  assert.equal(resolved[1]?.route, 'rule', '主动 LLM 被取消后不得发布');
+  assert.equal(h.orchestrator.snapshot().proactiveCount, 0);
+});
+
+test('ADR 0031 D3：主动话语进 system 段 3.5（时间感在主动路径上同样生效）', async () => {
+  const h = setupProactive({
+    lines: LINES_NO_IDLE,
+    llm: {
+      chat: async (request) => {
+        const isProactive = request.messages[request.messages.length - 1]?.content === PROACTIVE_PROMPT_USER;
+        return {
+          ok: true,
+          content: isProactive
+            ? '{"text":"……先生。","emotion":"neutral","intent":"none"}'
+            : '{"text":"我在。","emotion":"neutral","intent":"nod"}',
+        };
+      },
+    },
+  });
+
+  await h.orchestrator.respond({ text: '今天的天气如何', utteranceId: 'u1' });
+  // 桩 voice 不会自己发 speech_ended；手动收尾，否则 voiceBusy 会一直是 true（idle-drive 判 busy）
+  h.bus.emit('speech_ended', { utteranceId: 'u1', reason: 'completed', durationMs: 10 });
+  h.setNow(PROACTIVE_T0 + 120_000);
+  h.tick();
+  await flushImmediate();
+
+  const proactiveRequest = h.llm.lastRequest;
+  const system = proactiveRequest?.messages[0]?.content ?? '';
+  assert.match(system, /環境: /);
+  assert.match(system, /先生は 2 分前まで入力中/);
+  assert.match(system, /前面のアプリ: coding/, 'ADR 0032 D1：段 3.5 里只有归一化类别');
+  assert.match(system, /先生は今、プログラミングに集中している/, 'ADR 0032 D2：coding 追加提示');
+  assert.equal(proactiveRequest?.timeoutMs, 3000, '主动路径必须用 3s 短超时');
+});
+
+// ---------------------------------------------------------------------------
+// 托盘诊断的数据源（ADR 0032 D4）
+// ---------------------------------------------------------------------------
+
+test('ADR 0032 D4：判定与开口都写进 proactive-stats（托盘两行诊断的数据源）', async () => {
+  resetProactiveStats();
+  const h = setupProactive({ lines: LINES });
+
+  // ① 用户正在操作 → user-active，不计入次数
+  passGap(h);
+  h.setUserIdle(10_000);
+  h.tick();
+  assert.equal(readProactiveStats().firedCount, 0);
+  assert.equal(readProactiveStats().lastReason, 'user-active');
+
+  // ② 用户静下来 → 规则命中主动开口 → 次数 +1、原因变 ok
+  h.setUserIdle(PROACTIVE_IDLE_MS);
+  h.tick();
+  await flushImmediate();
+  assert.equal(readProactiveStats().firedCount, 1);
+  assert.equal(readProactiveStats().lastReason, 'ok');
+  assert.equal(h.orchestrator.snapshot().lastProactiveSkip, 'ok');
+
+  // ③ 读出来的是副本：改它不影响下一次读数
+  const copy = readProactiveStats();
+  copy.firedCount = 99;
+  assert.equal(readProactiveStats().firedCount, 1);
+
+  // ④ reset 之后归零（进程重启 / 自检重入）
+  resetProactiveStats();
+  assert.deepEqual(readProactiveStats(), { firedCount: 0, lastReason: null, updatedAt: 0 });
+});
+
+test('ADR 0032 D4：没装配主动性时，托盘看到的是 disabled 而不是含糊的"尚未评估"', () => {
+  resetProactiveStats();
+  setup(); // 不传 proactive
+  assert.equal(readProactiveStats().lastReason, 'disabled');
+  assert.equal(readProactiveStats().firedCount, 0);
+});
+

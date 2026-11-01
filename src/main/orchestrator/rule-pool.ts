@@ -2,9 +2,11 @@
  * 台词池与规则匹配（契约 §4.6、§9.1 ①、§9.3）。
  *
  * 规则条件只允许契约列出的四类：关键词 / 事件 / 状态 / 冷却。
- * 本轮落地的两类：
+ * 本轮落地的三类：
  * - `keywords`：用户话语的**字面**子串命中（大小写不敏感，不做分词、不做语义）；
- * - `on: 'head_patted'`：摸头事件（调用方保证在有效窗口内）。
+ * - `on: 'head_patted'`：摸头事件（调用方保证在有效窗口内）；
+ * - `on: 'idle'`：主动性引擎（ADR 0031 D3）的"空闲台词"，由 `idle-drive` 决定是否询问。
+ *   它不是新事件——`idle` 是编排层自己的状态条件，不广播、不跨进程（§6.3 未改）。
  *
  * 选择策略是**数据顺序的第一个命中者**（不是随机）：确定性让"为什么说了这句"可复现，
  * 也让自检能断言。冷却未满足视为"未命中"，不排队、不补偿。
@@ -13,7 +15,10 @@ import { RULE_DEFAULT_COOLDOWN_MS } from '../../shared/constants';
 import type { Reply } from '../../shared/types';
 import { assertValidReplyShape } from './reply-validator';
 
-export type RuleEvent = 'head_patted';
+export type RuleEvent = 'head_patted' | 'idle';
+
+/** `lines.json` 里 `match.on` 的合法取值（新增值必须同时改这里与 ADR）。 */
+const RULE_EVENTS: readonly RuleEvent[] = ['head_patted', 'idle'];
 
 export interface RuleMatchCondition {
   keywords?: string[];
@@ -87,10 +92,12 @@ export function parseLinesFile(raw: unknown): LinesFile {
       );
     }
     if (matchRaw['on'] !== undefined) {
-      if (matchRaw['on'] !== 'head_patted') {
-        throw new LinesError(`${label}.match.on 只支持 "head_patted"，收到 ${String(matchRaw['on'])}`);
+      if (typeof matchRaw['on'] !== 'string' || !RULE_EVENTS.includes(matchRaw['on'] as RuleEvent)) {
+        throw new LinesError(
+          `${label}.match.on 只支持 ${RULE_EVENTS.map((value) => `"${value}"`).join(' / ')}，收到 ${String(matchRaw['on'])}`,
+        );
       }
-      match.on = 'head_patted';
+      match.on = matchRaw['on'] as RuleEvent;
     }
     if (!match.keywords && !match.on) {
       throw new LinesError(`${label}.match 至少要有关键词或事件条件`);
@@ -126,6 +133,11 @@ export interface RulePool {
   matchText(text: string, now: number): RuleEntry | null;
   /** 摸头事件的规则命中；不命中返回 null */
   matchPat(now: number): RuleEntry | null;
+  /**
+   * 空闲台词的规则命中（ADR 0031 D3）；不命中返回 null。
+   * "该不该问"由 `idle-drive.evaluateIdleDrive()` 决定，这里只负责"有没有这句词"。
+   */
+  matchIdle(now: number): RuleEntry | null;
   /** 兜底台词（§9.1 ③）：轮转取，避免连续两次同一句 */
   fallback(): FallbackEntry;
   readonly rules: readonly RuleEntry[];
@@ -169,6 +181,15 @@ export function createRulePool(lines: LinesFile): RulePool {
     matchPat(at: number): RuleEntry | null {
       for (const entry of lines.rules) {
         if (entry.match.on !== 'head_patted') continue;
+        if (!ready(entry, at)) continue;
+        return take(entry, at);
+      }
+      return null;
+    },
+
+    matchIdle(at: number): RuleEntry | null {
+      for (const entry of lines.rules) {
+        if (entry.match.on !== 'idle') continue;
         if (!ready(entry, at)) continue;
         return take(entry, at);
       }

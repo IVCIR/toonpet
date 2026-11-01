@@ -23,6 +23,7 @@ export type ClipRole =
   | 'held'
   | 'walk'
   | 'walk.carried'
+  | 'sit'
   | 'pat'
   | 'greet'
   | 'happy'
@@ -87,6 +88,18 @@ export const CLIP_RULES: Record<ClipRole, ClipRule> = {
     exact: 'CH0335_Carrier2_Walk',
     patterns: [/carrier2?[_\s-]?walk/i],
     loop: true,
+  },
+  sit: {
+    // ADR 0028 D8：资产里没有名字带 Sit 的片段，唯一真坐姿藏在回忆片段里。
+    // 38.25s 整段是"走进咖啡厅 → 坐下 → 起身"的演出；11.2–13.5s 才是正面坐姿
+    // （屈膝坐在低处、双手在胸前），14.6s 之后起身。裁这一段、播一次并停住最后一帧
+    // （`playHold`），就是"坐在窗口边缘"的姿态。座位道具 `CH0335_Prop_Outlline`
+    // 已被 HIDE_ATTACHMENTS 隐藏，画面上只剩她本人。
+    exact: 'CH0335_my_event088_pastmemory_01',
+    patterns: [/pastmemory/i, /sit[_\s-]?(idle|down|loop)?$/i, /chair|seat/i],
+    loop: false,
+    startSeconds: 11.2,
+    maxSeconds: 13.5,
   },
 
   // ---- 一次性演出（正面）----

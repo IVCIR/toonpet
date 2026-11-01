@@ -1,12 +1,13 @@
 /**
- * render 的 HFSM 三层壳（契约 §5.1；ADR 0014 D3、ADR 0024 D1/D3）。
+ * render 的 HFSM 三层壳（契约 §5.1；ADR 0014 D3、ADR 0024 D1/D3、ADR 0028 D5）。
  *
  * - Base：`idle` / `walking`。`idle` 持续 20–40s 后由内部调度器随机触发一次行走
  *   （§4.1 的进入条件），行走结束或被拖拽打断即回 `idle`。
  * - Overlay：`speaking`（事件驱动）+ `reacting`（一次性，超时自愈）。
- * - Physics：`dragged`（指针拖拽）/ `settling`（松手回弹）。
+ * - Physics：`dragged`（指针拖拽）/ `settling`（松手回弹）/ `sitting`（吸附在别的窗口边缘）。
  *   `settling` 期间不接受新的动作意图与摸头（用户要求"回弹期间不被事件打断"，
  *   唯一例外是重新拖拽——那是 `drag_started` 事件，优先级更高）。
+ *   `sitting` 期间不做行走调度（她坐在那里，不会乱跑），只接受拖拽打断。
  *
  * 纯逻辑：不引用 three、不碰 DOM、不读时钟（时间由调用方传入），可脱离 WebGL 单测。
  * 随机数也注入，测试才能断言"到点必走"。
@@ -94,6 +95,16 @@ export interface Hfsm {
   intent(now: number, intent: Intent, durationMs: number): boolean;
   dragStarted(now: number): void;
   dragReleased(now: number): void;
+  /**
+   * `snap_applied` 事实 → Physics=`sitting`（ADR 0028 D5）。
+   * 进入即打断 `walking` 并清空排期：坐着的时候不该再迈步。
+   */
+  snapApplied(now: number): void;
+  /**
+   * `snap_released` 事实 → 退出 `sitting`（只在仍处于 `sitting` 时生效）。
+   * `drag_started` 会先把状态改成 `dragged`，此时本调用是空操作。
+   */
+  snapReleased(now: number): void;
   /** `motion_ended{kind:'walk'}`：行走结束（到达 / 撞边 / 被打断） */
   walkEnded(now: number): void;
   /** `motion_ended{kind:'settle'}`：回弹结束，Physics 整层退出 */
@@ -175,6 +186,20 @@ export function createHfsm(options: HfsmOptions): Hfsm {
     dragReleased(_now: number): void {
       // D-6：松手先进入回弹（settling），回弹结束才整层退出（§5.1）
       physics = 'settling';
+    },
+
+    snapApplied(_now: number): void {
+      physics = 'sitting';
+      // §4.1：`walking` 的退出条件之一就是被更高的 Physics 层接管
+      if (base === 'walking') base = 'idle';
+      nextWalkAt = null;
+    },
+
+    snapReleased(now: number): void {
+      if (physics !== 'sitting') return;
+      physics = null;
+      base = 'idle';
+      scheduleNextWalk(now);
     },
 
     walkEnded(now: number): void {

@@ -26,6 +26,8 @@ const HEAD_BONE = 'Bip001 Head';
 const EYE_L_BONE = 'Bip001 eye_L';
 const EYE_R_BONE = 'Bip001 eye_R';
 const PELVIS_BONE = 'Bip001 Pelvis';
+const THIGH_L_BONE = 'Bip001 L Thigh';
+const THIGH_R_BONE = 'Bip001 R Thigh';
 
 /**
  * GLTFLoader 会对节点名做 `sanitizeNodeName`（空格→下划线、去掉保留字符），
@@ -41,6 +43,8 @@ const BONE_TARGETS = {
   eyeL: normalizeBoneName(EYE_L_BONE),
   eyeR: normalizeBoneName(EYE_R_BONE),
   pelvis: normalizeBoneName(PELVIS_BONE),
+  thighL: normalizeBoneName(THIGH_L_BONE),
+  thighR: normalizeBoneName(THIGH_R_BONE),
 } as const;
 
 export interface ModelBones {
@@ -48,6 +52,9 @@ export interface ModelBones {
   eyeL: THREE.Bone | null;
   eyeR: THREE.Bone | null;
   pelvis: THREE.Bone | null;
+  /** 大腿（ADR 0028 D8 的程序化坐姿降级用；缺失只是降级，不影响 modelReady） */
+  thighL: THREE.Bone | null;
+  thighR: THREE.Bone | null;
 }
 
 export interface LoadedModel {
@@ -68,6 +75,11 @@ export interface LoadedModel {
   /** 模型自带动画（44 段；由 animation-controller 选择与播放） */
   animations: THREE.AnimationClip[];
   bones: ModelBones;
+  /**
+   * 光环枢轴（`HaloRoot`）。它不是骨骼、不受动画驱动，所以在"角色被搬走"的片段里
+   * 会留在原地（ADR 0028 D8 实测）。渲染侧每帧把它挂到头骨上。
+   */
+  halo: THREE.Object3D | null;
   mouthMaterialName: string | null;
   /** 从 Face 贴图采样的**主色**（众数，不是均值）——给嘴部底板填色用（ADR 0010 D2） */
   skinColor: { r: number; g: number; b: number } | null;
@@ -194,14 +206,37 @@ export function measureAnimatedMinY(
   meshes: readonly THREE.Mesh[],
   maxSamplesPerMesh = 4096,
 ): number | null {
+  const bounds = measureAnimatedBounds(root, meshes, maxSamplesPerMesh);
+  return bounds ? bounds.minY : null;
+}
+
+/**
+ * 当前姿态的**身体包围盒**（root 局部单位，排除配件：光环/武器/道具/笔刷）。
+ *
+ * 用途（ADR 0028 D8）：坐姿片段把身体平移了（回忆片段把角色搬到长椅上：
+ * cx ≈ -0.0035、minY ≈ +0.0058 单位），直接用会让她悬在窗口左上角；
+ * 进入 `sitting` 时按这里的测量值把"身体中心 → 窗口中线、身体最低点 → 窗口底边"。
+ *
+ * 排除规则与 `HIDE_ATTACHMENTS` 同源：光环会由 `haloFollow` 单独处理，
+ * 不能参与"身体"的包围盒，否则包围盒会被拉到光环的位置。
+ */
+export function measureAnimatedBounds(
+  root: THREE.Object3D,
+  meshes: readonly THREE.Mesh[],
+  maxSamplesPerMesh = 4096,
+  excludePattern: RegExp = /(halo|weapon|prop|brush|outline)/i,
+): { minX: number; maxX: number; minY: number } | null {
   root.updateMatrixWorld(true);
   const point = new THREE.Vector3();
   const world = new THREE.Vector3();
-  let min = Number.POSITIVE_INFINITY;
+  let minX = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
   let measured = 0;
 
   for (const mesh of meshes) {
     if (!mesh.visible) continue;
+    if (excludePattern.test(mesh.name || '')) continue;
     const geometry = mesh.geometry;
     const position = geometry?.getAttribute('position');
     if (!position || position.count === 0) continue;
@@ -224,12 +259,17 @@ export function measureAnimatedMinY(
       world.copy(point);
       mesh.localToWorld(world);
       root.worldToLocal(world);
-      if (world.y < min) min = world.y;
+      if (world.y < minY) minY = world.y;
+      if (world.x < minX) minX = world.x;
+      if (world.x > maxX) maxX = world.x;
       measured += 1;
     }
   }
 
-  return measured > 0 && Number.isFinite(min) ? min : null;
+  if (measured === 0 || !Number.isFinite(minY) || !Number.isFinite(minX) || !Number.isFinite(maxX)) {
+    return null;
+  }
+  return { minX, maxX, minY };
 }
 
 /**
@@ -280,10 +320,19 @@ export async function loadModel(options: LoadModelOptions): Promise<LoadedModel>
   scene.updateMatrixWorld(true);
 
   const meshes: THREE.Mesh[] = [];
-  const bones: ModelBones = { head: null, eyeL: null, eyeR: null, pelvis: null };
+  const bones: ModelBones = {
+    head: null,
+    eyeL: null,
+    eyeR: null,
+    pelvis: null,
+    thighL: null,
+    thighR: null,
+  };
   const materialNames = new Set<string>();
   let triangleCount = 0;
   let hasMorphTargets = false;
+  /** 光环的枢轴节点（ADR 0028 D8：光环不参与蒙皮，必须跟着头骨走） */
+  let halo: THREE.Object3D | null = null;
 
   scene.traverse((object) => {
     const bone = object as THREE.Bone;
@@ -293,7 +342,12 @@ export async function loadModel(options: LoadModelOptions): Promise<LoadedModel>
       else if (normalized === BONE_TARGETS.eyeL) bones.eyeL = bone;
       else if (normalized === BONE_TARGETS.eyeR) bones.eyeR = bone;
       else if (normalized === BONE_TARGETS.pelvis) bones.pelvis = bone;
+      else if (normalized === BONE_TARGETS.thighL) bones.thighL = bone;
+      else if (normalized === BONE_TARGETS.thighR) bones.thighR = bone;
     }
+    // `HaloRoot` 是光环的枢轴（`CH0335_Halo` 的父节点）：它是普通 Object3D，
+    // 不在骨骼层级里，也不会被任何片段驱动 —— 角色一移动，光环就留在原地。
+    if (normalizeBoneName(object.name) === 'haloroot') halo = object;
 
     const mesh = object as THREE.Mesh;
     if (!mesh.isMesh || !mesh.geometry) return;
@@ -415,6 +469,7 @@ export async function loadModel(options: LoadModelOptions): Promise<LoadedModel>
     meshes,
     animations: gltf.animations ?? [],
     bones,
+    halo,
     mouthMaterialName: mouth.material?.name ?? null,
     skinColor: sampleDominantColor(face.map),
     mouthMaterial: mouth.material,

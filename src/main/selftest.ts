@@ -6,7 +6,7 @@
  * 探针点不再写死：真实模型的窗口尺寸/角色位置由包围盒决定，自检从
  * `window.petModel.getDiagnostics()` 取候选点，并用真实掩膜（`petMask.probe`）校验命中与头部带。
  */
-import { app, BrowserWindow, globalShortcut, screen } from 'electron';
+import { app, BrowserWindow, desktopCapturer, globalShortcut, screen } from 'electron';
 import type { NativeImage } from 'electron';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -15,6 +15,7 @@ import { logInfo, logWarn } from './log';
 import { getRuntime } from './runtime';
 import { SELFTEST_LLM_MODEL, SELFTEST_TTS_PORT, startSelftestStubs } from './selftest-stubs';
 import { pushScriptedCursor, resetScriptedCursor } from './shell/cursor-source';
+import { pushScriptedForeground, resetScriptedForeground } from './shell/foreground-window';
 import { rectsOverlap } from './shell/input-bar-geometry';
 import { INPUT_HOTKEY_DEFAULT, INPUT_HOTKEY_FALLBACK } from './shell/hotkey';
 import { shell } from './shell/index';
@@ -81,6 +82,21 @@ interface ModelDiagnostics {
     /** 行走朝向（rad；ADR 0026 D1） */
     walkYaw?: number;
     walkYawTarget?: number;
+  };
+  /** ADR 0028：吸附与坐姿 */
+  sit?: {
+    sitting: boolean;
+    edge: 'top' | 'bottom' | null;
+    procedural: boolean;
+    clip: string | null;
+    done: boolean | null;
+    dropPx: number;
+    bobPx: number;
+    offsetPx?: { x: number; y: number };
+    /** 头骨本地四元数（诊断"头在打转"的累积漂移） */
+    headQuat?: [number, number, number, number] | null;
+    headWorld?: { x: number; y: number } | null;
+    headBase?: { baseFrom: string | null; yaw: number; pitch: number; roll: number } | null;
   };
   facial?: {
     emotion: string;
@@ -258,6 +274,64 @@ async function captureScreenshot(
   const captured = await captureToImage(window, fileName);
   logInfo('selftest', 'capture', { mode, pngPath: captured.pngPath, size: captured.image.getSize() });
   return captured.pngPath;
+}
+
+/**
+ * DIP 矩形 → 物理像素矩形（`pushScriptedForeground` 的输入口径）。
+ * 用 Electron 的 `screen.dipToScreenPoint()` 求逆，保证与主进程 `screenToDipPoint`
+ * 的换算完全对称（自检断言才能卡在 ±1px）。
+ */
+function dipRectToPhysical(rect: Rect): {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+} {
+  const topLeft = screen.dipToScreenPoint({ x: rect.x, y: rect.y });
+  const bottomRight = screen.dipToScreenPoint({
+    x: rect.x + rect.width,
+    y: rect.y + rect.height,
+  });
+  return { left: topLeft.x, top: topLeft.y, right: bottomRight.x, bottom: bottomRight.y };
+}
+
+/**
+ * 抓一张**桌面合成图**（ADR 0028 验收：她坐在记事本窗口边缘的样子）。
+ *
+ * `capturePage()` 只给桌宠自己的窗口（透明底），看不到她与目标窗口的相对位置；
+ * 这里用 `desktopCapturer` 抓主显示器整屏（物理像素），是唯一能证明"坐在别人窗口边缘"的证据。
+ * 失败只记 WARN 并返回 null（某些远程会话/受控桌面里屏幕捕获会被禁用）。
+ */
+async function captureDesktop(fileName: string): Promise<{ pngPath: string; size: { width: number; height: number } } | null> {
+  try {
+    const primary = screen.getPrimaryDisplay();
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: {
+        width: Math.round(primary.size.width * primary.scaleFactor),
+        height: Math.round(primary.size.height * primary.scaleFactor),
+      },
+    });
+    const source =
+      sources.find((item) => item.display_id === String(primary.id)) ?? sources[0] ?? null;
+    if (!source || source.thumbnail.isEmpty()) {
+      logWarn('selftest', '桌面截图不可用（没有屏幕源或缩略图为空）', {
+        sources: sources.length,
+        fileName,
+      });
+      return null;
+    }
+    const outputDir = path.join(app.getAppPath(), 'dist', 'selftest');
+    await mkdir(outputDir, { recursive: true });
+    const pngPath = path.join(outputDir, fileName);
+    await writeFile(pngPath, source.thumbnail.toPNG());
+    const size = source.thumbnail.getSize();
+    logInfo('selftest', 'capture-desktop', { fileName, pngPath, size });
+    return { pngPath, size };
+  } catch (error) {
+    logWarn('selftest', '桌面截图失败（继续跑其余断言）', { fileName, error: String(error) });
+    return null;
+  }
 }
 
 interface CapturedImage {
@@ -546,8 +620,45 @@ async function resolvePoints(window: BrowserWindow): Promise<ResolvedPoints> {
   return JSON.parse(raw) as ResolvedPoints;
 }
 
-async function runFallbackSuite(window: BrowserWindow, checks: AcceptanceCheck[]): Promise<void> {
-  const check = (name: string, pass: boolean, detail?: unknown): void => {
+/**
+ * 在**当前姿态**的掩膜里找一个真实命中点（自检用）。
+ *
+ * 为什么需要：坐姿与站姿的身体轮廓完全不同，加载时算出的 body 探针点在 `sitting`
+ * 时会落到空气里（本轮实测：探针判 transparent → 按下被 D-2 门槛拒绝）。
+ * 扫描从窗口中线向两侧扩、从下往上找：先命中的点落在她的下半身，
+ * 既避开头部带（不误触摸头），也离窗口边缘足够远（掩膜边缘容易抖动）。
+ */
+async function findCurrentHitPoint(window: BrowserWindow): Promise<ProbePoint | null> {
+  try {
+    const raw = (await window.webContents.executeJavaScript(
+      `(() => {
+        const m = window.petMask;
+        const w = window.innerWidth;
+        const h = window.innerHeight;
+        const centerX = Math.round(w / 2);
+        const offsets = [];
+        for (let d = 0; d < w / 2 - 24; d += 16) {
+          offsets.push(d);
+          if (d !== 0) offsets.push(-d);
+        }
+        for (let y = h - 48; y > 48; y -= 16) {
+          for (const offset of offsets) {
+            const x = centerX + offset;
+            if (x < 24 || x > w - 24) continue;
+            if (m.probe(x, y).hit) return JSON.stringify({ x, y });
+          }
+        }
+        return 'null';
+      })()`,
+      true,
+    )) as string;
+    return JSON.parse(raw) as ProbePoint | null;
+  } catch {
+    return null;
+  }
+}
+
+async function runFallbackSuite(window: BrowserWindow, checks: AcceptanceCheck[]): Promise<void> {  const check = (name: string, pass: boolean, detail?: unknown): void => {
     checks.push({ name, pass, detail });
   };
 
@@ -696,12 +807,40 @@ async function runInputSuite(window: BrowserWindow, checks: AcceptanceCheck[]): 
   const mainWindow = window;
   const bar = shell.getInputBarWindow();
 
-  // 0) 托盘：启动时创建、菜单项固定、图标为 16×16 占位（ADR 0018 D3）
-  const tray = shell.traySnapshot();
+  // 0) 托盘：启动时创建、顶部两行只读诊断、菜单项固定、图标为 16×16 占位
+  //    （ADR 0018 D3 / ADR 0028 D4 / ADR 0032 D4）
+  let tray = shell.traySnapshot();
+  // 诊断项由既有的 16ms 轮询器刷新（读数一变，下一拍就同步）：这里给最多 1s 的稳定窗口，
+  // 避免把"启动瞬间的旧读数"当成失败。
+  for (let attempt = 0; attempt < 20 && tray.stats.lastReason !== 'disabled'; attempt += 1) {
+    await sleep(50);
+    tray = shell.traySnapshot();
+  }
   check('托盘：启动时已创建（ADR 0018 D3）', tray.exists === true, tray);
   check(
-    '托盘：菜单项为 呼出输入条 / 重新加载桌宠 / 退出',
-    JSON.stringify(tray.menuLabels) === JSON.stringify(['呼出输入条', '重新加载桌宠', '退出']),
+    '托盘：顶部两行只读诊断（今天主动交互 / 上次未主动原因，ADR 0032 D4）',
+    tray.statLabels.length === 2 &&
+      /^今天主动交互: \d+ 次$/u.test(tray.statLabels[0] ?? '') &&
+      /^上次未主动原因: /u.test(tray.statLabels[1] ?? ''),
+    tray.statLabels,
+  );
+  check(
+    '托盘：自检里主动性硬关 → 诊断项显示 disabled（ADR 0031 D6 / ADR 0032 D4）',
+    tray.stats.lastReason === 'disabled' && tray.stats.firedCount === 0,
+    tray.stats,
+  );
+  check(
+    '托盘：菜单项为 两行诊断 + 呼出输入条 / 吸附 / 离开 / 重新加载桌宠 / 退出（ADR 0028 D4）',
+    JSON.stringify(tray.menuLabels) ===
+      JSON.stringify([
+        '今天主动交互: 0 次',
+        '上次未主动原因: disabled（主动性已关闭）',
+        '呼出输入条',
+        '吸附到前台窗口（Ctrl+Shift+S）',
+        '离开窗口边缘',
+        '重新加载桌宠',
+        '退出',
+      ]),
     tray.menuLabels,
   );
   check(
@@ -1861,6 +2000,298 @@ export async function runSelfTestIfRequested(): Promise<void> {
   );
 
   // ------------------------------------------------------------------
+  // 3.9 吸附到前台窗口与坐姿（ADR 0028）
+  //     自检自己造一个"记事本"窗口（同进程 BrowserWindow、可聚焦），让它成为前台窗口，
+  //     再走与 Ctrl+Shift+S 完全相同的入口（shell.snapToForeground）。
+  //     验收要求的三件事：跳到下边缘、播放坐姿、截图可见。
+  // ------------------------------------------------------------------
+  await window.webContents.executeJavaScript(`window.petRender.setWalkInterval(600000, 600001)`, true);
+  await waitFor(window, 6000, (diagnostics) => diagnostics?.motion.base === 'idle');
+
+  const display = screen.getPrimaryDisplay();
+  const notepadWidth = 560;
+  const notepadHeight = 220;
+  const notepadBottom = display.workArea.y + Math.round(display.workArea.height * 0.9);
+  const notepadX = display.workArea.x + 240;
+  const notepadY = notepadBottom - notepadHeight;
+  const notepad = new BrowserWindow({
+    x: notepadX,
+    y: notepadY,
+    width: notepadWidth,
+    height: notepadHeight,
+    show: false,
+    frame: true,
+    skipTaskbar: true,
+    title: 'selftest-notepad',
+    backgroundColor: '#ffffff',
+    webPreferences: { sandbox: true, contextIsolation: true },
+  });
+  await notepad.loadURL(
+    'data:text/html;charset=utf-8,' +
+      encodeURIComponent(
+        '<body style="margin:0;background:#fbfbfb;font:16px \'Segoe UI\',sans-serif;color:#333">' +
+          '<div style="padding:14px 18px;border-bottom:1px solid #ddd">未命名 - 记事本（自检替身）</div>' +
+          '<div style="padding:14px 18px;color:#555">这一扇窗口只是为了让桌宠有"别人的窗口边缘"可坐。</div>' +
+          '</body>',
+      ),
+  );
+  notepad.setBounds({ x: notepadX, y: notepadY, width: notepadWidth, height: notepadHeight });
+  notepad.show();
+  await sleep(700);
+
+  // 先验一次"真实前台窗口"：证明 Win32 读取 + DIP 换算这条真链路可用。
+  // 注意本应用主窗口 focusable=false（§3.2），拿不到前台权，`notepad.focus()` 抢不来
+  // 系统前台（本轮实测：真实前台仍是别的应用）——所以几何/解除断言改用脚本化前台（下一段）。
+  const realSnap = shell.snapToForeground();
+  const realDip = realSnap && realSnap.ok ? realSnap.target?.dip ?? null : null;
+  check(
+    '吸附：真实前台窗口可被 Win32 读到并换算成 DIP（命中或明确拒绝）',
+    realSnap !== null &&
+      (realSnap.ok
+        ? realSnap.source === 'foreground' &&
+          realDip !== null &&
+          realDip.width >= 80 &&
+          realDip.height >= 40
+        : ['fullscreen', 'invalid-rect', 'geometry', 'shell-window', 'own-window'].includes(
+            realSnap.reason,
+          )),
+    realSnap ?? null,
+  );
+  shell.releaseSnap();
+  await waitFor(window, 3000, (diagnostics) => diagnostics?.hfsm.physics === null);
+
+  // 从这里开始把"前台窗口"指向自检自己造的那扇记事本窗口（PET_SELFTEST=1 才生效）。
+  // 传入的是**物理像素**，仍然走真实的 `screenToDipPoint` 换算与真实的吸附控制器。
+  pushScriptedForeground(dipRectToPhysical(notepad.getBounds()));
+  await sleep(200);
+
+  const snapOutcome = shell.snapToForeground();
+  const snapDiag = shell.snapSnapshot();
+  check('吸附：热键入口返回成功（ADR 0028 D4）', snapOutcome?.ok === true, snapOutcome ?? null);
+  check(
+    '吸附：Win32 前台窗口读取可用（auto 模式 / koffi，ADR 0028 D1）',
+    snapDiag?.mode === 'foreground',
+    snapDiag ?? null,
+  );
+
+  const notepadBounds = notepad.getBounds();
+  const seatedBounds = shell.getBounds();
+  check(
+    '吸附：窗口贴到记事本下边缘（±8px，ADR 0028 D2）',
+    Math.abs(seatedBounds.y + seatedBounds.height - (notepadBounds.y + notepadBounds.height)) <= 8,
+    { pet: seatedBounds, target: notepadBounds },
+  );
+  check(
+    '吸附：水平居中于记事本（±8px）',
+    Math.abs(
+      seatedBounds.x + seatedBounds.width / 2 - (notepadBounds.x + notepadBounds.width / 2),
+    ) <= 8,
+    {
+      petCenter: seatedBounds.x + seatedBounds.width / 2,
+      targetCenter: notepadBounds.x + notepadBounds.width / 2,
+    },
+  );
+
+  const seated = await waitFor(window, 3000, (diagnostics) => diagnostics?.hfsm.physics === 'sitting');
+  check(
+    '吸附：render 进入 Physics=sitting（§4.1 新增状态，ADR 0028 D5）',
+    seated?.hfsm.physics === 'sitting',
+    seated?.hfsm ?? null,
+  );
+  check(
+    '吸附：播放官方坐姿片段（pastmemory 11.2–13.5s），不是程序化降级（ADR 0028 D8）',
+    (seated?.animation?.current?.name ?? '').includes('pastmemory') &&
+      seated?.sit?.procedural === false,
+    { current: seated?.animation?.current ?? null, sit: seated?.sit ?? null },
+  );
+  check(
+    '吸附：行走调度已关闭（walking=null、nextWalkInMs=null）',
+    seated?.motion.walking === null && seated?.motion.nextWalkInMs === null,
+    seated?.motion ?? null,
+  );
+
+  const sitDone = await waitFor(window, 6000, (diagnostics) => diagnostics?.sit?.done === true);
+  check(
+    '吸附：坐姿片段播完停在最后一帧（playHold，不会自己站回去）',
+    sitDone?.sit?.done === true &&
+      (sitDone?.animation?.current?.name ?? '').includes('pastmemory'),
+    { sit: sitDone?.sit ?? null, current: sitDone?.animation?.current ?? null },
+  );
+  const sittingShot = await captureScreenshot(window, 'window-sitting.png', 'sitting');
+  // 桌面抓取（desktopCapturer）在合成透明置顶窗口时可能拿到稍早的一帧：
+  // 先等坐姿停稳，再抓一次；两次写同一路径，后一次覆盖（只是验收证据，不参与断言）。
+  await sleep(1500);
+  const desktopShot = await captureDesktop('window-sitting-desktop.png');
+  check(
+    '截图：桌面合成图已产出（她坐在记事本窗口下边缘，ADR 0028 验收）',
+    desktopShot !== null,
+    { sittingShot, desktopShot },
+  );
+  // 停帧语义：截图（含 ~1s 的桌面抓取）之后姿态必须还在最后一帧，不能自己循环/漂移
+  const afterDesktop = await readDiagnostics(window);
+  check(
+    '吸附：截图之后姿态仍停在最后一帧（playHold 的 clamp 生效）',
+    afterDesktop?.sit?.done === true &&
+      Math.abs(
+        (afterDesktop?.animation?.current?.time ?? 0) -
+          (sitDone?.animation?.current?.time ?? 0),
+      ) < 0.05,
+    {
+      before: sitDone?.animation?.current ?? null,
+      after: afterDesktop?.animation?.current ?? null,
+      sit: afterDesktop?.sit ?? null,
+    },
+  );
+
+  // 头骨稳定性（真机 bug 回归）：坐姿停帧后，头骨本地四元数在 1s 内不得漂移。
+  // 之前"头疯狂打转"就是这个量在累积——骨骼仲裁把上一帧的偏移当成新基底。
+  const headA = afterDesktop?.sit?.headQuat ?? null;
+  await sleep(1000);
+  const headDiag = await readDiagnostics(window);
+  const headB = headDiag?.sit?.headQuat ?? null;
+  const headDriftRad =
+    headA && headB
+      ? 2 *
+        Math.acos(
+          Math.min(
+            1,
+            Math.abs(headA[0] * headB[0] + headA[1] * headB[1] + headA[2] * headB[2] + headA[3] * headB[3]),
+          ),
+        )
+      : Number.NaN;
+  check(
+    '吸附：坐姿 1s 内头骨不漂移（回归"头在打转"，≤0.15 rad）',
+    Number.isFinite(headDriftRad) && headDriftRad <= 0.15,
+    { headA, headB, headDriftRad, headBase: headDiag?.sit?.headBase ?? null, headWorld: headDiag?.sit?.headWorld ?? null },
+  );
+
+  // 跟随：目标窗口移动 → 她在同一个 16ms 轮询器里跟着走（节流 120ms）
+  const notepadMoved = {
+    x: notepadBounds.x + 90,
+    y: notepadBounds.y + 24,
+    width: notepadBounds.width,
+    height: notepadBounds.height,
+  };
+  notepad.setBounds(notepadMoved);
+  pushScriptedForeground(dipRectToPhysical(notepadMoved));
+  const expectedEdge = notepadMoved.y + notepadMoved.height;
+  let followedBounds = shell.getBounds();
+  const followDeadline = Date.now() + 3000;
+  while (Date.now() < followDeadline) {
+    followedBounds = shell.getBounds();
+    if (Math.abs(followedBounds.y + followedBounds.height - expectedEdge) <= 8) break;
+    await sleep(80);
+  }
+  check(
+    '吸附：目标窗口移动后跟着走（ADR 0028 D6，复用唯一 16ms 轮询器）',
+    Math.abs(followedBounds.y + followedBounds.height - expectedEdge) <= 8 &&
+      followedBounds.y !== seatedBounds.y,
+    { before: seatedBounds, after: followedBounds, target: notepadMoved },
+  );
+
+  // 解除 1：点她一下 → 立即离开窗口边缘、站回 Idle
+  const clickPoint = await findCurrentHitPoint(window);
+  current = window.getContentBounds();
+  const clickX = clickPoint?.x ?? body.x;
+  const clickY = clickPoint?.y ?? body.y;
+  pushScriptedCursor(current.x + clickX, current.y + clickY);
+  await sleep(340);
+  await dispatchPointer('down', clickX, clickY);
+  await sleep(60);
+  await dispatchPointer('up', clickX, clickY);
+  const clickedOff = await waitFor(window, 3000, (diagnostics) => diagnostics?.hfsm.physics === null);
+  check(
+    '解除：点她一下 → Physics 退出、回到 idle（ADR 0028 D9）',
+    clickedOff?.hfsm.physics === null &&
+      clickedOff?.sit?.sitting === false &&
+      shell.snapSnapshot()?.sitting === false,
+    { hfsm: clickedOff?.hfsm ?? null, sit: clickedOff?.sit ?? null },
+  );
+  const clickReleaseLog = lastJsonAfter(await runLogText(), '吸附解除（ADR 0028 D9）');
+  check(
+    '解除：snap_released{reason:clicked} 已发出',
+    clickReleaseLog?.['reason'] === 'clicked',
+    clickReleaseLog,
+  );
+
+  // 解除 2：拖走她 → sitting 被 dragged 打断
+  const resnap = shell.snapToForeground();
+  check('重新吸附：可以再吸一次（旧目标不残留）', resnap?.ok === true, resnap ?? null);
+  await waitFor(window, 3000, (diagnostics) => diagnostics?.hfsm.physics === 'sitting');
+  // 等坐姿片段播完（姿态静止）：片段播放中身体一直在动，掩膜逐帧变化，
+  // 探针可能在"扫描命中"与"按下"之间变成透明（本轮踩到，按下被 D-2 拒绝）。
+  await waitFor(window, 6000, (diagnostics) => diagnostics?.sit?.done === true);
+  const sitPoint = await findCurrentHitPoint(window);
+  check('吸附：坐姿下掩膜仍能命中她（探针随姿态变化）', sitPoint !== null, sitPoint);
+  current = window.getContentBounds();
+  const grabX = sitPoint?.x ?? body.x;
+  const grabY = sitPoint?.y ?? body.y;
+  pushScriptedCursor(current.x + grabX, current.y + grabY);
+  await sleep(340);
+  await dispatchPointer('down', grabX, grabY);
+  await sleep(50);
+  pushScriptedCursor(current.x + grabX + 70, current.y + grabY + 8);
+  await sleep(180);
+  const draggedOff = await readDiagnostics(window);
+  check(
+    '解除：拖走她 → Physics=dragged（sitting 被打断，ADR 0028 D9）',
+    draggedOff?.hfsm.physics === 'dragged' && shell.snapSnapshot()?.sitting === false,
+    { hfsm: draggedOff?.hfsm ?? null, snap: shell.snapSnapshot(), sitPoint },
+  );
+  await dispatchPointer('up', grabX, grabY);
+  await waitFor(window, 4000, (diagnostics) => diagnostics?.hfsm.physics === null);
+  resetScriptedCursor();
+  await sleep(200);
+
+  // 拒绝：前台全屏（游戏/视频）→ 不吸附 + 提示
+  notepad.setBounds({ x: 0, y: 0, width: display.bounds.width, height: display.bounds.height });
+  pushScriptedForeground(
+    dipRectToPhysical({
+      x: display.bounds.x,
+      y: display.bounds.y,
+      width: display.bounds.width,
+      height: display.bounds.height,
+    }),
+  );
+  await sleep(600);
+  const refuseBaseline = await countInLog('吸附被拒绝');
+  const refused = shell.snapToForeground();
+  check(
+    '拒绝：前台全屏（游戏/视频）→ 不吸附（ADR 0028 D3）',
+    refused?.ok === false && refused.reason === 'fullscreen',
+    refused ?? null,
+  );
+  check(
+    '拒绝：给出用户可见提示（吸附被拒绝 + 托盘气泡，ADR 0028 D3）',
+    (await countInLog('吸附被拒绝')) > refuseBaseline,
+    { refuseBaseline },
+  );
+
+  // 解除 3：目标窗口被关掉 → 跟随轮询发现句柄失效 → 自动解除
+  notepad.setBounds(notepadMoved);
+  pushScriptedForeground(dipRectToPhysical(notepadMoved));
+  await sleep(300);
+  const restorable = shell.snapToForeground();
+  check('吸附：全屏窗口恢复普通尺寸后可再次吸附', restorable?.ok === true, restorable ?? null);
+  await waitFor(window, 3000, (diagnostics) => diagnostics?.hfsm.physics === 'sitting');
+  // "目标窗口被关掉"：句柄失效（脚本化前台置空，等价于 IsWindow 返回 false）
+  pushScriptedForeground(null);
+  await sleep(700);
+  const closedOff = await waitFor(window, 3000, (diagnostics) => diagnostics?.hfsm.physics === null);
+  const closedLog = lastJsonAfter(await runLogText(), '吸附解除（ADR 0028 D9）');
+  check(
+    '解除：目标窗口被关闭 → 自动解除（reason=window-gone，ADR 0028 D9）',
+    shell.snapSnapshot()?.sitting === false &&
+      closedOff?.hfsm.physics === null &&
+      closedLog?.['reason'] === 'window-gone',
+    { hfsm: closedOff?.hfsm ?? null, snap: shell.snapSnapshot(), closedLog },
+  );
+  shell.releaseSnap();
+  resetScriptedForeground();
+  if (!notepad.isDestroyed()) notepad.destroy();
+  await sleep(200);
+
+  // ------------------------------------------------------------------
   // 3.8 Emotion → 面部贴图（ADR 0026 D2/D3/D4）
   //     自检直接把 intent_resolved 注入渲染页（生产路径是主进程广播），
   //     断言"图元映射 + 贴图真的变了（截图像素差）+ 情绪结束回 neutral"。
@@ -2164,6 +2595,32 @@ export async function runSelfTestIfRequested(): Promise<void> {
     '降级链路：LLM 已本会话熔断（§11：不再探测 ②）',
     getRuntime()?.snapshot().orchestrator.llmDisabled === true,
     getRuntime()?.snapshot().orchestrator ?? null,
+  );
+
+  // ADR 0031 D6：主动性在自检里必须默认硬关，只有显式 PET_SELFTEST_PROACTIVE=1 才开。
+  // 理由：本套断言对"收尾没有在途语音"与截图像素差有强依赖，随机插话会让它们随机翻红。
+  const proactiveExpected = process.env.PET_SELFTEST_PROACTIVE === '1';
+  const gateSnapshot = getRuntime()?.snapshot() ?? null;
+  check(
+    '主动性：自检默认硬关，仅 PET_SELFTEST_PROACTIVE=1 时启用（ADR 0031 D6）',
+    gateSnapshot?.proactive.enabled === proactiveExpected &&
+      gateSnapshot?.orchestrator.proactiveEnabled === proactiveExpected,
+    {
+      expected: proactiveExpected,
+      gate: gateSnapshot?.proactive ?? null,
+      orchestratorProactiveEnabled: gateSnapshot?.orchestrator.proactiveEnabled ?? null,
+    },
+  );
+
+  // ADR 0033：预热搬到独立心跳后，自检仍然默认**零后台推理**——不建定时器、不发任何预热请求。
+  // 这条断言是那条硬约束的唯一证据：它同时覆盖"总闸关"与"真的一次都没打出去"。
+  check(
+    '预热：自检默认硬关（零后台推理，ADR 0033）',
+    gateSnapshot?.warmup.enabled === false &&
+      gateSnapshot?.warmup.running === false &&
+      gateSnapshot?.warmup.attempts === 0 &&
+      gateSnapshot?.warmup.warmedUp === false,
+    gateSnapshot?.warmup ?? null,
   );
 
   const failed = checks.filter((item) => !item.pass);

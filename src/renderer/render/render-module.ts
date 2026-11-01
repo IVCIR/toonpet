@@ -50,12 +50,13 @@ import { createHfsm } from './hfsm';
 import type { Hfsm, HfsmSnapshot, WalkPlan } from './hfsm';
 import { createMaskCapture } from './mask-capture';
 import type { MaskCapture } from './mask-capture';
-import { loadModel, measureAnimatedMinY, placeModel } from './model-loader';
+import { loadModel, measureAnimatedMinY, measureAnimatedBounds, placeModel } from './model-loader';
 import type { LoadedModel } from './model-loader';
 import { PAT_DURATION_MS, PAT_MOUTH_FRAME, patPose } from './pat-react';
 import type { PatPose } from './pat-react';
 import { createCapsulePlaceholder, PLACEHOLDER_BOTTOM_MARGIN_PX } from './placeholder';
 import type { PlaceholderModel } from './placeholder';
+import { sitPose } from './sit-pose';
 
 /** 契约 §7.3 / §12：同一 intent 200ms 内只执行一次。 */
 export const INTENT_DEDUPE_MS = 200;
@@ -68,6 +69,11 @@ const WALK_IN_FADE_SECONDS = 0.3;
 const WALK_OUT_FADE_SECONDS = 0.35;
 /** 回弹过程中从悬空姿态淡回 Idle（ADR 0024 D3） */
 const SETTLE_FADE_SECONDS = 0.45;
+/** 坐姿的进出淡入（ADR 0028 D8）：进 0.45s（片段本身也正"坐下去"），出 0.35s */
+const SIT_IN_FADE_SECONDS = 0.45;
+const SIT_OUT_FADE_SECONDS = 0.35;
+/** 加载期"临时切到坐姿采样"用的淡入（不能是 0：three 的权重插值需要正时长） */
+const CALIBRATION_FADE_SECONDS = 0.001;
 
 /** 拖拽期间的"整体轻微摇摆"与"被拎起"抬升（不写骨骼，只转/抬 animationRoot）。 */
 const DRAG_SWAY_PERIOD_S = 1.6;
@@ -223,6 +229,28 @@ export interface RenderDiagnostics {
     walkYaw: number;
     walkYawTarget: number;
   };
+  /** ADR 0028：前台窗口吸附与坐姿（内部诊断，不进 `RenderState`） */
+  sit: {
+    sitting: boolean;
+    /** 吸附在哪条边；未吸附为 null */
+    edge: 'top' | 'bottom' | null;
+    /** 官方坐姿片段缺失 → 程序化降级（下沉 + 弯腿） */
+    procedural: boolean;
+    /** 实际在播的坐姿片段名（裁剪后带时间窗后缀） */
+    clip: string | null;
+    /** 片段是否已播到最后一帧（`playHold` 停住了） */
+    done: boolean | null;
+    dropPx: number;
+    bobPx: number;
+    /** 身体平移补偿（px）：抵消片段把角色搬去长椅的偏移 */
+    offsetPx: { x: number; y: number };
+    /** 头骨本地四元数（[x,y,z,w]，诊断"头在慢慢转"这类累积 bug 用） */
+    headQuat: [number, number, number, number] | null;
+    /** 头骨世界坐标（px，内容区坐标系） */
+    headWorld: { x: number; y: number } | null;
+    /** 骨骼仲裁器对头骨的最近一帧记录（基底来源 / 提交的偏移） */
+    headBase: { baseFrom: 'mixer' | 'cache' | null; yaw: number; pitch: number; roll: number } | null;
+  };
   pat: PatDiagnostics;
   speech: { frame: number; driven: boolean };
   probePoints: { head: { x: number; y: number } | null; body: { x: number; y: number } | null };
@@ -282,6 +310,22 @@ class StageRender implements RenderModule {
   private gaze: GazeController | null = null;
   /** 当前行走计划（`walking` 期间非空） */
   private walkingPlan: WalkPlan | null = null;
+
+  /** ADR 0028 D5/D8：吸附（`sitting`）与坐姿 */
+  private sitting = false;
+  private sitStartedAt = 0;
+  /** 官方坐姿片段缺失 → 程序化降级（悬空姿态下沉 + 大腿弯曲） */
+  private sitProcedural = false;
+  private sitEdge: 'top' | 'bottom' | null = null;
+  /**
+   * ADR 0028 D8：坐姿片段的**身体包围盒**（root 局部单位，加载时采一次）。
+   * 回忆片段把角色搬到长椅上（身体 cx≈-0.0035、minY≈+0.0058 单位），直接用会让她
+   * 悬在窗口左上角；这里把测量值换算成像素补偿："身体中心 → 窗口中线、最低点 → 窗口底边"。
+   */
+  private sitBounds: { minX: number; maxX: number; minY: number } | null = null;
+  /** 光环相对头骨的偏移（光环不在骨骼层级里，必须每帧手动跟随头骨） */
+  private haloOffset: THREE.Vector3 | null = null;
+  private readonly haloHeadWorld = new THREE.Vector3();
 
   /** 内部接口：掩膜采集（由 RenderBundle 持有，不属于 §7.3） */
   readonly maskCapture: MaskCapture;
@@ -403,6 +447,8 @@ class StageRender implements RenderModule {
 
       this.setupAnimations(loaded);
       this.calibrateGround();
+      this.calibrateHalo();
+      this.calibrateSitPose();
 
       this.arbiter = createBoneArbiter();
       for (const bone of [loaded.bones.head, loaded.bones.eyeL, loaded.bones.eyeR]) {
@@ -816,8 +862,93 @@ class StageRender implements RenderModule {
       }
     }
     if (this.placeholder) {
-      this.placeholder.group.position.y = -this.height / 2 + PLACEHOLDER_BOTTOM_MARGIN_PX;
+      // animationRoot 的原点已经是内容区底边（见 resize），占位体只需要保留白边距。
+      // 写成 `-height/2 + margin` 会把胶囊体推到窗口下方（实测：只剩 1px 露在底边，
+      // 掩膜几乎全空 → 缺失模型自检的"占位体可命中"失败）。
+      this.placeholder.group.position.y = PLACEHOLDER_BOTTOM_MARGIN_PX;
     }
+  }
+
+  /**
+   * ADR 0028 D8：记下"光环相对头骨"的偏移。
+   *
+   * 资产事实：`HaloRoot` 是普通节点（不是骨骼），不在骨架层级里，任何片段都不会驱动它。
+   * 大多数片段身体原地不动，所以看不出来；一旦片段把角色搬走（回忆片段坐到长椅上），
+   * 光环就会留在原地。这里把空闲姿态下的相对偏移记下来，之后每帧把光环挂回头骨。
+   */
+  private calibrateHalo(): void {
+    const halo = this.model?.halo ?? null;
+    const head = this.model?.bones.head ?? null;
+    if (!halo || !head || !halo.parent) {
+      if (this.ready) console.warn('[render] 未找到 HaloRoot/头骨：光环不会跟随（只影响视觉）');
+      return;
+    }
+    this.model?.root.updateMatrixWorld(true);
+    head.getWorldPosition(this.haloHeadWorld);
+    halo.parent.worldToLocal(this.haloHeadWorld);
+    this.haloOffset = halo.position.clone().sub(this.haloHeadWorld);
+    console.log('[render] 光环跟随已标定', {
+      offset: this.haloOffset.toArray().map((value) => Number(value.toFixed(5))),
+    });
+  }
+
+  /** 每帧把光环挂到头骨上（`calibrateHalo` 失败时是空操作）。 */
+  private updateHalo(): void {
+    const halo = this.model?.halo ?? null;
+    const head = this.model?.bones.head ?? null;
+    const offset = this.haloOffset;
+    if (!halo || !head || !offset || !halo.parent) return;
+    // 骨骼世界矩阵在 mixer.update 之后还是旧的：这里补一次（约 0.2ms，远小于一帧预算）
+    this.model?.root.updateMatrixWorld(true);
+    head.getWorldPosition(this.haloHeadWorld);
+    halo.parent.worldToLocal(this.haloHeadWorld);
+    halo.position.copy(this.haloHeadWorld.add(offset));
+  }
+
+  /**
+   * ADR 0028 D8：加载时采一次**坐姿的身体包围盒**。
+   *
+   * 做法：临时切到坐姿片段（淡入 0、权重直上 1），采完立刻切回 Idle。
+   * 为什么不在进入 `sitting` 时采：那一刻动作还在淡入（权重 0→1），采样到的是
+   * "站姿与坐姿的混合"，补偿量会错；加载时 CPU 采样一次（约几毫秒）最干净。
+   */
+  private calibrateSitPose(): void {
+    const model = this.model;
+    const animations = this.animations;
+    if (!model || !animations) return;
+    if (!animations.playHold('sit', CALIBRATION_FADE_SECONDS)) {
+      this.sitBounds = null;
+      console.log('[render] 坐姿片段缺失：sitting 走程序化降级（下沉 + 弯腿）');
+      return;
+    }
+    animations.update(0.016);
+    model.root.updateMatrixWorld(true);
+    this.sitBounds = measureAnimatedBounds(model.root, model.meshes, 4096);
+    // 还原空闲姿态（1ms 淡入 → 下一帧就是纯 Idle）
+    animations.clearHold(CALIBRATION_FADE_SECONDS);
+    animations.play('idle', CALIBRATION_FADE_SECONDS);
+    animations.update(0.016);
+    model.root.updateMatrixWorld(true);
+    console.log('[render] 坐姿标定', {
+      bounds: this.sitBounds
+        ? {
+            centerX: Number(((this.sitBounds.minX + this.sitBounds.maxX) / 2).toFixed(5)),
+            minY: Number(this.sitBounds.minY.toFixed(5)),
+          }
+        : null,
+      ppm: Math.round(model.pixelsPerUnit),
+    });
+  }
+
+  /** 坐姿的像素补偿：身体中心 → 窗口中线，身体最低点 → 窗口底边。 */
+  private sitOffsetPx(): { x: number; y: number } {
+    const model = this.model;
+    const bounds = this.sitBounds;
+    if (!model || !bounds) return { x: 0, y: 0 };
+    const pixelsPerUnit = model.pixelsPerUnit;
+    const centerX = ((bounds.minX + bounds.maxX) / 2) * pixelsPerUnit + model.root.position.x;
+    const bottomY = bounds.minY * pixelsPerUnit + model.root.position.y;
+    return { x: -centerX, y: -bottomY };
   }
 
   resize(width: number, height: number): void {
@@ -914,6 +1045,10 @@ class StageRender implements RenderModule {
       case 'drag_started': {
         // §4.1：`walking` 的退出条件之一是被拖拽打断
         this.stopWalk('drag_started');
+        // ADR 0028 D9：拖走她就离开窗口边缘（shell 也会发 snap_released，这里同时兜底）
+        this.sitting = false;
+        this.sitEdge = null;
+        this.sitProcedural = false;
         this.hfsm.dragStarted(now);
         this.dragStartedAt = now;
         this.dragging = true;
@@ -948,6 +1083,19 @@ class StageRender implements RenderModule {
         }
         break;
       }
+      case 'snap_applied': {
+        // ADR 0028 D5/D8：窗口已经贴到边缘 → Physics=sitting、停住坐姿
+        const payload = event.payload as { edge?: unknown; source?: unknown };
+        const edge: 'top' | 'bottom' = payload.edge === 'top' ? 'top' : 'bottom';
+        const source = typeof payload.source === 'string' ? payload.source : 'foreground';
+        this.enterSit(now, edge, source);
+        break;
+      }
+      case 'snap_released': {
+        const payload = event.payload as { reason?: unknown };
+        this.exitSit(now, typeof payload.reason === 'string' ? payload.reason : 'unknown');
+        break;
+      }
       case 'intent_resolved': {
         const payload = event.payload as { emotion: Emotion };
         this.emotion = payload.emotion;
@@ -962,6 +1110,48 @@ class StageRender implements RenderModule {
 
   setCursor(cssX: number, cssY: number, at: number = performance.now()): void {
     this.gaze?.setCursor(cssX, cssY, at);
+  }
+
+  /**
+   * ADR 0028 D8：进入 `sitting`。
+   *
+   * 顺序是刻意的：先收步（正在走的话立即停），再让 HFSM 进 Physics（这会清空行走排期），
+   * 最后播坐姿——`sitting` 期间 Base 层不再有任何调度，她不会在窗口边缘上迈步。
+   */
+  private enterSit(now: number, edge: 'top' | 'bottom', source: string): void {
+    const wasSitting = this.sitting;
+    this.stopWalk('snap_applied');
+    this.hfsm.snapApplied(now);
+    this.sitting = true;
+    this.sitStartedAt = wasSitting ? this.sitStartedAt : now;
+    this.sitEdge = edge;
+    if (wasSitting && this.animations?.hold()) {
+      // 改吸到另一扇窗：保持当前坐姿，不重播"坐下去"
+      console.log(`[render] sitting 目标更新 edge=${edge} source=${source}（保持坐姿）`);
+      return;
+    }
+    const held = this.animations?.playHold('sit', SIT_IN_FADE_SECONDS) ?? false;
+    this.sitProcedural = !held;
+    if (!held) {
+      // 降级：悬空姿态 + 下沉 24px + 大腿弯曲 0.45rad（用户原始建议的路径）
+      this.playAnimation('held', SIT_IN_FADE_SECONDS, 'snap_applied（无坐姿片段 → 程序化降级）');
+    }
+    console.log(
+      `[render] sitting 开始 edge=${edge} source=${source} ` +
+        `clip=${held ? String(this.animations?.roles.sit.name) : '(缺失，程序化降级)'}`,
+    );
+  }
+
+  /** ADR 0028 D9：离开 `sitting` —— 淡出坐姿、站回 Idle，并重新排期行走。 */
+  private exitSit(now: number, reason: string): void {
+    if (!this.sitting) return;
+    this.sitting = false;
+    this.sitEdge = null;
+    this.sitProcedural = false;
+    this.hfsm.snapReleased(now);
+    this.animations?.clearHold(SIT_OUT_FADE_SECONDS);
+    this.playAnimation('idle', SIT_OUT_FADE_SECONDS, `snap_released(${reason}) → 站立`);
+    console.log(`[render] sitting 结束 reason=${reason}`);
   }
 
   setMouthFrame(frame: number): void {
@@ -1079,6 +1269,53 @@ class StageRender implements RenderModule {
         walkYaw: this.walkYaw,
         walkYawTarget: this.walkYawTarget,
       },
+      sit: (() => {
+        const held = this.animations?.hold() ?? null;
+        const pose = this.sitting ? sitPose(now - this.sitStartedAt, this.sitProcedural) : null;
+        const shift = this.sitting ? this.sitOffsetPx() : { x: 0, y: 0 };
+        return {
+          sitting: this.sitting,
+          edge: this.sitEdge,
+          procedural: this.sitProcedural,
+          clip: held?.name ?? null,
+          done: held ? held.done : null,
+          dropPx: Number((pose?.dropPx ?? 0).toFixed(2)),
+          bobPx: Number((pose?.bobPx ?? 0).toFixed(2)),
+          offsetPx: { x: Number(shift.x.toFixed(1)), y: Number(shift.y.toFixed(1)) },
+          headQuat: (() => {
+            const head = this.model?.bones.head ?? null;
+            if (!head) return null;
+            const q = head.quaternion;
+            return [
+              Number(q.x.toFixed(5)),
+              Number(q.y.toFixed(5)),
+              Number(q.z.toFixed(5)),
+              Number(q.w.toFixed(5)),
+            ] as [number, number, number, number];
+          })(),
+          headWorld: (() => {
+            const head = this.model?.bones.head ?? null;
+            if (!head) return null;
+            const world = new THREE.Vector3();
+            head.getWorldPosition(world);
+            return { x: Number(world.x.toFixed(1)), y: Number(world.y.toFixed(1)) };
+          })(),
+          headBase: (() => {
+            const head = this.model?.bones.head ?? null;
+            const entry = head
+              ? this.arbiter?.snapshot().find((item) => item.bone === head.name) ?? null
+              : null;
+            return entry
+              ? {
+                  baseFrom: entry.baseFrom,
+                  yaw: Number(entry.yaw.toFixed(4)),
+                  pitch: Number(entry.pitch.toFixed(4)),
+                  roll: Number(entry.roll.toFixed(4)),
+                }
+              : null;
+          })(),
+        };
+      })(),
       pat: (() => {
         const pat = this.patState(now);
         return {
@@ -1168,9 +1405,10 @@ class StageRender implements RenderModule {
     this.officialPat = oneShot?.role === 'pat';
     const snapshot = this.hfsm.snapshot();
 
-    // ADR 0023 D5：空闲时轮换待机姿态（拖拽、行走与一次性演出期间不换）
+    // ADR 0023 D5：空闲时轮换待机姿态（拖拽、行走、吸附与一次性演出期间不换）
     if (
       !this.dragging &&
+      !this.sitting &&
       !oneShot &&
       snapshot.base === 'idle' &&
       snapshot.physics === null &&
@@ -1179,8 +1417,17 @@ class StageRender implements RenderModule {
       this.rotateIdleVariant(now);
     }
 
+    // 0) 仲裁器在 mixer.update **之前**记下受控骨骼的四元数：第 2 步靠"这中间变没变"
+    //    判断动画有没有重写该骨骼。three 的 `PropertyMixer.apply()` 在片段停帧后会
+    //    跳过冗余写入，旧的"比较我上次写的值"判据在浮点噪声下会误判 → 偏移逐帧累积
+    //    （真机表现：坐姿时头疯狂打转，实测 2.5 rad/s）。
+    this.arbiter?.capture();
+
     // 1) AnimationMixer（ADR 0014 D1：全帧只允许在这里 update）
     this.animations?.update(dt);
+
+    // 1.5) ADR 0028 D8：光环挂在头骨上（它不在骨骼层级里，任何片段都不会驱动它）
+    this.updateHalo();
 
     // 2) 骨骼仲裁：抓取本帧动画基底并清零叠加量
     this.arbiter?.beginFrame();
@@ -1190,12 +1437,19 @@ class StageRender implements RenderModule {
       this.gaze.update(now, this.width, this.height, this.arbiter);
     }
 
-    // 4) 反应通道叠加（pat_react 的头部后仰/侧倾）
+    // 4) 反应通道叠加（pat_react 的头部后仰/侧倾）+ 坐姿的降级弯腿
     const pat = this.patState(now);
     const head = this.model?.bones.head ?? null;
     // 官方片段自己会动头/动身体，程序化后仰、侧倾只在降级路径叠加（ADR 0023 D4）
     if (pat && head && this.arbiter && !this.officialPat) {
       this.arbiter.add(head, 0, pat.pose.headPitch, pat.pose.headRoll);
+    }
+    // ADR 0028 D8：官方坐姿片段路径下 thighBend 恒为 0，这里只在降级时生效
+    const sit = this.sitting ? sitPose(now - this.sitStartedAt, this.sitProcedural) : null;
+    if (sit && sit.thighBend !== 0 && this.arbiter) {
+      for (const thigh of [this.model?.bones.thighL ?? null, this.model?.bones.thighR ?? null]) {
+        if (thigh) this.arbiter.add(thigh, 0, -sit.thighBend);
+      }
     }
     this.syncPatMouth(pat);
 
@@ -1233,9 +1487,14 @@ class StageRender implements RenderModule {
     this.dragLiftPx += (liftTarget - this.dragLiftPx) * smooth;
 
     const sway = this.dragSway(now);
-    this.animationRoot.position.y = -this.height / 2 + hop - this.dragLiftPx;
+    // ADR 0028 D8：坐姿的下沉与呼吸浮动是**窗口内的表现**，不参与窗口位置（窗口由 shell 定）；
+    // 坐姿片段自带的身体平移用 `sitOffsetPx()` 抵消，保证"身体中心 = 窗口中线、最低点 = 窗口底边"。
+    const sitShift = this.sitting ? this.sitOffsetPx() : { x: 0, y: 0 };
+    this.animationRoot.position.x = sitShift.x;
+    this.animationRoot.position.y =
+      -this.height / 2 + hop - this.dragLiftPx - (sit?.dropPx ?? 0) + (sit?.bobPx ?? 0) + sitShift.y;
     this.animationRoot.rotation.z =
-      tilt + sway + (this.officialPat ? 0 : (pat?.pose.bodyLean ?? 0));
+      tilt + sway + (this.officialPat ? 0 : (pat?.pose.bodyLean ?? 0)) + (sit?.lean ?? 0);
     // 转身与 `look` 反应共用同一个 Y 轴通道：叠加而不是互相覆盖
     this.animationRoot.rotation.y = look + this.walkYaw;
     this.animationRoot.scale.set(1, 1 - squash, 1);

@@ -2,9 +2,9 @@
 
 | 项 | 值 |
 |---|---|
-| 对应契约版本 | 1.8.0（ADR 0026 第 2 版：表情改为官方差分贴图，禁止程序化绘制眼型） |
-| 最后更新 | 2026-10-31 |
-| 当前里程碑 | M11：走路会转身 + 表情改为**官方差分贴图驱动**（`data/expressions/`，缺图自动降级为只变嘴型）。**官方差分尚未拿到**（下载器在本机受阻，详见 ADR 0026 D6.4），当前用非官方 fixture 跑通并自证管线 |
+| 对应契约版本 | 1.12.0（ADR 0033：预热与主动性解耦 + `model_ready` 前置对齐） |
+| 最后更新 | 2026-11-01 |
+| 当前里程碑 | **M14：完全体（封版 v1.0.0）** —— 段 3.5 只发"她在什么类别的应用前面"，本地模型在她**出现在桌面上的那一瞬间**开始预热（与主动性开关无关），托盘能回答"她今天主动说了几次 / 上次为什么没说" |
 | 维护规则 | 每个模块对话收尾时必须更新本文件；只写事实，不写计划性描述（计划进 TODO） |
 
 ## 填写口径
@@ -23,8 +23,22 @@
 ## 模块：shell
 
 ### 已完成
-- **字幕与语音时序对齐（本轮，ADR 0021）**：新增 `src/renderer/shell/subtitle-cue.ts`（纯逻辑、定时器注入）+ `subtitle.ts` 扩 `holdMs: null`（不自动隐藏）与 `holdFor(ms)`。`intent_resolved` **只登记**待显示文本（15s failsafe），`speech_started` 才显示完整字幕（播放期间不自动隐藏），`speech_ended{failed}` 立即显示兜底，`{completed|interrupted}` 留 1.2s 尾巴；新回复到达时先收起旧字幕；打断丢弃未显示的 pending。渲染页只做接线（`window.petSubtitle.getDiagnostics()` 是内部诊断，不进 `RenderState`）
-- **系统托盘（ADR 0018 D3）**：`src/main/shell/tray.ts` + 纯规格 `tray-menu.ts`；图标是内嵌的 16×16 PNG data URL（不新增二进制资产、不联网）；菜单固定为 `呼出输入条`（复用 `openInputBar()`，不复制热键逻辑）/ `重新加载桌宠`（`mainWindow.webContents.reload()`，只重启渲染进程）/ `退出`（先 `await shell.stop()` 再 `app.quit()`，ADR 0004 D9）；`start()` 内创建、`stop()` 内先销毁；创建/销毁失败只记 WARN，不影响热键与桌宠；`shell.traySnapshot()` 为内部诊断
+- **`model_ready` 事实闩锁（本轮，ADR 0033 D2.2）**：`onRendererEvent` 收到 `model_ready` 时多调一行 `noteModelReady()`（`src/main/model-ready.ts` 的进程内单例，只记第一次；`runtime.stop()` 清零）。这一行不是为了 shell——`model_ready` **可能早于 `runtime.start()` 完成**（启动顺序是先 shell 后 runtime，而渲染进程加载 VRM 只要 1–2s），早到的那一次如果没人落闩锁，`runtime` 就没机会"在模型出现的那一刻预热"。**没有新增事件、IPC 通道、setter 或 `RenderState` 字段**（与 ADR 0032 的 `proactive-stats` 同一手法）
+- **托盘顶部两行只读诊断（ADR 0032 D4）**：`tray-menu.ts` 变成"2 行只读（`enabled:false`）+ 5 个动作项"的纯规格；第一行 `今天主动交互: N 次`、第二行 `上次未主动原因: user-active（先生正在操作）`（原因保留 idle-drive 的英文原词 + 中文解释，`Record<ProactiveSilenceReason,string>` 穷举，漏一个 `tsc` 就报错；取值 = 九个判定原因 + `no-lines`/`llm-failed` 两个"判定通过但最终静默"的诊断值，避免在她什么都没说时显示"已开口"）。数据来自新增的 `src/main/proactive-stats.ts` 进程内单例（与 `appBus` 同一手法）：**没有新事件、没有新 IPC、没给 shell 加 setter、`RenderState` 未动**。`tray.setStats()` 只在标签真的变化时 `setContextMenu`；刷新挂在既有 16ms 指针轮询器的 `onTick` 上（读数变化 → 下一拍即刷，无变化 → 5s 复查），**没有新定时器**；`stop()` 里连同 `lastTrayStats` 一起清空
+- **托盘诊断的自检覆盖**：输入条套件新增 2 条断言（两行格式 `/^今天主动交互: \d+ 次$/`、`/^上次未主动原因: /`；`stats.lastReason === 'disabled'`），并把菜单项断言从 5 项改为 7 项；实测 `menuLabels = ["今天主动交互: 0 次","上次未主动原因: disabled（主动性已关闭）","呼出输入条","吸附到前台窗口（Ctrl+Shift+S）","离开窗口边缘","重新加载桌宠","退出"]`（自检里主动性硬关，所以是 `disabled`）
+- **前台窗口吸附（上一轮，ADR 0028）**：`src/main/shell/foreground-window.ts`（`koffi` 加载 `user32`/`dwmapi`：`GetForegroundWindow` → `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)`，失败退回 `GetWindowRect`；`IsWindowVisible/IsIconic/GetClassNameW/GetWindowTextW` 一并读取；**物理像素**输出，DIP 换算由 shell 用 `screen.screenToDipPoint()` 逐点做）、`snap-geometry.ts`（纯函数：`y = 边缘线 - 窗口高`、水平居中、**整窗可见优先**的 D-7 夹取、竖直夹取 >40px 直接拒绝、覆盖式全屏判定）、`snap.ts`（控制器：8 种拒绝原因、热键/托盘入口、跟随轮询、五条解除路径、`snapDiagnostics`）
+- **吸附入口（ADR 0028 D4）**：全局热键 `Ctrl+Shift+S`（被占用降级 `Ctrl+Alt+S`，与输入条热键同一套三级降级，都失败只记 ERROR）；托盘新增 `吸附到前台窗口（Ctrl+Shift+S）` 与 `离开窗口边缘` 两项（托盘菜单单测同步更新）
+- **吸附跟随（ADR 0028 D6）**：挂在既有 16ms 指针轮询器的 `onTick` 上（**没有新定时器**），内部节流 `PET_SNAP_FOLLOW_MS`（默认 120ms）；按句柄重读目标矩形 → 用同一 edge 重算位置 → `setPosition`；句柄失效/最小化 → `snap_released{window-gone}`，变全屏 → `{fullscreen}`
+- **解除的五条路径（ADR 0028 D9）**：指针按下（`clicked`，在把手势交给 poller **之前**解除，避免 sitting→idle→dragged 闪回）、拖拽（`dragged`）、托盘（`command`）、目标消失（`window-gone`）、目标全屏（`fullscreen`）
+- **拒绝与提示（ADR 0028 D3）**：全屏 / 自己的窗口 / 桌面外壳窗口（`Progman`/`WorkerW`/`Shell_TrayWnd`…）/ 不可见 / 太小（<80×40 DIP）/ 坐标异常 / 放不下（夹取 >40px）/ 忙（行走·回弹·拖拽，只记日志）→ 托盘气泡 + WARN 日志，**不移动窗口、不发 `snap_applied`**
+- **回退（ADR 0028 D7）**：`koffi` 缺失/加载失败 → 有效模式退回 `workarea`（启动日志 WARN）；热键吸到工作区下沿（`PET_SNAP_EDGE=top` 放不下时自动退回下沿）；拖到下沿 24px 内松手 → 直接坐在那条边上；`PET_SNAP_MODE=workarea` 可强制
+- **自检新增 22 条（119/119 全绿）**：真实前台窗口读取（Win32 + DIP 闭环）、热键入口、贴下边缘 ±8px、水平居中 ±8px、`physics=sitting`、播放坐姿片段（非降级）、行走调度关闭、`playHold` 停帧、桌面合成截图、跟随移动、点击解除、拖拽解除、坐姿掩膜命中、全屏拒绝 + 提示、目标关闭自动解除；截图 `dist/selftest/window-sitting.png`（窗口）与 `window-sitting-desktop.png`（**桌面合成图**，3200×2000）
+- **单测 287 个（28 文件）**：上一轮新增 `snap-geometry`（12）、`snap`（17）、`sit-pose`（4）、`bone-arbiter`（4）；`hfsm` +4（sitting 进出/打断行走/不得覆盖 dragged）、`tray-menu` 改动 3
+- **本轮（M14 封版）单测总量 417 个（38 文件）**：`orchestrator` 34 → 29（5 条预热用例随实现迁往 `heartbeat.test.ts`），新增 `heartbeat`（16）、`heartbeat-config`（6）、`model-ready`（12）
+- **本轮四套自检全绿（exit 0）**：主链路 **121/121**（+1「预热：自检默认硬关」）、输入条 **29/29**、语音 **30/30**、缺失模型 **4/4**；`tsc --noEmit` 0 错
+- **顺带修 bug**：占位胶囊体被写成 `-height/2 + margin`（animationRoot 已在底边，等于双重偏移），实测只剩 1px 露在窗口底边、掩膜几乎全空 → 缺失模型自检第 4 条失败；改成 `+margin` 后 4/4
+- **字幕与语音时序对齐（ADR 0021）**：新增 `src/renderer/shell/subtitle-cue.ts`（纯逻辑、定时器注入）+ `subtitle.ts` 扩 `holdMs: null`（不自动隐藏）与 `holdFor(ms)`。`intent_resolved` **只登记**待显示文本（15s failsafe），`speech_started` 才显示完整字幕（播放期间不自动隐藏），`speech_ended{failed}` 立即显示兜底，`{completed|interrupted}` 留 1.2s 尾巴；新回复到达时先收起旧字幕；打断丢弃未显示的 pending。渲染页只做接线（`window.petSubtitle.getDiagnostics()` 是内部诊断，不进 `RenderState`）
+- **系统托盘（ADR 0018 D3；本轮扩为 2 行只读诊断 + 5 个动作项）**：`src/main/shell/tray.ts` + 纯规格 `tray-menu.ts`；图标是内嵌的 16×16 PNG data URL（不新增二进制资产、不联网）；动作项为 `呼出输入条`（复用 `openInputBar()`，不复制热键逻辑）/ `吸附到前台窗口` / `离开窗口边缘` / `重新加载桌宠`（`mainWindow.webContents.reload()`，只重启渲染进程）/ `退出`（先 `await shell.stop()` 再 `app.quit()`，ADR 0004 D9）；`start()` 内创建、`stop()` 内先销毁；创建/销毁失败只记 WARN，不影响热键与桌宠；`shell.traySnapshot()` 为内部诊断
 - **`.env` 加载器（本轮，装配层；ADR 0018 D1）**：`src/shared/env-file.ts`（约 100 行纯字符串解析，无第三方依赖、无网络）+ `src/main/env.ts`；`bootstrap()` 的第一条可执行语句调用 `loadProjectEnv()`，文件固定 `<appRoot>/.env`，**进程环境变量优先**（`setx` / 终端变量 / 自检注入压过文件），坏行只记 WARN 并忽略；日志只记键名不记值。新增 `.env.example` 全量模板、`.gitignore` 排除 `.env` / `.env.local`；`scripts/doctor.mjs` 用 `process.loadEnvFile()` 按同一语义加载并在「运行环境」报告，因此 `.env` 同时作用于 `doctor` 与 `npm start`
 - **单测 219 个全绿（22 个文件）**：本轮新增 34（memory 21 / subtitle-cue 13）+ reply-validator +7（日文用例）+ orchestrator +8（记忆接入）+ config +1（记忆配置）；`tsc --noEmit` 0 错；四套自检 exit 0（主链路 61 / 输入条 27 / 语音 **30** / 缺失模型 4）
 - 工程骨架：`package.json` / `tsconfig.json` / `build.mjs`（esbuild CLI 打包，产物 `dist/`），`npm run build` 通过
@@ -75,10 +89,15 @@
 - **撞边处理**：行走目标先按"重叠面积最大的工作区"夹取；若该方向已贴边则**掉头**走反向，两侧都无空间才停下并发 `motion_ended{reason:'edge'}`。掉头/夹取都在启动时决定，运行中不再改目标。
 
 ### 未完成
+- 吸附跟随只认"同一个句柄"：目标窗口被销毁重建（部分应用切全屏会重建 HWND）时以 `window-gone` 结束，不会自动改吸新窗口
+- 显示器增删/分辨率变化时没有重算吸附位置（未监听 `display-metrics-changed`）
+- `top` 边缘只在"窗口上沿离屏幕顶 ≥ 窗口高"时成立；工作区上沿永远放不下（自动退回下沿），没有别的上沿方案
+- Win11 关闭通知时托盘气泡不显示，`notify` 只有日志兜底
 - 真实鼠标（非自检合成事件）下的手工验收；指针捕获在"窗口被 D-7 钳制停住、指针离开窗口"时的行为当前只有日志级证据
 - 行走/回弹期间的**穿透**只做到"按新窗口矩形重新判定"：R-6 轮询器每 tick 读 `getContentBounds()`，没有额外的"位移中强制刷新探针"通路（实测不丢点击，但没有专门断言）
 - 托盘：热键注册失败时**仍没有** UI 提示（托盘菜单不显示热键状态，只能看 `logs/pet.log` 的 `输入条热键状态`）
-- 托盘菜单的点击行为无法在自检里合成：自检只断言"托盘存在 / 菜单标签 / 图标 16×16"，`重新加载桌宠` 与 `退出` 需人工点一次验收
+- 托盘诊断只有"本进程"口径：`今天主动交互: N 次` 其实是"本次启动以来 N 次"，跨天/跨重启都没有累计（ADR 0032 D4.2）
+- 托盘诊断项不可点击（本来就只读），但**原生菜单的点击行为仍无法自检**：`重新加载桌宠` 与 `退出` 需人工点一次验收
 - "角色头顶之上"的字幕气泡：窗口按模型包围盒紧贴，头顶没有窗口内空白；要做窗口外气泡需要第三个窗口与新的 ADR（ADR 0016 D6）
 - DPI/分辨率变化时重建窗口尺寸、锚点与掩膜映射（当前尺寸只在启动时按模型包围盒算一次）
 
@@ -95,8 +114,11 @@
 | `closeInputBar` | `closeInputBar(reason: string): void` | 非契约（内部）：Esc / 失焦 / 提交后共用，不发事件 |
 | `inputBarDiagnostics` | `inputBarDiagnostics(): InputBarDiagnostics` | 非契约（内部诊断）：存在性/可见性/焦点/几何 |
 | `hotkeySnapshot` | `hotkeySnapshot(): HotkeyRegistration \| null` | 非契约（内部诊断）：默认/降级/失败结果 |
-| `traySnapshot` | `traySnapshot(): TrayDiagnostics` | 非契约（内部诊断，本轮）：托盘存在性 / 菜单标签 / tooltip / 图标尺寸（ADR 0018 D3） |
+| `traySnapshot` | `traySnapshot(): TrayDiagnostics` | 非契约（内部诊断）：托盘存在性 / 菜单标签 / tooltip / 图标尺寸 / **顶部两行诊断文本与原始读数**（ADR 0018 D3、ADR 0032 D4） |
 | `getInputBarWindow` | `getInputBarWindow(): BrowserWindow \| null` | 非契约（内部）：只给自检截图与注入脚本 |
+| `snapToForeground` | `snapToForeground(): SnapOutcome \| null` | 非契约（内部）：吸附的唯一内部入口（热键/托盘/自检共用），ADR 0028 D4 |
+| `releaseSnap` | `releaseSnap(): void` | 非契约（内部）：解除吸附（幂等），与托盘"离开窗口边缘"同一路径 |
+| `snapSnapshot` | `snapSnapshot(): SnapDiagnostics \| null` | 非契约（内部诊断）：模式/是否坐着/目标窗口/最近一次结果/跟随计数 |
 
 > 内部接口（不对外）：`PointerPoller.notePointerFact()`（`cmd:drag` 入队）、`DragGesture`、`drag-pause`、`installInputBarWindow()`、`registerHotkey()`。
 
@@ -104,17 +126,26 @@
 
 | 事件 | 用途 |
 |---|---|
-| `model_ready` | 渲染侧加载成功、首帧已渲染后上行；shell 记日志并 `showInactive()`（与 `did-finish-load` 同一幂等显示路径） |
+| `model_ready` | 渲染侧加载成功、首帧已渲染后上行；shell 记日志、`showInactive()`（与 `did-finish-load` 同一幂等显示路径），并落一个**一次性闩锁**（`noteModelReady()`）给 `runtime` 补发预热（ADR 0033 D2.2） |
 | `intent_resolved` | 渲染侧（shell 的字幕气泡）消费：**只登记**待显示文本，不显示（ADR 0021 D1）；不参与动作（动作只走 `cmd:render-intent`） |
 | `speech_started` | 字幕显示完整文本（同一帧），播放期间不自动隐藏（ADR 0021 D2/D4） |
 | `speech_ended` | `failed` → 立即显示兜底字幕；`completed`/`interrupted` → 留 1.2s 尾巴（ADR 0021 D3/D4/D5） |
 
-> 生产侧：shell 发出 `drag_started` / `drag_released` / `head_patted` / `user_utterance`（§6.3 全量清单内，未新增事件）。
+> 生产侧：shell 发出 `drag_started` / `drag_released` / `head_patted` / `user_utterance` / `snap_applied` / `snap_released`（§6.3 全量清单内，未新增清单外事件）。
 
 ### 已知坑位
 
 | 现象 | 影响 | 规避 |
 |---|---|---|
+| **本应用拿不到系统前台权**：主窗口 `focusable=false`（§3.2），自检里 `BrowserWindow.focus()` 无法把自建窗口变成系统前台窗口（Windows 前台锁） | 自检没法"打开一个记事本并让它成为前台"；第一版自检因此把桌宠吸到了真实前台（MuMu 模拟器）上，7 条断言全错 | 几何断言改用**脚本化前台**（`pushScriptedForeground`，仅 `PET_SELFTEST=1` 生效，输入是物理像素、仍走真实 `screenToDipPoint`）；真实 Win32 路径由另一条断言覆盖（"读到前台窗口 + 矩形自洽"） |
+| **DWM 扩展边框与 `GetWindowRect` 差 3–5px**（阴影/不可见调整边框） | 用后者吸附会留一条缝 | 优先 `DWMWA_EXTENDED_FRAME_BOUNDS`（9），失败才退回 `GetWindowRect`；日志记 `source` |
+| **全屏判定是"覆盖整块显示器 bounds"的矩形近似** | 带黑边的无边框全屏可能漏判成普通窗口 | 漏判时位置会被 D-7 夹取或按 `geometry` 拒绝，不会画到屏幕外；拖动目标窗口改变其矩形同样会触发重算/解除 |
+| **坐姿片段的"身体平移"**：`CH0335_my_event088_pastmemory_01` 11.2–13.5s 把身体搬到长椅上（cx≈-0.0035、minY≈+0.0058 单位），而 `HaloRoot` 不是骨骼、任何片段都不驱动它 | 直接播：她悬在窗口左上角、光环留在窗口中间（实测截图，第一版就是这样） | render 侧两处修正：加载期采样坐姿身体包围盒 → 每帧把"身体中心→窗口中线、最低点→窗口底边"；光环每帧挂到头骨（`updateHalo`）。诊断 `sit.offsetPx` 可见补偿值（实测 x≈+218、y≈-323） |
+| **坐姿片段的最后一帧是闭眼放松姿态** | 观感偏"打盹" | 美术事实，不修改资产；换模型/换窗口需重新标定 `clip-bank` 的 `startSeconds/maxSeconds` |
+| **掩膜随姿态变化**：坐姿轮廓与站姿完全不同，加载时算出的 body 探针点会落到空气里 | 按下被 D-2 门槛拒绝（"not-interactive"），自检点不中她 | 自检用 `findCurrentHitPoint()` 在当前掩膜上扫描；生产路径无需处理（掩膜本来就是当前姿态） |
+| **坐姿片段播放中（2.3s）身体一直在动**，掩膜逐帧变化 | "扫描命中"与"按下"之间该点可能已经变透明 → 按下被拒（本轮踩到两次） | 自检等 `sit.done === true`（姿态静止）后再采样点击点 |
+| **`koffi` 是 optionalDependency**：`build.mjs` 必须把它标成 `external`，且 `@koromix/koffi-win32-x64`（1.0MB `.node`）要随包带上 | 忘记 external 会打包失败；忘带平台包 → 启动期 `require` 失败（功能降级为贴工作区，不崩溃） | `build.mjs` 的 main bundle `external: ['electron','better-sqlite3','koffi']`；启动日志的 `吸附配置` 行会打印 `supported/effectiveMode` |
+| **曾经的怀疑：`desktopCapturer` 抓透明置顶窗会拿到"另一帧"** | 修 ADR 0029 之前，桌面合成图里的姿势确实会和窗口截图不一致（"背对镜头"），当时误以为是抓帧问题 | **已澄清**：那是头骨在漂移（1.5s 转半圈）。修好后两张图一致；断言"截图后 `animation.current.time` 仍为 2.3s"也一直是通过的（它只证明片段没重播，不能证明骨骼没漂——所以另加了 `headQuat` 断言） |
 | Windows 上 `setIgnoreMouseEvents(true, {forward:true})` 的 `forward` 无效，穿透后渲染进程收不到 `mousemove` | 无法用"光标回到模型上"的事件自动恢复交互 | 主进程 ~16ms 轮询光标 + `cmd:probe` 回判（ADR 0002，契约 §3.3 R-6） |
 | 光标进入窗口到判定返回约 1–2 帧 | 该窗口内的快速点击会落到桌面（点不中角色） | 判定通过才关闭穿透；不靠"进入即取消穿透"，否则会吞掉空白区点击（契约 §12 残余缺陷） |
 | 运行期切换主窗口 `focusable` 会闪烁、丢失置顶、输入法异常 | 输入条无法复用主窗口 | 输入条使用独立窗口，主窗口 `focusable` 恒 false（ADR 0003） |
@@ -143,7 +174,11 @@
 | 热键被占用时没有状态提示（托盘已实现，但菜单不显示热键状态） | 用户以为功能坏了，实际已降级或完全不可用 | 看 `logs/pet.log` 的 `输入条热键状态` / `降级到备用热键` / `两个热键都无法注册`；不自动重试注册（避免与占用方互抢） |
 | **托盘图标是 16×16 内嵌占位图**；通知区域由 explorer 提供 | explorer 未运行/受限桌面会话里 `new Tray` 可能抛错或图标不可见 | 创建失败只 WARN 并继续无托盘运行；热键、输入条、桌宠都不依赖托盘。换正式图标需要新资产与构建拷贝（ADR 0018 D3） |
 | **Windows 11 默认把新托盘图标放进溢出区（任务栏 `^`）** | 首次运行时可能"看不到图标"，需要点 `^` 或把它拖到任务栏常驻 | Electron 没有"强制常驻任务栏"的 API；这是系统设置，不是应用缺陷。`logs/pet.log` 的 `托盘已创建` 可确认创建成功 |
-| **托盘菜单点击无法自检**（原生菜单，Electron 不暴露"点第 N 项"） | "重新加载桌宠 / 退出"只有代码单测（tray-menu）与人工验收，没有端到端断言 | 自检断言 `exists` / `menuLabels` / `iconSize`；点击行为列为人工验收项 |
+| **托盘菜单点击无法自检**（原生菜单，Electron 不暴露"点第 N 项"） | "重新加载桌宠 / 退出"只有代码单测（tray-menu）与人工验收，没有端到端断言 | 自检断言 `exists` / `menuLabels` / `statLabels` / `stats` / `iconSize`；点击行为列为人工验收项 |
+| **托盘诊断的刷新依赖 16ms 指针轮询器** | 若将来把轮询器改成"窗口隐藏就停"，托盘两行会僵在旧读数 | `refreshTrayStats()` 只在 `onTick` 里跑（与吸附跟随同一约束，§12）；轮询器当前在 `start()` 到 `stop()` 之间**永不暂停**，因此可接受。要让它在无指针场景下也刷新，必须复用同一个定时器，不得新开 |
+| **第一版"一律 5s 节流"会让启动后的托盘显示旧读数**（本轮踩到）：`shell.start()` 先建托盘，`runtime.start()` 之后才装配 orchestrator，orchestrator 写下的第一条 `disabled`/`user-active` 要等最长 5s 才可见 | 用户点开菜单看到"尚未评估"，误以为诊断坏了；自检里也要 sleep 等待 | 改成"读数变了就在下一拍刷新，只在没变化时才 5s 复查"（ADR 0032 D4.3）。`setStats()` 内部仍会比较标签，文本相同不碰原生菜单 |
+| **托盘两行的原因文案是穷举映射**（`Record<ProactiveSilenceReason, string>`） | 将来若给判定原因或静默诊断加值而忘了映射，编译期就会报错（这是刻意的） | 加取值时同步 `tray-menu.ts` 的 `SKIP_REASON_LABEL` 与该模块单测 |
+| **`ok` 不等于"她真的说了"**：主动路径有两条"判定通过但静默"的分支（没台词且 LLM 不可用 / 主动推理失败） | 只看 `snapshot().lastProactiveSkip` 会误判成"她说过了"；第一版托盘就撒过这个谎 | 托盘读的是 `proactive-stats.lastReason`，静默分支会分别写 `no-lines` / `llm-failed`（ADR 0032 D4.0）；两条路径都有单测断言 |
 | **托盘"重新加载桌宠"会直接重启渲染进程**：不通知 voice/orchestrator | 若重载时正在播放语音，voice 会话会停在 `waiting-start` / `playing`，直到下一次 `speak` / `stopSpeaking` 收尾（与渲染进程崩溃同一类，ADR 0015 D3 不加看门狗） | 仅用于调试；重载后说下一句话即自动收尾。不要在正常对话中频繁点 |
 | **托盘"退出"会先 `shell.stop()`**，销毁窗口会触发 `window-all-closed` → `app.quit()` | 看起来像"退出了两次" | bootstrap 的 `before-quit` 有 `quitting` 守卫，`shell.stop()` 幂等；托盘回调随后再 `app.quit()` 是空操作（ADR 0004 D9） |
 | **`.env` 只在启动时读一次**，且进程环境变量优先 | 改 `.env` 后不重启不生效；`setx` 留下的同名变量会一直压过 `.env`，表现为"文件明明改了没用" | 改完重启；用 `echo $env:PET_XXX` 确认是否有同名进程变量；`logs/pet.log` 的 `.env 已加载` 行会列出 `applied` / `kept` 键名 |
@@ -159,6 +194,10 @@
 | 自检里"字幕在 `intent_resolved` 后立刻可见"的旧断言已失效 | 照旧写会假失败 | 现在的断言是"`intent_resolved` 后**不可见** + pending 已登记"（`SLOWTTS` 桩把 TTS 延迟 1.2s 制造窗口） |
 
 ### TODO
+- [x] 前台窗口吸附（Win32 via koffi + DIP 换算 + 热键/托盘 + 跟随 + 五条解除路径，ADR 0028）
+- [x] 吸附不可用时回退工作区贴边（无 koffi 也能用）
+- [ ] 目标窗口重建句柄后的自动重连（当前以 `window-gone` 结束）
+- [ ] `display-metrics-changed` 时重算吸附位置（显示器增删/缩放变化）
 - [x] 穿透状态机（8px 迟滞、100ms 冷却、单探针在飞、超时降级）
 - [x] 128×72 掩膜采集 / `cmd:probe` 应答 / cold-ready-stale / 矩形退路
 - [x] 拖拽位移与末速度、`head_patted` 的 4px/250ms/800ms 判定（第 4/5 步）
@@ -178,6 +217,11 @@
 ## 模块：render
 
 ### 已完成
+- **坐姿"头在打转"修复（2026-11-01 真机 bug，ADR 0029）**：根因不在视线/光环/`playHold`，而是骨骼仲裁器判断"动画这帧写没写"的方法——three 的 `PropertyMixer.apply()` 在累计姿态与上一个 accu 相同时**跳过 `binding.setValue()`**，`playHold` 停帧后 mixer 再也不写头骨，旧判据（"骨值 = 我上次写的值 ⇒ 动画没写"）被浮点末位噪声击穿 → 把上一帧的偏移当成新基底 → 每帧再叠一次（实测 **2.51 rad/s**）。修法：新增 `arbiter.capture()`（`mixer.update()` **之前**记录受控骨骼四元数），`beginFrame()` 改为"这中间变没变"的直接观测；阈值 1e-6。修后 1s 漂移 **0.000 rad**，桌面截图与窗口截图不再互相矛盾
+- **骨骼仲裁可观测**：`BoneArbitrationState` 增 `baseFrom`（`mixer`/`cache`）与 `applied`；`RenderDiagnostics.sit` 增 `headQuat` / `headWorld` / `headBase`；自检断言"坐姿 1s 内头骨不漂移（≤0.15 rad）"
+- **坐姿 `sitting`（本轮，ADR 0028 D8）**：`hfsm.ts` 新增 `snapApplied(now)` / `snapReleased(now)`——进入即 `Physics=sitting`、打断 `walking`、清空行走排期；`snapReleased` 只在仍是 `sitting` 时生效（`drag_started` 优先，不会被回滚）。`animation-controller.ts` 新增 `playHold/clearHold/hold()`：`LoopOnce + clampWhenFinished`，播完**停在最后一帧**、不自动回槽位（`playOnce` 相反），诊断带回 `done`。`clip-bank.ts` 新增 `sit` 角色（`CH0335_my_event088_pastmemory_01` 11.2–13.5s 裁剪）。`render-module.ts`：加载期"临时切到坐姿采样身体包围盒"（淡入 1ms）→ 每帧把 `animationRoot.x/y` 补偿到"身体中心=窗口中线、最低点=窗口底边"；坐姿期间关掉待机姿态轮换、`handleIntent` 照常可用；`sit-pose.ts` 提供呼吸浮动（1.2px/3.6s）与程序化降级（下沉 24px + 大腿 0.45rad）
+- **光环跟随头骨**：`HaloRoot` 不是骨骼、任何片段都不驱动它（回忆片段把角色搬走时它留在原地）→ 加载期标定"光环相对头骨"的偏移，每帧把光环挂回头骨（`updateHalo`）；诊断新增 `sit` 块（sitting/edge/procedural/clip/done/dropPx/bobPx/offsetPx）
+- **顺带修 bug**：占位胶囊体的位置被写成 `-height/2 + 24`（`animationRoot` 已经在底边 → 双重偏移），实测只剩 1px 露在窗口底边；改成 `+24` 后"缺失模型"自检 4/4
 - **行走转身（2026-10-31，ADR 0026 D1）**：`walking` 期间 `animationRoot.rotation.y` 叠加 ±90° 偏航（右走 `+π/2`、左走 `-π/2`），用帧率无关的指数逼近 `approach(cur, target, dt, 9)`（≈0.3s 走完 96%，不过冲）；停下 / 撞边 / 被拖拽 / 进入回弹时目标归 0，自动回正。偏航与既有 `look` 反应**相加**共用同一个 Y 轴通道，不互相覆盖。偏航进内部诊断 `motion.walkYaw / walkYawTarget`，自检断言"起步转向 ±90°、平滑逼近、停下回正"三条（截图 `window-walking.png` 可见侧身行走）
 - **emotion → 面部贴图（2026-10-31 第 2 版，ADR 0026 D6）**：**废弃"逐像素重绘五官"**（实机截图恐怖、不像官方），改为"官方差分贴图 → 面空间投影 → 覆盖眼部 UV"。新增 `expression-assets.ts`（PNG 解码成 `PixelImage`、单眼/双眼条裁剪、最近邻采样、缺失降级）、`shared/expression-files.ts`（协议白名单）；`emotion-face.ts` 只保留 `EMOTION_FACE`（emotion → `eyes/blush/mouth`）与嘴型图元，**删除全部眼型绘制代码**。`facial-texture.ts` 保留面空间栅格化/脏矩形/眼睛层/淡入，眼睛层改为合成 PNG、红晕层改为叠加 `blush.png`。素材目录 `data/expressions/`（`PET_EXPRESSIONS_DIR` 可覆盖），经只读 `pet-asset://asset/expr/<file>` 白名单路由读取
 - **降级与还原（ADR 0026 D6.2/D6.3）**：缺眼型 → 保持默认眼、只变嘴型；缺红晕 → 不叠；缺材质/几何 → 表情整体不生效。还原改用**初始化时的 `ImageData` 快照 + `putImageData`**（不再从 base 画布 `drawImage` 拷贝），恢复 neutral 时 `faceDistance` 精确为 **0**
@@ -199,7 +243,7 @@
 - **真实模型替换占位（阶段 4.5）**：加载成功即移除胶囊体；模型缺失/HTTP 404/解析失败/关键骨骼（head、eyeL、eyeR）缺失 → `modelReady=false` + 占位胶囊体（§7.3、§11），不白屏、不抛异常。
 - **自带动画接入（本轮，ADR 0014 D3/D8）**：`animation-controller.ts` 把 **44 段 clip 全量建 action**、启动时在控制台打印全部名称与角色识别（`pickup=CH0335_Formation_Pickup`、`struggle=CH0335_Vital_Panic` 作为 `held` 的降级候选）；选择 `idle=CH0335_Cafe_Idle`、`held=CH0335_Carrier_Idle`、`walk=CH0335_Move_Ing`（只识别、不启用，留给下一轮 `walking`）；切换只用 `crossFadeFrom(prev, 0.25/0.3s, false)`。**程序化呼吸退役**（ADR 0014 D8）：Base 的"呼吸"由 Idle 动画承担，不再对 `modelRoot` 做周期缩放。
 - **HFSM 三层壳（本轮，ADR 0014 D3）**：`hfsm.ts` 纯逻辑（不引用 three / 不读时钟）；Base=`idle`（`walking` 未实现，枚举保留）、Overlay=`speaking`/`reacting`、Physics=`dragged`；`overlay` 是 §7.1 单字段的投影 `speaking > reacting > null`；`reacting` 由 `head_patted` 或 §4.1 列出的 5 个 intent 进入，1.1s 自愈；`dragged`/`speaking` 只由事件进出（H-4）。
-- **骨骼仲裁（本轮，ADR 0014 D1/D2）**：`bone-arbiter.ts` 固定每帧顺序 **Mixer → 抓取动画基底 → 视线叠加 → pat 叠加 → 单次写回 → Physics 根变换 → render**；`head`/`eyeL`/`eyeR` 只允许仲裁器写；用"写回检测/还原"区分"本帧动画有没有重写这根骨"，避免未受动画驱动的骨骼逐帧累积偏移。
+- **骨骼仲裁（ADR 0014 D1/D2；基底判定于 ADR 0029 修正）**：`bone-arbiter.ts` 固定每帧顺序 **`capture()` → Mixer → 抓取动画基底 → 视线叠加 → pat 叠加 → 单次写回 → Physics 根变换 → render**；`head`/`eyeL`/`eyeR` 只允许仲裁器写。**"本帧动画有没有重写这根骨"改为用 `mixer.update()` 前后快照判定**（ADR 0029：three 的 `PropertyMixer.apply()` 在停帧后会跳过冗余写入，旧的"骨值 = 我上次写的值"判据在浮点噪声下会误判，把上一帧偏移当成新基底 → 逐帧累积）；未受动画驱动的骨骼仍然安全。
 - **视线改造（本轮）**：`gaze.ts` 不再持绑定姿态快照，改为向仲裁器提交 yaw/pitch 偏移；Idle 动画驱动头/眼时视线仍然有效（自检：左右光标 `yaw` 分别为 -0.24 / +0.24）。
 - **摸头反应（本轮，ADR 0014 D6）**：`pat-react.ts` 纯函数（`sin(πp)` 包络、权重、姿态）；头部后仰 `-0.3 rad` + 侧倾 `0.08 rad` + 身体前倾 `0.05 rad`，嘴型切图集第 4 帧（shy）；**说话时权重封顶 0.4、且不改嘴型**，`emotion` 临时投影 `shy`、结束回到 `intent_resolved` 的值。
 - **拖拽姿态（ADR 0014 D3）**：`drag_started` → crossFade 到 `Formation_Pickup`（被拎着的垂姿，ADR 0023 D3）、`animationRoot` 抬升 18px + 周期 1.6s / ±0.05 rad 摇摆；`drag_released` → Physics=`settling`，回弹过程中淡回 Idle。
@@ -214,7 +258,9 @@
 - 掩膜采集与 `cmd:probe` 应答（128×72、20Hz、垂直翻转、cold/stale/矩形退路）、`cmd:drag` 上行、R-8 暂停链路保持上一轮实现，未回退。
 
 ### 未完成
-- **官方表情差分尚未获取**：`ZM-Kimu/Blue-Archive-Asset-Downloader` 在本机卡在三处环境问题（uv 对 PyPI 的 TLS 证书不受信、缺 .NET 10 SDK、未走到 BA CDN），详见 ADR 0026 D6.4。当前 `data/expressions/` 为空，表情走"只变嘴型"降级；`data/expressions.fixtures/` 是非官方 fixture，仅用于自检自证
+- 坐姿片段的时间窗（11.2–13.5s）是**本资产**的标定值，换模型要在 `clip-bank.ts` 重新量；换掉之后"身体平移补偿"仍会自动生效（它是运行期测的），但"坐得像不像"要人眼复核
+- `sitting` 期间没有专门的坐姿表情（沿用当前 `emotion`；片段自带闭眼，遮住了部分表情效果）
+- **官方表情差分尚未获取**：`ZM-Kimu/Blue-Asset-Downloader` 在本机卡在三处环境问题（uv 对 PyPI 的 TLS 证书不受信、缺 .NET 10 SDK、未走到 BA CDN），详见 ADR 0026 D6.4。当前 `data/expressions/` 为空，表情走"只变嘴型"降级；`data/expressions.fixtures/` 是非官方 fixture，仅用于自检自证
 - 眉毛类表情（§4.5 的"眉内侧下压""眉下压"）：本资产眉毛/眼线是几何体 + 1 texel 纯色块，贴图改不了形状。若官方差分里带眉毛则可直接接入（协议白名单加文件名即可），否则需要"眉毛贴片"（等于改模型）
 - `angry` 与 `sleepy` 共用 `half` 眼型、嘴型差异小，视觉区分度一般（可继续调参或加眉毛贴片）
 - 眼型/嘴型/红晕的弧度、厚度、浓度是**美术标定值**，只做过截图目视复核，没有量化美观指标
@@ -244,6 +290,8 @@
 | `head_patted` | Overlay=`reacting`；`pat_react` 低权重叠加（说话时 ≤0.4、不改嘴型）；回弹期间忽略 |
 | `intent_resolved` | 只取 `emotion`（不触发动作）；摸头期间投影为 `shy`；该值驱动**面部贴图合成**（眼型/嘴型/红晕，ADR 0026） |
 | `motion_ended` | ADR 0024：`kind:'walk'` → Base 回 `idle` 并重新排期；`kind:'settle'` → Physics 退出、加落地缓冲 |
+| `snap_applied` | ADR 0028：Physics=`sitting`、收步、播官方坐姿片段并停在最后一帧（缺片则程序化降级）；期间不做行走调度 |
+| `snap_released` | ADR 0028：只在仍是 `sitting` 时退出 → 淡回 `idle` 并重新排期行走（`dragged` 优先，不会被回滚） |
 
 > 生产侧（既有）：`model_ready` 由 render 经 `evt:broadcast` 上行（§6.3 事件，未新增）。
 
@@ -251,6 +299,14 @@
 
 | 现象 | 影响 | 规避 |
 |---|---|---|
+| **坐姿片段把身体搬走、光环不跟着走**：回忆片段 11.2–13.5s 的 `Bip001` 身体相对根节点平移（cx≈-0.0035、minY≈+0.0058 单位 ≈ 470px），而 `HaloRoot` 是普通节点（不是骨骼），任何片段都不驱动它 | 直接播：她悬在窗口左上角、光环留在窗口中央（实测截图 `window-sitting.png` 第一版） | ① 加载期采样坐姿身体包围盒，每帧补偿 `animationRoot`（实测 x≈+218、y≈-323）；② `updateHalo()` 每帧把光环挂到头骨（偏移在空闲姿态标定） |
+| **`playHold` 停帧后，three 的 `PropertyMixer.apply()` 会跳过冗余写入**（累计姿态与上一个 accu 相同就不调 `binding.setValue()`） | 骨骼仲裁器旧判据（"骨值 = 我上次写的值 ⇒ 动画没写"）被浮点末位噪声击穿 → 把上一帧偏移当新基底 → **头每帧多转一点，像陀螺**（真机实测 2.51 rad/s；桌面截图与窗口截图互相矛盾就是它在转） | 用 `arbiter.capture()`（`mixer.update()` 前后快照）直接观测"动画有没有写这根骨"，阈值 1e-6；见 ADR 0029。**任何"停帧"状态都适用，不要退回旧判据** |
+| **`PropertyMixer.apply()` 的跳写是"比自己的两个 accu"**，不是"比骨骼当前值" | 试图用"先 `reset()` 骨骼再让 mixer 写"来绕过它会失效（它比的是内部 buffer） | 同上：只在仲裁器侧做观测，不改 mixer 行为 |
+| **`sitting` 期间头骨会跟着视线小幅转动**（±0.2 rad） | 属正常表现，不是 bug；但会让"1s 不漂移"这类断言误报 | 自检阈值取 0.15 rad（真实累积是 2.5 rad/s 量级，差 15 倍以上），断言 detail 里带 `headBase.baseFrom` 便于区分"cache/mixer" |
+| **坐姿片段的最后一帧是闭眼放松姿态**（美术事实） | 观感像在打盹；表情贴图被眼睑遮住 | 接受；换片段/换窗口要重新标定 `startSeconds/maxSeconds` |
+| **掩膜随姿态变化**：坐姿脚/腿/头发的位置与站姿完全不同 | 若沿用加载期的 body 探针点，点击会落到空气里（自检踩到两次，按下被 D-2 拒绝） | 生产路径无需处理（掩膜本来就是当前姿态）；自检改用 `findCurrentHitPoint()` 在掩膜上扫描，并等 `sit.done` 后再点 |
+| **`playHold` 与 `playOnce` 的区别**：前者 `clampWhenFinished` 后**不**回槽位，后者由 `finished` 事件淡回 `returnTo` | 用错的话坐姿会在 2.3s 后自己站起来 | 停帧姿态一律走 `playHold`；`clearHold` 时淡出（被暂停的 action 权重插值照常工作） |
+| **加载期"临时切到坐姿采样"必须用极小淡入（1ms）而不是 0** | 淡入 0 时 three 的权重插值区间长度为 0，行为依赖 `Interpolant` 的边界分支 | `CALIBRATION_FADE_SECONDS = 0.001`，采样后立刻切回 Idle |
 | **左右眼共用同一块 UV 岛**（虹膜 + 巩膜条都在 `u 0.14..0.96` 一带） | 眼型只能**镜像对称**：`>_<` 这种左右不同的画法在贴图上无法区分两只眼 | 契约 §4.5 对 `shy` 写的是"`>_<` 或半闭"，本轮取 `squint`（半闭/眯眼）；`EyeShape` 里不提供 `cross`（ADR 0026 D2.2） |
 | **`percentileRange` 的"还没赋值"哨兵写错会把区间塌成一点**：用 `low === min` 判断时，直方图第一桶通常就超过 1%，`low` 被一路覆盖到接近 high | 归一化后绝大多数像素落到 `[-1,1]` 外 → 表情贴图只在眼睛上画出一小块碎片（实测症状） | 用独立的两侧累加（低侧从左、高侧从右）代替哨兵；补单测（均匀分布 → 1%/99%） |
 | **眼部包围盒宽:高 ≈ 2:1，方形差分图会被横向拉伸** | 手绘方形眼图直接贴上去会变扁；而"官方贴图空间的眼部裁剪"恰好需要这个拉伸 | 差分按包围盒**拉伸铺满**（语义写进 `data/expressions/README.md`）；手绘图应画在垂直中段并横向铺满 |
@@ -291,6 +347,9 @@
 | `dragging` / `patMouthActive` / `dragSwayGain` 是**内部标志位**，不是 §4.1 的状态名 | 读代码/日志时容易误以为新增了状态 | 只会出现在 render 内部；对外状态仍只有 `base/overlay/physics` 三个字段（§4.1 集合未变）。`reaction.kind` 里的 `head_patted` 是"触发来源"，不是状态名 |
 
 ### TODO
+- [x] 坐姿 `sitting`（HFSM + `playHold` 停帧 + 身体平移补偿 + 光环跟随 + 程序化降级，ADR 0028）
+- [ ] 坐姿专用表情（闭眼/困倦 vs 当前 emotion 的取舍）
+- [ ] `sitting` 时的腿部遮挡检查（长裙/大衣在屈膝姿态下的穿插，需人眼复验）
 - [x] GLB 加载管线 + 包围盒校正 + 真实模型替换占位
 - [x] 视线跟随/微动（替代眨眼）
 - [x] 口型通道接口 + 静态闭嘴底图（8×8 图集标定）
@@ -331,12 +390,24 @@
 - **摸头规则（§9.1 的事件条件）**：空闲时命中 `on:'head_patted'` 规则并说话；`thinking` 或正在说话时**跳过**（§5.3：摸头不打断语音/在途 LLM），只有身体反应由 render 自己处理
 - **单测 19 个**：规则命中/顺序、健康检查熔断、LLM 合法/非法/超时、`cancel` 不发布、新话语打断旧话语、空话语、chat 抛异常、摸头跳过、prompt 段序；本轮新增 8 条记忆用例（段 ③ 注入 / 查询词 / 空或失败退回「（无）」/ 异步写两条 + refId / 写库在 speak 之后 / write 抛错不影响回复 / 摸头不写 / 无 memory 依赖时行为不变 + `formatMemoryFacts` 上限与截断）
 - **自检**：降级套件（无 TTS/无 LLM）验证 `route=rule` / `route=fallback` / `llm_failed{unavailable}` / 无 `speech_started` / 字幕可见 / 熔断；语音桩套件验证 `route=llm`、`invalid_output`、打断、记忆写入与段 ③ 注入、字幕时序
+- **在场感 presence（本轮，ADR 0030）**：新增 `src/main/presence.ts`（`PresencePort` 的 Win32 实现）。`GetLastInputInfo` + `GetTickCount`（**kernel32**，user32 里没有）拿系统级键鼠空闲毫秒；`GetForegroundWindow` + `GetWindowTextW`/`GetClassNameW` 拿前台标题与类名。**2s 懒采样**（`getSnapshot()` 节流，无定时器），标题控制字符压成单空格并截断 80 字；koffi 缺失或调用失败一律折算 `userIdleMs: null`，永不抛异常。真机首采 `userIdleMs=104360`、标题 `Trending repositories on GitHub today - Google Chrome`。**两个实测坑**：`GetTickCount` 不在 user32 导出表；`GetLastInputInfo` 必须声明 `_Inout_`（`_Out_` 或省略注解时 `cbSize` 传不进去，恒返回 0）
+- **提示词段 3.5「环境事实」（ADR 0030 D2/D3；本轮形态见 ADR 0032 D2）**：`buildPrompt` 新增**可选** `world?: WorldFacts`；缺省时输出与 1.9.0 **逐字节一致**（`world.test.ts` 用整串相等锁死）。注入时插在段 3 与段 4 之间，单行 ≤160 字：`環境: {YYYY-MM-DD HH:mm} / 先生は {时长}前まで入力中 / 前面のアプリ: {类别} / 先生は今、プログラミングに集中している（仅 coding） / 前回の会話から {时长}`；缺项整项省略（不写"未知"）；超长按"先丢编程提示 → 截类别 → 丢上次会话 → 丢类别 → 丢输入状态"降级，时间戳永远保留。时长 `<2min` 用秒（ADR 示例就是"90 秒"）、`<1h` 分、`<1d` 時間、其余日
+- **段 3 相对时间 + 去冗余 + 预算（本轮，ADR 0030 D4）**：`[10-30]` → `[今日]/[昨日]/[N日前]/[Nヶ月前]/[N年前]`（按**本地日历天**差，跨零点算昨日）；同 `tags` 且三字组 Jaccard ≥0.8 只留先出现的一条（**排序规则未改**，仍是 `hits → at → id`）；全部记忆行合计 ≤360 字，超出即停止装填（不二次截断行内文本）。`formatMemoryFacts(facts, limit, now?)`：给了 `now` 走相对时间，没给保持 1.9.0 的绝对时间
+- **主动性 idle-drive（本轮，ADR 0031）**：新增 `src/main/orchestrator/idle-drive.ts`（**纯函数**，14 条单测覆盖全部边界）+ `src/main/proactive-config.ts`（开关与阈值解析，9 条单测）。orchestrator 内 15s 节拍评估：编排层 idle、voice 不在播、`userIdleMs` ∈ (90s, 5min)、距上次交互 >90s、每会话 ≤12 次（深夜 23:00–07:00 减半为 6）、距上次主动 ≥10min；判定顺序 `disabled → busy → no-presence → user-active → user-away → gap → budget → cooldown → ok`。分流固定"先 `lines.json` 的 `on:'idle'`（4 条日文台词）→ 未命中才一次 3s 超时的本地 LLM"。**三条红线**：① LLM 失败/超时/非法输出 → **完全沉默**（不发 `llm_failed`、不播兜底）；② 主动话语**进对话历史**（`{user:'（彼女が自分から話しかけた）', assistant}`）但**不写 `memory.db`**；③ 仅在"本会话已成功健康检查且未熔断"时用 LLM——主动路径**不得**自行探测，否则一次心血来潮就会把 LLM 判死
+- **主动性开关（本轮，ADR 0031 D6）**：`PET_SELFTEST=1` 时**默认硬关**，只有 `PET_SELFTEST_PROACTIVE=1` 才开；`PET_PROACTIVE_DISABLE=1` 是逃生口且优先级最高；阈值可用 `PET_PROACTIVE_MIN_IDLE_MS` / `MAX_IDLE_MS` / `COOLDOWN_MS` / `MIN_GAP_MS` / `BUDGET` 覆盖（默认值仍来自 `constants.ts`，缺省时不覆盖任何一项）
+- **单测 29 个**（orchestrator；M14 封版时由 34 降为 29——5 条预热用例随实现迁往 `heartbeat.test.ts`）：上一轮 27 条（规则命中/健康检查熔断/LLM 合法非法超时/`cancel` 不发布/新话语打断/空话语/chat 抛异常/摸头跳过/prompt 段序/记忆注入与写入/段 3.5 与主动路径 8 条）+ 7 条（`proactive-stats` 的判定与开口写入 + 读副本 + reset、未装配主动性时写 `disabled`、段 3.5 主动路径）；**预热相关的 5 条已整体搬到 `heartbeat.test.ts`（16 条）**
+- **前台应用归一化接入（本轮，ADR 0032 D1/D2）**：`presence` 在**采样点**就把标题/类名归一化成 `coding`/`browser`/`game`/`meeting`/`video`/`other: <类名>`（新增 `src/main/presence/app-normalizer.ts`，纯函数、6 条单测表格穷举）；`PresenceSnapshot.foregroundCategory` 随之出现，`WorldFacts` **删掉** `foregroundTitle`/`foregroundClass`、只留 `foregroundCategory`——类型上就不给"把用户文档名塞进模型"留口子。段 3.5 变成 `前面のアプリ: coding`，`coding` 时追加一句 `先生は今、プログラミングに集中している`；降级顺序在原有基础上插入"先丢编程提示"
+- **生命周期心跳（本轮，ADR 0033；预热从本模块迁出）**：新增 `src/main/orchestrator/heartbeat.ts` + `src/main/heartbeat-config.ts` + `src/main/env-flags.ts`（与 `proactive-config` 共用同一个"什么算真"的语义）+ `src/main/model-ready.ts`（闩锁 + 观察者）。心跳是 `runtime` 装配的**独立 15s 节拍**（`HEARTBEAT_TICK_MS`），**只做生命周期任务**，当前唯一一件 = 冷启动预热（1-token `/api/generate`；16 + 6 + 12 条单测）。触发有两条：① `model_ready` 到达**立即**一次（ADR 0033 D2，`warmUpNow('model-ready')`）；② 15s 节拍按"未热好 + 未在飞 + 未熔断 + 编排层空闲 + presence 可读 + 距上次 ≥60s + 未超 3 次"重试。**与主动性彻底解耦**：`PET_PROACTIVE_DISABLE=1` 照样预热；`PET_SELFTEST=1` 时心跳整个不启动（不建定时器、零后台推理、无 opt-in 开关）；另有 `PET_WARMUP_DISABLE=1` 逃生口。沿用 W-1…W-4（不建会话 / 不改熔断 / 不发事件 / 不占预算），唯一放宽的是 `model_ready` 触发不看 presence（启动动作本身就是在场证据，ADR 0033 D3）。`orchestrator.snapshot()` 随之**删除** `llmWarmedUp` / `warmupAttempts`，诊断搬到 `RuntimeSnapshot.warmup`（迁移后编排层不再认识"预热"这个概念）
+- **托盘诊断的数据源（本轮，ADR 0032 D4）**：新增 `src/main/proactive-stats.ts` 进程内单例（`reset/publish/read`，读出来是副本）。`tickProactive()` 每拍写 `lastReason`、`publishProactive()` 每次成功开口写 `firedCount`；`startProactiveTimer()` 在主动性关闭时写 `disabled`（托盘据此解释"为什么没开"，而不是含糊的"尚未评估"）。**没有新增事件、IPC 或 setter**
 
 ### 未完成
 - 台词池的权重/随机化/多句变体（当前确定性首命中 + 固定兜底轮转）
 - 云端 fallback（§10.3；明确不在默认链，未实现）
 - ASR（§13 X-1）
 - 记忆的跨语言召回（中文提问查不到日文记忆，字面匹配的必然结果，见已知坑位）
+- 应用类别规则表的可配置化（目前硬编码在 `app-normalizer.ts`；扩类别要改代码 + 补单测）
+- 主动话语的"话题延续"（现在只按规则/单次生成，不会接着上一轮的话题自己往下说）
+- 段 3.5 里"上次会话"与"输入状态"信息有重叠（用户刚说完话时两者数值接近），可以合并成一项
 
 ### 对外暴露
 
@@ -374,19 +445,47 @@
 | **记忆写入是异步的（`setImmediate`）**：`respond()` 返回时可能还没落库 | 单元测试/自检里"写完立刻查"会读到 0 行（本轮踩到，已用 flush 修复） | 需要确定性时等一轮 `setImmediate`（测试）或轮询 `snapshot().rows`（自检）；生产路径不需要等 |
 | **跨语言检索不到**：记忆里是日文，用户用中文问同一个东西 | 段落 ③ 为空，模型"记不住" | 字面匹配的必然结果（ADR 0020 D4）；不引入 Embedding（§10.1 $5）。缓解方式：记忆同时存用户原话，用词尽量贴近 |
 | **检索发生在 LLM 分支内** | 规则/兜底路径不会去查记忆，`lastRetrieve` 可能停留在上一轮 | 段 ③ 只服务 LLM；想看"刚查了什么"看 `logs/pet.log` 的 `记忆检索` 行或 `snapshot().memory.lastRetrieve` |
+| **`gap` 的基准曾经写错：真机"永远不开口"**（本轮踩到并修复） | 应用在用户已离开 4 分钟后启动时，若以 `sessionStartedAt` 为 gap 基准，等 gap 满 90s 时 `userIdle` 已越过 5 分钟 → 永久 `user-away`，一次都不开口。日志现场：22:17:17 `gap` → 22:18:17 起 `user-away` | 已改为"无显式交互时以 `now - userIdleMs` 为基准"（ADR 0031 D2.1）；单测 `idle-drive` 增加"启动即已离开 4 分钟"用例 |
+| **一次离开最多主动开口一次** | 冷却 10min > 空闲上限 5min，所以第二次必定撞 `user-away` | 这是"严格打扰预算"的必然结果（ADR 0031 D2.4），不是 bug。要更黏人请同时调 `PET_PROACTIVE_COOLDOWN_MS` 与 `PET_PROACTIVE_MAX_IDLE_MS`，不要在代码里放宽 |
+| **主动路径在"本会话还没说过话"时只用规则** | 用户启动后从未发言 → `llmHealthChecked=false` → 主动 LLM 不可用，只能命中 4 条 `on:'idle'` 台词 | 有意为之（ADR 0031 D4.1：主动路径不得自行探测，否则空闲时的探测会污染 §11 的熔断语义）。规则台词由 `data/lines.json` 扩充即可 |
+| **TTS 未启动时主动话语只有字幕** | 真机 22:30:00 的观察：`intent_resolved{route:rule}` → `speech_ended{failed}`，气泡显示文本 | 与用户话语的降级路径完全一致（§11 / ADR 0021），不是新缺陷；启动 GPT-SoVITS 后自动有声 |
+| **presence 依赖 `koffi`（可选依赖）** | 装不上时 `userIdleMs` 恒 `null` → idle-drive 因 `no-presence` 永不触发；段 3.5 只剩时间戳 | 启动日志 `presence 不可用` + `snapshot().orchestrator.presenceIdleKnown=false` 可诊断；不阻断启动、不影响对话 |
+| **主动性的 15s 节拍器是进程内第二个定时器** | 容易被误读成违反 §12"不得再开第二个轮询器" | §12 约束的是**指针轮询器**（16ms，服务穿透与位移）。该节拍只做 idle-drive 评估，已在契约 §12 与 ADR 0031 D1 明确；未装配 `proactive` 时一个定时器都不建 |
+| **段 3.5 让提示词不可复现** | 每次请求的 system 段都不同（时间在走） | 这是"时间感"的代价；单测只能断言"存在 + 格式正确"，不能断言整串相等（`buildPrompt` 不传 `world` 时才逐字节可复现） |
+| ~~预热只在主动性开启时发生~~ **（已在 ADR 0033 修掉）**：旧实现把预热挂在 idle-drive 的 15s 节拍上，`PET_SELFTEST=1`（硬关）与 `PET_PROACTIVE_DISABLE=1` 都不预热 | 关掉主动性的人，首句仍会冷启动（10s → 撞 8s 预算） | 预热已迁到独立的心跳（`heartbeat.ts`）：`PET_PROACTIVE_DISABLE=1` 照样预热。**不要再把预热挂回 idle-drive**，那等于把"要不要打扰"和"把模型热好"重新绑在一起（ADR 0033 D1） |
+| **`model_ready` 不在 `appBus` 上**（本轮真机验证抓到的坑）：它是渲染侧 → 主进程的 IPC，`shell` 的 `onRendererEvent` 是收口，但**没有** `appBus.emit('model_ready')`；第一版把预热触发写成 `appBus.subscribe('model_ready')`，单测全绿、真机静默（模型热了才怪） | "预热看起来接好了，其实一次都没发出"——最坏的一类 bug：所有断言都过，功能没生效 | 改用 `src/main/model-ready.ts` 的一次性闩锁 + 观察者（`onModelReady`），**不要**改成 `appBus.emit('model_ready')`：`appBus.emit` 会把事件回环转发给渲染侧（`evt:broadcast`）。真机验证方法见 ADR 0033「验证」一节（本地桩 + `logs/pet.log` 的 `trigger:"model-ready"`） |
+| **`model_ready` 触发绕过 presence 门槛（有意放宽）** | koffi 缺失的机器上，启动时也会打一次本地预热请求 | 这是对 ADR 0032 D3 第 4 条的唯一放宽：启动动作本身就是在场证据，代价被限制在"1 token × 最多 3 次"。15s 心跳仍然守 presence 门槛（读不到就不做消耗 CPU 的事） |
+| **定时器现在有两个 15s 节拍**（idle-drive + heartbeat） | 计划表上"多一个定时器"容易被误读成违反 §12 | §12 禁的是**指针轮询器**（16ms）重复；两条 15s 节拍职责不同、互不引用，任一关闭都不影响另一条（ADR 0033 D1）。自检里心跳整个不启动，所以自检期间仍然只有一个（或零个） |
+| **自检的"零后台推理"是硬保证，不是默认值** | 没有 `PET_SELFTEST_WARMUP=1` 这类开关，想端到端验收预热只能起本地桩 | 刻意如此（ADR 0033 D1.1）：给自检留一个可能被 `.env` 意外打开的口，比"暂时测不了"危险得多。要看预热是否真的发生，看 `logs/pet.log` 的 `[heartbeat] LLM 预热已发出` / `已常驻内存` |
+| **预热不再是编排层的事实** | 老的排查习惯（`snapshot().orchestrator.llmWarmedUp`）会读到 `undefined` | 改读 `getRuntime().snapshot().warmup`（`enabled/running/warmedUp/attempts/lastTrigger/lastResult/lastSkip`）；`tsc` 已经会拦住旧字段访问 |
+| **预热会占几秒 CPU**（模型加载），且条件里**没有**排除"用户正在打字" | 用户可能感到一次短暂卡顿 | 只排除了"她在说话/推理中"；若要求预热必须在用户空闲时才做，就要把门槛提到 90s 空闲，等于让第一句继续冷启动。宁可花几秒 CPU |
+| **预热成功 ≠ 模型常驻** | Ollama 默认 `keep_alive` 5 分钟，闲置后仍会卸载；再隔很久说话又冷一次 | 应用**不**偷偷设 `keep_alive`（不擅自改外部服务的资源策略）；需要更长常驻请设 `OLLAMA_KEEP_ALIVE` |
+| **首问仍可能超时**：预热完成前用户就开口 | 那一轮仍走 `llm_failed{timeout}` → 兜底 | 预热不会取消/排队用户的请求（W-1：不建在途话语）；`getRuntime().snapshot().warmup.warmedUp` 可用于确认"到底热了没"（`lastSkip` 会给出没热的原因） |
+| **段 3.5 的应用信息变成"类别"后信息量下降** | 模型不再知道具体是哪个编辑器/哪个网页 | 刻意的方向（ADR 0032 D1）：隐私面更小、token 更省、对 4B 小模型更稳。要加信息就扩规则表，不要回退到原始标题 |
+| **归一化是启发式**：`Chrome_WidgetWin_1` 这类通用类名不能用来分类，只能靠标题；标题被应用改得面目全非时（如全屏只显示页面名）会落到 `other:` | 个别应用分类不准 | 规则表顺序与用例都在 `app-normalizer.test.ts` 里锁死；新增规则必须同时补用例。降级仍是可用的（`other: <类名>` 比空更有信息） |
 
 ### TODO
 - [x] 台词池与规则匹配 + 冷却
+- [x] 冷启动预热策略（ADR 0032 D3：1-token `/api/generate`，最多 3 次尝试，不改熔断）
+- [x] 预热与主动性解耦 + `model_ready` 前置对齐（ADR 0033：独立生命周期心跳，`PET_PROACTIVE_DISABLE=1` 照样预热，首问不再等 15s 节拍）
+- [x] 前台应用名归一化（ADR 0032 D1：`src/main/presence/app-normalizer.ts`，段 3.5 只发类别）
+- [x] 主动性可观测（ADR 0032 D4：托盘两行只读诊断，`proactive-stats` 单例）
 - [x] 本地 LLM 客户端与 8s 硬超时
 - [x] 输出 schema / 枚举校验与兜底
 - [x] `user_utterance` → `intent_resolved` / `llm_failed` 接线 + 打断
 - [x] 安装 `qwen3:4b` 后真机联调（2026-10-29：健康检查通过、一轮 3.1s；输出被判 `invalid_output`，见已知坑位）
 - [x] 真实 LLM 输出的合规化（ADR 0018 D2：提示词约束 + 装饰剥离 + 严格校验；真机 `route=llm` 1.7s）
-- [ ] 冷启动预热策略（避免首问撞 8s 预算；需先决定是否值得多一次本地推理）
 - [x] 记忆段接入（`memory.retrieve` → 段 ③，≤5 条；ADR 0020）
 - [x] 记忆写入接线（`publish()` 之后异步写 user + pet）
 - [x] 输入条热键与 `input:'hotkey'` 的真实来源（ADR 0016）
 - [ ] 记忆的淘汰/压缩策略（当前只增不删）
+- [x] 时间感：段 3.5 环境事实 + 段 3 相对时间（ADR 0030）
+- [x] 在场感：`presence` 只读端口（`GetLastInputInfo`，2s 懒采样）（ADR 0030）
+- [x] 主动性：idle-drive（规则优先 + 3s LLM，有打扰预算，失败即沉默）（ADR 0031）
+- [x] 主动性测试隔离：`PET_SELFTEST=1` 默认硬关，`PET_SELFTEST_PROACTIVE=1` 才开
+- [ ] 前台应用类别规则表的可配置化（当前硬编码，扩类别 = 改代码 + 补单测）
+- [ ] 主动话语的话题延续（接上一轮话题往下说，而不是每次重新起头）
+- [ ] 主动/被动比例的长期统计（托盘已有"本进程"两行读数，但没有跨天累计与历史曲线）
 
 ---
 
@@ -549,6 +648,8 @@
 
 | 日期 | 模块 | 摘要 | 契约版本 |
 |---|---|---|---|
+| 2026-11-01 | render | **真机 bug：坐姿时头疯狂打转**（ADR 0029）。二分结论：不是视线（提交的 yaw/pitch 只有 ±0.2 rad）、不是 `HaloRoot` 挂载（GLB 层级里它与骨架平级、只写 position）、不是 `playHold` 重入（`time` 恒为 2.3s）、不是窗口抖动。根因是骨骼仲裁的基底判定依赖"骨值 = 我上次写的值"，而 three 的 `PropertyMixer.apply()` 在**停帧**后会跳过冗余写入 → 误判成"动画写了" → 每帧把偏移叠在上一帧结果上（实测 2.51 rad/s）。修法：`arbiter.capture()` 在 `mixer.update()` 前快照受控骨骼，`beginFrame()` 用"这中间变没变"判定；阈值 1e-8 → 1e-6；新增 `baseFrom`/`applied` 诊断与 `headQuat/headWorld/headBase` 字段。修后 1s 漂移 **0.000 rad**；新增单测 `bone-arbiter` 4 条、自检 +1 条（头骨不漂移），主链路 **119/119** | 1.9.0 |
+| 2026-11-01 | shell、render、全局 | **前台窗口吸附 + 坐姿**（ADR 0028）：① shell 新增 `foreground-window.ts`（`koffi` → `GetForegroundWindow` + `DWMWA_EXTENDED_FRAME_BOUNDS`，退路 `GetWindowRect`；物理像素 → `screen.screenToDipPoint` 逐点换 DIP）、`snap-geometry.ts`（纯几何：边缘线 + 居中 + 整窗可见夹取 + 竖直 >40px 拒绝 + 覆盖式全屏判定）、`snap.ts`（控制器 + 跟随节流 120ms + 8 种拒绝 + 五条解除路径）；热键 `Ctrl+Shift+S`（降级 `Ctrl+Alt+S`）与托盘两项；无 `koffi` 时回退"工作区贴边"。② render 新增 Physics=`sitting`（`snapApplied/snapReleased`）、`playHold` 停帧播放、`clip-bank` 的 `sit` 角色（回忆片段 11.2–13.5s）、`sit-pose.ts`（呼吸 + 程序化降级）、坐姿身体平移补偿与**光环跟随头骨**。③ 修 bug：占位胶囊体位置双重偏移（缺失模型自检 4/4）。契约 **1.9.0**（§4.1 `sitting`、§5.1/§5.3、§6.3 两条事件、§7.1/§7.2/§7.3、§11 四行、§12、§13 X-10/X-11）。单测 **287**（28 文件，+15）、`tsc` 0 错、主链路自检 **119/119**（+22）、输入条 27 / 语音 30 / 缺失模型 4 套均 exit 0；截图 `window-sitting.png` + `window-sitting-desktop.png`（桌面合成） | 1.9.0 |
 | 2026-10-31 | render、shell（资产协议）、全局 | ADR 0026 第 2 版（**决策反转**）：实机判定"逐像素重绘五官"恐怖、不像官方 → **废弃程序化眼型/红晕**，改为官方差分贴图（`data/expressions/eyes_{happy,shy,sad,surprised}.png` + `blush.png`）。新增 `expression-assets.ts`（解码/裁剪/采样/降级）、`shared/expression-files.ts`（协议白名单）、`pet-asset://asset/expr/<file>` 只读路由与 `PET_EXPRESSIONS_DIR` 配置；`emotion-face.ts` 删除全部眼型绘制，只留 emotion→资产映射与嘴型；`facial-texture.ts` 保留面空间栅格化/脏矩形/眼睛层/0.25s 淡入，眼睛层改为合成 PNG、还原改为 `ImageData` 快照（`faceDistance` 恢复为 0）。修 `percentileRange` 哨兵 bug、边缘像素改夹取（去"幽灵眼环"）。契约 **1.8.0**（§5.2 表情通道、§7.3 新增"表情表现"规则表、§11 新增差分缺失降级行）。**官方差分未拿到**：下载器卡在 uv TLS（PyPI 证书不受信）/ 缺 .NET 10 SDK / 未到 BA CDN，已记入 ADR 0026 D6.4；改用 `data/expressions.fixtures/`（非官方 fixture）自证管线。单测 **247**（24 套件，+5 新增：差分裁剪/采样/红晕强度/百分位区间/去重）、`tsc` 0 错、主链路自检 **97 条全绿**（有素材与空目录两种配置各跑一遍）、输入条/语音/缺失模型三套 exit 0 | 1.8.0 |
 | 2026-10-31 | render | ADR 0026：① **行走转身**（修侧滑）：`walking` 期间 `animationRoot.rotation.y` 叠加 ±90° 偏航（指数逼近 9/s，≈0.3s），与 `look` 反应相加共用 Y 轴通道；停下/撞边/拖拽/回弹强制回正，偏航进 `motion.walkYaw` 诊断。② **emotion 上脸**：新增 `emotion-face.ts`（`EMOTION_FACE` 七个值 + 纯图元采样 + `resolveMouthOwner` 仲裁）、`facial-geometry.ts`（抽面空间三角形）、重写 `facial-texture.ts`（逐三角形重心插值栅格化 + 1%/99% 分位重归一化 + 脏矩形还原 + 眼睛透明层合成 + 打包颜色零分配 + `faceDistance` / `textureDigest`）。实测：换眼型 40ms（一次性）、淡入每步 3.6ms、眼像素 1,048,770 → 524,408（去重）。契约 **1.7.0**（§4.1 walking 朝向、§5.2 表情通道贴图实现、§7.3 四条禁令与降级、§11 两行降级）。单测 **242**（24 套件，+23 新增；上一轮记录的 244 未复现，本轮以 `npm test` 实测 242/24 为准）、`tsc` 0 错、主链路自检 **96 条全绿**、输入条/语音/缺失模型三套仍 exit 0；截图 `window-emotion-{neutral,happy,shy,sad,surprised,neutral-again}.png` + `window-walking.png`（侧身行走） | 1.7.0 |
 | 2026-10-27 | 全局 | 建立模板；按 ADR 0002/0003 预置 shell、render 的已知坑位 | 1.1.0 |
@@ -570,5 +671,6 @@
 | 2026-10-31 | render | ADR 0023：官方片段接线。新增 `clip-bank.ts`（44 段 → 语义角色：idle/idle.alt1/held/walk/walk.carried/pat/greet/happy/victory + 侧向战斗片段只登记）；`animation-controller` 增 `playOnce`/`playRole`，槽位退化为角色别名；held 改用 `Formation_Pickup`（`Carrier_Idle` 实为站姿）、摸头用 `Cafe_Reaction` 3.5–6.6s、打招呼用同段 0–2.2s、开心用 `Victory_Start`；待机 22–40s 在 `Cafe_Idle`/`Formation_Idle` 间轮换。**关键实测：`Normal_*`/`Exs*`/`Vital_*`/`Public01`/`Move_*` 是侧身战斗动画，不能用于正面桌宠**。新增 `tools/clip-preview`（浏览器预览 + 胶片条 + 离屏截图）。单测 **13（hfsm）+4（pat）+12（motion）**、`tsc` 0 错、自检 61 条全绿 | 1.5.0 |
 | 2026-10-31 | shell、render、memory、全局 | ADR 0024/0025：① **walking 与窗口位移**：`shared/motion.ts` 纯函数（`stepWalk` 刹车曲线 / `stepSpring` / `stepSettle`）+ `shell/motion.ts` 控制器，由唯一 16ms 轮询器驱动；`cmd:walk`（新命令通道）让 render 只说方向与距离；`motion_ended`（新事件）回传到达/撞边/回弹结束；撞边自动掉头。② **真实回弹**：`drag_released` → Physics=`settling`，弹簧-阻尼落到工作区地面线（k=140/c=12/恢复系数 0.28）+ 180ms 落地缓冲；回弹期间忽略 intent/摸头（重新拖拽除外）。③ **记忆淘汰**：`prune()` 按 `at` 升序删超额行（上限 2000、单次 ≤200），`write` 后 `setImmediate` 排期，FTS5 由 `AFTER DELETE` 触发器同步。契约 **1.6.0**（§3.5 增 `cmd:walk`、§4.1/§7.1 `PhysicsState` 增 `settling`、§6.3 增 `motion_ended`、§7.5 增 `prune`、§12 单定时器口径）。单测 **25（memory，+4）/12（motion）/13（hfsm）**、`tsc` 0 错、自检 **69 条全绿**（新增行走 4 条 + 回弹 4 条，截图 `window-walking.png`） | 1.6.0 |
 | 2026-10-31 | render | 修嘴周发暗：`sampleTextureColor` 用 1×1 缩放取整张贴图的**平均色**，被眉毛/鼻影/下颌阴影拖到 `(204,190,186)`，比肤色 `(249,241,236)` 暗 18%，嘴部底板刷上去就是一圈暗斑。改为取**众数**（5bit 量化，最大桶 43%），算法抽到 `shared/color.ts` 纯函数 + 5 条单测；填色向外扩 2 texel 消除 UV 岛边界的亮边。自检仍 69 条全绿，`tsc` 0 错，单测 **244**（23 套件，+5） | 1.6.0 |
+| 2026-11-01 | orchestrator、memory（段 3 格式）、新增 presence、全局 | **时间感 + 在场感 + 主动性**（ADR 0030 / ADR 0031）：① `presence.ts`（`GetLastInputInfo`+`GetTickCount` 取系统空闲，`GetForegroundWindow`+`GetWindowTextW/GetClassNameW` 取前台；**2s 懒采样、无定时器**；koffi 缺失即 `userIdleMs:null`）；② `buildPrompt` 新增可选 `world`，段 3.5 `環境: … / 先生は …前まで入力中 / 前面のアプリ: … / 前回の会話から …`，缺省与 1.9.0 逐字节一致；③ 段 3 改相对时间（`[3日前]`）+ 同 tags 三字组 Jaccard ≥0.8 去冗余 + 360 字预算（**排序规则未改**）；④ `idle-drive.ts` 纯函数判定 + orchestrator 15s 节拍：`userIdle ∈ (90s, 5min)`、gap >90s、每次 ≥10min、每会话 12 次（深夜 6）；先 `lines.json` 的 `on:'idle'`（新增 4 条日文台词）再 3s LLM；**失败完全沉默**、**进历史但不写 `memory.db`**、**只在已健康检查时用 LLM**；⑤ `PET_SELFTEST=1` 默认硬关 + `PET_SELFTEST_PROACTIVE=1` 才开 + `PET_PROACTIVE_*` 阈值覆盖。契约 **1.10.0**（§2/§2.1/§3.1、§9.3 段 3.5、§7.5 段 ③ 格式、§7.6 PR-1…PR-7、§11 四行、§12 两行）。单测 **+40**（orchestrator 19→27、world 13、idle-drive 14、presence 7、proactive-config 9）、`tsc` 0 错、主链路自检 **120/120**（+1 条主动性闸门）。**真机两处发现**：`GetTickCount` 不在 user32 导出表；`gap` 以 `sessionStartedAt` 为基准会导致"启动即已离开"时永不开口（已修为以最后一次输入为基准）。真机观察：22:30:00 规则 `idle-check` 主动开口 → `intent_resolved{route:rule}` → TTS 未启动按 §11 降级为字幕 | 1.10.0 |
 | 2026-11-01 | render、全局 | **编码事故与重建**（ADR 0027）：用 PowerShell `Get-Content/Set-Content` 临时改行，GBK 解码把 `render-module.ts` 变成乱码并吃掉换行（305 个语法错误，编码不可逆）。当时**没有 git**、`dist` 被 `rm -rf` 清空、无编辑器历史/卷影副本 → 只能重写。① 先建 git（`f653cd3` 事故基线、`8dc450a` 重建）；② 分三轮重写 `render-module.ts`（骨架与加载 / 动画视线交互 / 口型贴花）；③ 新增 ADR 0027（禁止 shell 文本往返、强制 git、破坏性实验走副本）；④ ADR 0026 补 **D7 官方线稿贴花层**（`face-decal.ts`：头骨下的深度测试平面，贴图由 `FX_TEX_CH0335_Img_Face_01.png` 按连通域裁出）。验证：`tsc` 0 错、单测 **272**（25 套件）全绿、自检 **97/97**（连跑两次，其中一次仅 shell 侧"冷却拦下"日志断言偶发，属既有 flaky） | 1.6.0 |
 | 2026-11-01 | render | **移除多余贴花，回归官方动画眨眼**（ADR 0026 D7 否决）：实测 `Cafe_Idle` 在 t≈2.5s 用**眼皮骨骼平移**（`bone_eye_D_L/R` 的 `translation.x` 0.000262→0.000435，0.3s 回落）完成眨眼。此前自建的「遮罩 + 线稿」贴花层多余且每帧写 `applyBlink(0)` 覆盖了动画——这是"看不见眨眼"的真正原因。① 删除 `render-module` 里的贴花接线、眨眼计时器、眼骨缩放、`PET_DECAL_DEBUG` 调试通道；② `face-decal.ts` 保留为储备，默认不创建、不加载贴图；`DECAL_FACE_FILES` 移出 `EXPRESSION_FILES` 白名单，任何代码都不再读取；③ 嘴型换用官方高清图集 `Character_Mouth_High-BgFqI_9W.png`（2048²/8×8=64 帧）；④ 表情嘴型改用图集帧，不再用 Canvas 图元；⑤ 自检 fixture 默认关闭（`PET_SELFTEST_FIXTURES=1` 才启用），截图=真机效果。**教训：先查动画，再做渲染；不要写动画拥有的骨骼** | 1.6.0 |

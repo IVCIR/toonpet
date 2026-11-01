@@ -112,6 +112,84 @@ export const MEMORY_TAG_MAX_CHARS = 40;
 /** 检索延迟预算（契约 §7.5：≤ 50ms）；只用于自检/单测断言，不是运行期超时。 */
 export const MEMORY_RETRIEVE_BUDGET_MS = 50;
 
+// --- 在场感 presence（ADR 0030 D1/D5） ---
+/**
+ * presence 的采样节流：`getSnapshot()` 至多每 2s 真正调一次 Win32。
+ * **不是定时器**——没有 setInterval，读的时候才判断是否需要重采；
+ * 因此不构成契约 §12 所说的"第二个轮询器"（那一条说的是 16ms 指针轮询）。
+ */
+export const PRESENCE_SAMPLE_INTERVAL_MS = 2000;
+/** 前台窗口标题在 presence 里的硬截断：只为段 3.5 用，不需要完整标题 */
+export const PRESENCE_TITLE_MAX_CHARS = 80;
+
+// --- 世界事实与段 3.5（ADR 0030 D2/D3；ADR 0032 D1/D2） ---
+/** 段 3.5「环境事实」的最大字符数：单行、可截断，保证它永远不会顶掉段 4/5 */
+export const WORLD_SEGMENT_MAX_CHARS = 160;
+/** 判定"用户正在输入"的阈值：小于它就不提"多久之前" */
+export const WORLD_TYPING_ACTIVE_MS = 5000;
+/**
+ * 段 3.5 里"前台应用"标签的截断上限。
+ * 本轮起标签是归一化类别（`coding` / `other: <类名>`），只有 `other:` 的长类名才可能超长。
+ */
+export const WORLD_APP_TITLE_MAX_CHARS = 48;
+
+// --- 生命周期心跳（ADR 0033） ---
+/**
+ * 生命周期心跳的节拍：15s。它**只**做生命周期任务（目前唯一一件 = 冷启动预热），
+ * 与 idle-drive 的 15s 主动性节拍（`PROACTIVE_TICK_MS`）各自独立：
+ * 关掉主动性，心跳照常；自检里心跳整个不启动。
+ */
+export const HEARTBEAT_TICK_MS = 15000;
+
+// --- 冷启动 LLM 预热（ADR 0032 D3；调度方于 ADR 0033 改为生命周期心跳） ---
+/**
+ * 预热请求的超时。它买的是**模型加载**时间（CPU 上 4B 量级首次加载可到几十秒），
+ * 不是推理时间；给得比 `LLM_HARD_TIMEOUT_MS` 宽得多，且不占用任何对话预算。
+ */
+export const LLM_WARMUP_TIMEOUT_MS = 60000;
+/** 预热失败后的重试间隔（同一会话最多 `LLM_WARMUP_MAX_ATTEMPTS` 次） */
+export const LLM_WARMUP_RETRY_MS = 60000;
+/** 同一会话最多尝试几次预热：失败 3 次就放弃，避免对着一个关着的 Ollama 每 15s 敲一次 */
+export const LLM_WARMUP_MAX_ATTEMPTS = 3;
+/** 预热只生成 1 个 token：目的只是把权重读进内存，不要算力 */
+export const LLM_WARMUP_NUM_PREDICT = 1;
+
+// --- 托盘只读诊断（ADR 0032 D4） ---
+/**
+ * 托盘诊断项的刷新节流：挂在既有 16ms 指针轮询器的 `onTick` 上（与吸附跟随同一手法），
+ * **不新开定时器**；5000ms 远大于人观察托盘菜单的粒度。
+ */
+export const TRAY_STATS_REFRESH_MS = 5000;
+
+// --- 记忆段的相对时间与预算（ADR 0030 D4） ---
+/**
+ * 段 3 全部记忆行的总字符上限。
+ * 5 条 × 120 字上限 = 600 字的最坏情况会把段 3 顶到角色卡的两倍，
+ * 这里压到 360：宁可少两条，也不让"记忆"压过"角色卡"。
+ */
+export const MEMORY_SEGMENT_MAX_CHARS = 360;
+/** 两条记忆被判为"重复"的三字组 Jaccard 阈值（同 tags 时才比较） */
+export const MEMORY_DEDUPE_SIMILARITY = 0.8;
+
+// --- 主动性 idle-drive（ADR 0031 D2/D3） ---
+/** 评估节拍：15s 一次。**不是**指针轮询器，也不参与穿透/位移（§12） */
+export const PROACTIVE_TICK_MS = 15000;
+/** 系统键鼠空闲超过这么久，才认为"用户没在操作" */
+export const PROACTIVE_MIN_USER_IDLE_MS = 90000;
+/** 空闲超过这么久，认为"用户可能离开了"——此时不打扰（ADR 0031 D2.2） */
+export const PROACTIVE_MAX_USER_IDLE_MS = 300000;
+/** 距上一次用户主动交互（说话/摸头）至少这么久 */
+export const PROACTIVE_MIN_INTERACTION_GAP_MS = 90000;
+/** 两次主动开口之间的冷却：10 分钟 */
+export const PROACTIVE_COOLDOWN_MS = 600000;
+/** 每会话主动开口总预算（规则 + LLM 合并计）：12 次 */
+export const PROACTIVE_SESSION_BUDGET = 12;
+/** 深夜（23:00–07:00）预算减半 → 6 次 */
+export const PROACTIVE_NIGHT_START_HOUR = 23;
+export const PROACTIVE_NIGHT_END_HOUR = 7;
+/** 主动路径的 LLM 超时：3s。超时即沉默，**绝不**走兜底（ADR 0031 D4） */
+export const PROACTIVE_LLM_TIMEOUT_MS = 3000;
+
 // --- 行走（契约 §4.1 `walking`、§5.3、§12；ADR 0024） ---
 /** idle 持续这么久之后才可能触发一次行走（§4.1 的 20s 下限） */
 export const WALK_INTERVAL_MIN_MS = 20000;
@@ -143,3 +221,28 @@ export const SETTLE_SQUASH_RATIO = 0.06;
 export const MEMORY_MAX_ROWS = 2000;
 /** 单次 prune 最多删这么多行：把最坏耗时锁在毫秒级，剩余的下次再删 */
 export const MEMORY_PRUNE_BATCH_MAX = 200;
+
+// --- 前台窗口吸附（契约 §4.1 `sitting`、§6.3 `snap_*`；ADR 0028） ---
+/** 吸附热键：默认 Ctrl+Shift+S，被占用降级 Ctrl+Alt+S（与输入条热键同一套三级降级） */
+export const SNAP_HOTKEY_DEFAULT = 'Control+Shift+S';
+export const SNAP_HOTKEY_FALLBACK = 'Control+Alt+S';
+/**
+ * 跟随目标窗口的轮询节流（ms）。挂在既有 16ms 轮询器的 onTick 上，
+ * 不新开定时器（契约 §12）；120ms ≈ 8 帧一次，拖动/缩放窗口时肉眼无延迟感。
+ */
+export const SNAP_FOLLOW_INTERVAL_MS = 120;
+/** 可作为吸附目标的前台窗口最小尺寸（DIP）：比这更小的窗口吸附上去没有意义 */
+export const SNAP_MIN_TARGET_WIDTH_PX = 80;
+export const SNAP_MIN_TARGET_HEIGHT_PX = 40;
+/** 全屏判定容差（DIP）：窗口矩形与显示器 bounds 的差在这个范围内即视为全屏 */
+export const SNAP_FULLSCREEN_TOLERANCE_PX = 2;
+/**
+ * 允许的贴边误差（DIP）：吸附后的位置被 D-7 夹回工作区时，若离目标边缘线超过这么多，
+ * 就不再"假装吸附"——她会被摆在一个明显不在边缘的位置上，宁可拒绝并提示（ADR 0028 D3）。
+ */
+export const SNAP_MAX_CLAMP_PX = 40;
+/**
+ * 回退模式（没有 koffi）的"物理贴边"距离：拖拽松手时窗口底边离工作区下沿
+ * 不超过这么多像素，就吸到下沿并坐下（她本来就落在这条线上，只是把姿态换成坐）。
+ */
+export const SNAP_EDGE_DRAG_THRESHOLD_PX = 24;

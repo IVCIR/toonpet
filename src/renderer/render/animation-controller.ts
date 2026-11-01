@@ -57,6 +57,15 @@ export interface OneShotStatus {
   duration: number;
 }
 
+/**
+ * "停住的姿态"的进行态（诊断用，ADR 0028 D8）。
+ * 与 `OneShotStatus` 的区别：播完**不回**常驻槽位，停在最后一帧等调用方解除。
+ */
+export interface HoldStatus extends OneShotStatus {
+  /** 已经播到最后一帧（clampWhenFinished 生效） */
+  done: boolean;
+}
+
 export interface OneShotOptions {
   /** 淡入秒数（默认 0.18） */
   fadeIn?: number;
@@ -80,6 +89,16 @@ export interface ModelAnimations {
   playRole(role: ClipRole, fadeSeconds: number, slot?: AnimationSlot): boolean;
   /** 播一次性演出；片段缺失返回 false，调用方自行降级 */
   playOnce(role: ClipRole, options?: OneShotOptions): boolean;
+  /**
+   * 播一个"停住的姿态"（ADR 0028 D8）：`LoopOnce` + `clampWhenFinished`，
+   * 播完停在最后一帧**不回**常驻槽位，直到 `clearHold` 或下一次 `play*`。
+   * 用于 `sitting`：她坐在那里，姿势不能自己变回站姿。
+   */
+  playHold(role: ClipRole, fadeSeconds: number): boolean;
+  /** 淡出当前停住的姿态（离开 `sitting` 时用）；幂等 */
+  clearHold(fadeSeconds: number): void;
+  /** 停住姿态的进行态（诊断用）；没有时返回 null */
+  hold(): HoldStatus | null;
   /** 打断正在播的一次性演出（淡出），不改变常驻槽位 */
   cancelOneShot(fadeSeconds: number): void;
   oneShot(): OneShotStatus | null;
@@ -162,6 +181,8 @@ export function createModelAnimations(
   let oneShotAction: THREE.AnimationAction | null = null;
   let oneShotRole: ClipRole | null = null;
   let oneShotReturn: AnimationSlot = 'idle';
+  let holdAction: THREE.AnimationAction | null = null;
+  let holdRole: ClipRole | null = null;
 
   function fadeTo(action: THREE.AnimationAction, fadeSeconds: number): void {
     const previous = currentAction;
@@ -188,13 +209,22 @@ export function createModelAnimations(
     oneShotRole = null;
   }
 
+  function fadeOutHold(fadeSeconds: number): void {
+    if (!holdAction) return;
+    // 停住的姿态是被 clampWhenFinished 暂停的 action：淡出仍然生效（权重插值照跑）
+    holdAction.fadeOut(Math.max(0, fadeSeconds));
+    holdAction = null;
+    holdRole = null;
+  }
+
   function playSlot(slot: AnimationSlot, fadeSeconds: number): boolean {
     const picked = selection[slot];
     if (!picked.name) return false;
     const next = byName.get(picked.name);
     if (!next) return false;
-    if (next === currentAction && oneShotAction === null) return true;
+    if (next === currentAction && oneShotAction === null && holdAction === null) return true;
     clearOneShot(fadeSeconds);
+    fadeOutHold(fadeSeconds);
     next.setLoop(THREE.LoopRepeat, Infinity);
     next.clampWhenFinished = false;
     fadeTo(next, fadeSeconds);
@@ -223,16 +253,55 @@ export function createModelAnimations(
     playRole(role: ClipRole, fadeSeconds: number, slot: AnimationSlot = 'idle'): boolean {
       const next = roleActions.get(role);
       if (!next || !roleSelections[role].name) return false;
-      if (next === currentAction && oneShotAction === null) {
+      if (next === currentAction && oneShotAction === null && holdAction === null) {
         currentSlot = slot;
         return true;
       }
       clearOneShot(fadeSeconds);
+      fadeOutHold(fadeSeconds);
       next.setLoop(THREE.LoopRepeat, Infinity);
       next.clampWhenFinished = false;
       fadeTo(next, fadeSeconds);
       currentSlot = slot;
       return true;
+    },
+
+    playHold(role: ClipRole, fadeSeconds: number): boolean {
+      const next = roleActions.get(role);
+      if (!next || !roleSelections[role].name) return false;
+      if (next === currentAction && holdAction === next) return true;
+      clearOneShot(fadeSeconds);
+      next.setLoop(THREE.LoopOnce, 1);
+      next.clampWhenFinished = true;
+      next.reset();
+      next.enabled = true;
+      next.setEffectiveTimeScale(1);
+      next.setEffectiveWeight(1);
+      next.play();
+      if (currentAction && currentAction !== next) {
+        next.crossFadeFrom(currentAction, Math.max(0, fadeSeconds), false);
+      }
+      currentAction = next;
+      currentSlot = null;
+      holdAction = next;
+      holdRole = role;
+      return true;
+    },
+
+    clearHold(fadeSeconds: number): void {
+      fadeOutHold(fadeSeconds);
+    },
+
+    hold(): HoldStatus | null {
+      if (!holdAction || !holdRole) return null;
+      const clip = holdAction.getClip();
+      return {
+        role: holdRole,
+        name: clip.name,
+        time: holdAction.time,
+        duration: clip.duration,
+        done: holdAction.time >= clip.duration - 1e-3,
+      };
     },
 
     playOnce(role: ClipRole, options: OneShotOptions = {}): boolean {
@@ -242,6 +311,8 @@ export function createModelAnimations(
       const returnTo = options.returnTo ?? 'idle';
 
       if (oneShotAction && oneShotAction !== next) clearOneShot(fadeIn);
+      // 一次性演出要接管身体：停住的姿态必须让位（否则两份权重叠在一起）
+      fadeOutHold(fadeIn);
       oneShotAction = next;
       oneShotRole = role;
       oneShotReturn = returnTo;

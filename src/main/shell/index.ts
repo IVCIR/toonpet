@@ -12,7 +12,11 @@
 import { app, globalShortcut, ipcMain, screen } from 'electron';
 import type { BrowserWindow, IpcMainEvent } from 'electron';
 import path from 'node:path';
-import { WINDOW_HEIGHT_PX, WINDOW_WIDTH_PX } from '../../shared/constants';
+import {
+  TRAY_STATS_REFRESH_MS,
+  WINDOW_HEIGHT_PX,
+  WINDOW_WIDTH_PX,
+} from '../../shared/constants';
 import { isEventName } from '../../shared/events';
 import type { BroadcastEvent, EventName, EventPayloads, ModelReadyPayload } from '../../shared/events';
 import { computeWindowSize } from '../../shared/model-frame';
@@ -21,16 +25,22 @@ import { IPC_CHANNELS } from '../../shared/ipc';
 import type { PointerFact, ProbeResponse, WalkCommand } from '../../shared/ipc';
 import { logError, logInfo, logWarn } from '../log';
 import { appBus } from '../event-bus';
+import { noteModelReady } from '../model-ready';
+import { readProactiveStats } from '../proactive-stats';
 import { registerAssetProtocol } from './asset-protocol';
 import { resolveAssetConfig } from './asset-config';
 import { readGlbBounds } from './glb-bounds';
 import { createCursorSource } from './cursor-source';
+import { createForegroundWindowReader } from './foreground-window';
+import type { ForegroundWindowReader, PhysicalRect } from './foreground-window';
 import { createMainWindow, loadMainRenderer } from './main-window';
 import type { WindowSize } from './main-window';
 import { createMotionController } from './motion';
 import type { MotionController, MotionDiagnostics } from './motion';
 import { createPointerPoller } from './pointer-poller';
 import type { PointerPoller } from './pointer-poller';
+import { createSnapController, resolveSnapConfig, SNAP_HOTKEY } from './snap';
+import type { SnapController, SnapDiagnostics, SnapOutcome } from './snap';
 import {
   INPUT_HOTKEY_DEFAULT,
   INPUT_HOTKEY_FALLBACK,
@@ -41,6 +51,7 @@ import type { InputBarBounds } from './input-bar-geometry';
 import { createInputWindow, loadInputBarRenderer, positionInputBar } from './input-window';
 import { createShellTray } from './tray';
 import type { ShellTray, TrayDiagnostics } from './tray';
+import type { TrayStatsView } from './tray-menu';
 
 export interface ShellStartOptions {
   hotkey?: string;
@@ -90,6 +101,15 @@ export interface ShellModule {
   motionSnapshot(): MotionDiagnostics | null;
   /** 内部（非契约）：输入条 BrowserWindow 句柄，只给自检截图/注入脚本用。 */
   getInputBarWindow(): BrowserWindow | null;
+  /**
+   * 内部（非契约）：触发一次"吸附到前台窗口"，与 Ctrl+Shift+S 同一个入口（ADR 0028 D4）。
+   * 自检需要一条不依赖真实按键的路径（与 `openInputBar` 同理）。
+   */
+  snapToForeground(): SnapOutcome | null;
+  /** 内部（非契约）：解除吸附（幂等），与托盘"离开窗口边缘"同一个入口。 */
+  releaseSnap(): void;
+  /** 内部诊断（非契约）：吸附状态、目标窗口、最近一次结果（ADR 0028）。 */
+  snapSnapshot(): SnapDiagnostics | null;
 }
 
 let mainWindow: BrowserWindow | null = null;
@@ -98,6 +118,15 @@ let hotkeyRegistration: HotkeyRegistration | null = null;
 let pointerPoller: PointerPoller | null = null;
 let motionController: MotionController | null = null;
 let shellTray: ShellTray | null = null;
+let snapController: SnapController | null = null;
+let snapReader: ForegroundWindowReader | null = null;
+let snapHotkeyRegistration: HotkeyRegistration | null = null;
+/** ADR 0032 D4：托盘诊断项的上次刷新时刻（`performance.now()` 时基，节流用） */
+let lastTrayStatsRefreshAt = Number.NEGATIVE_INFINITY;
+/** ADR 0032 D4：上一次同步给托盘的读数（用于"变了就立刻刷"） */
+let lastTrayStats: TrayStatsView | null = null;
+/** 拖拽进行中（shell 侧镜像；`sitting` 时点/拖都要先解除吸附，ADR 0028 D9） */
+let dragging = false;
 let onProbeResponse: ((event: unknown, response: ProbeResponse) => void) | null = null;
 let onPointerFact: ((event: IpcMainEvent, fact: PointerFact) => void) | null = null;
 let onRendererEvent: ((event: IpcMainEvent, envelope: BroadcastEvent) => void) | null = null;
@@ -127,6 +156,52 @@ function installRendererSink(window: BrowserWindow): void {
 /** ADR 0004 D6.2：D-7 钳制逐个显示器求交，禁止 `getDisplayNearestPoint()`。 */
 function getAllWorkAreas(): Rect[] {
   return screen.getAllDisplays().map((display) => display.workArea);
+}
+
+/** ADR 0028 D3：全屏判定用**完整 bounds**（工作区差一个任务栏，最大化窗口不是全屏）。 */
+function getAllDisplayBounds(): Rect[] {
+  return screen.getAllDisplays().map((display) => display.bounds);
+}
+
+/**
+ * ADR 0028 D2：物理像素 → DIP。逐点换算（`screenToDipPoint`）而不是除以
+ * `scaleFactor`：混合 DPI 的多显示器下，同一个窗口的两个角可能落在不同的缩放比上。
+ */
+function toDipRect(physical: PhysicalRect): Rect {
+  const topLeft = screen.screenToDipPoint({ x: physical.left, y: physical.top });
+  const bottomRight = screen.screenToDipPoint({ x: physical.right, y: physical.bottom });
+  return {
+    x: topLeft.x,
+    y: topLeft.y,
+    width: bottomRight.x - topLeft.x,
+    height: bottomRight.y - topLeft.y,
+  };
+}
+
+/** ADR 0028 D3：前台是桌宠自己的窗口（主窗口/输入条）时拒绝吸附。 */
+function ownWindowHandles(): string[] {
+  const handles: string[] = [];
+  for (const target of [mainWindow, inputWindow]) {
+    if (!target || target.isDestroyed()) continue;
+    try {
+      const buffer = target.getNativeWindowHandle();
+      if (buffer.length >= 8) handles.push(buffer.readBigUInt64LE(0).toString());
+      else if (buffer.length >= 4) handles.push(String(buffer.readUInt32LE(0)));
+    } catch (error) {
+      // 拿不到句柄只是少了"别吸自己"这一层过滤，不影响其它判定
+      logWarn('shell', '读取窗口句柄失败（吸附的自我过滤会退化）', { error: String(error) });
+    }
+  }
+  return handles;
+}
+
+/** 用户可见提示：优先托盘气泡，没有托盘时只写日志（ADR 0028 D3）。 */
+function notifyUser(message: string): void {
+  if (shellTray) {
+    shellTray.notify(message);
+    return;
+  }
+  logWarn('shell', '吸附提示（无托盘，只写日志）', { message });
 }
 
 // ---------------------------------------------------------------------------
@@ -291,11 +366,45 @@ async function quitFromTray(): Promise<void> {
   }
 }
 
+/**
+ * ADR 0032 D4：把 `orchestrator` 写进 `proactive-stats` 单例的读数同步到托盘顶部两行。
+ *
+ * 挂在既有 16ms 指针轮询器的 `onTick` 上，**不新开定时器**（与 ADR 0028 D6 的吸附跟随同一手法）。
+ * 节流语义是"**没有变化时**每 `TRAY_STATS_REFRESH_MS` 复查一次"：一旦读数真的变了
+ * （例如启动后 orchestrator 写下第一条 `disabled`/`user-active`），下一拍（≤16ms）就刷新，
+ * 不让用户对着一个"5 秒前的旧原因"看菜单。托盘不存在（创建失败）时直接返回。
+ */
+function refreshTrayStats(now: number): void {
+  const tray = shellTray;
+  if (!tray) return;
+  const stats = readProactiveStats();
+  const changed =
+    lastTrayStats === null ||
+    lastTrayStats.firedCount !== stats.firedCount ||
+    lastTrayStats.lastReason !== stats.lastReason;
+  if (!changed && now - lastTrayStatsRefreshAt < TRAY_STATS_REFRESH_MS) return;
+  lastTrayStatsRefreshAt = now;
+  lastTrayStats = { firedCount: stats.firedCount, lastReason: stats.lastReason };
+  tray.setStats(lastTrayStats);
+}
+
 function createTray(): void {
+  const stats = readProactiveStats();
   shellTray = createShellTray(
     {
       openInputBar: () => {
         openInputBar();
+      },
+      // ADR 0028 D4：托盘项与 Ctrl+Shift+S 共用同一个入口（不复制逻辑）
+      snapForeground: () => {
+        const outcome = snapController?.snapNow() ?? null;
+        logInfo('shell', '托盘：吸附到前台窗口', {
+          ok: outcome?.ok ?? false,
+          reason: outcome && !outcome.ok ? outcome.reason : null,
+        });
+      },
+      releaseSnap: () => {
+        snapController?.release('command');
       },
       reloadPet: () => {
         reloadRenderer();
@@ -309,7 +418,48 @@ function createTray(): void {
       else if (level === 'warn') logWarn('shell', message, data);
       else logInfo('shell', message, data);
     },
+    // ADR 0032 D4：顶部两行用启动时的读数（多半是全零：orchestrator 还没跑过一拍）
+    { firedCount: stats.firedCount, lastReason: stats.lastReason },
   );
+  lastTrayStatsRefreshAt = Number.NEGATIVE_INFINITY;
+  lastTrayStats = { firedCount: stats.firedCount, lastReason: stats.lastReason };
+  logInfo('shell', '托盘诊断项初值', {
+    firedCount: stats.firedCount,
+    lastReason: stats.lastReason,
+  });
+}
+
+/**
+ * 吸附热键（ADR 0028 D4）：与输入条热键同一套三级降级。
+ * 失败不阻断启动：托盘菜单项仍然可用。
+ */
+function registerSnapHotkey(): void {
+  if (!snapController) return;
+  snapHotkeyRegistration = registerInputHotkey(
+    {
+      register: (accelerator) =>
+        globalShortcut.register(accelerator, () => {
+          const outcome = snapController?.snapNow() ?? null;
+          logInfo('shell', '热键：吸附到前台窗口', {
+            accelerator,
+            ok: outcome?.ok ?? false,
+            reason: outcome && !outcome.ok ? outcome.reason : null,
+          });
+        }),
+      log: (level, message, data) => {
+        if (level === 'error') logError('shell', message, data);
+        else if (level === 'warn') logWarn('shell', message, data);
+        else logInfo('shell', message, data);
+      },
+    },
+    SNAP_HOTKEY.preferred,
+    SNAP_HOTKEY.fallback,
+  );
+  logInfo('shell', '吸附热键状态', {
+    accelerator: snapHotkeyRegistration.accelerator,
+    fallbackUsed: snapHotkeyRegistration.fallbackUsed,
+    defaultFailed: snapHotkeyRegistration.defaultFailed,
+  });
 }
 
 
@@ -465,6 +615,56 @@ function startPointerPoller(window: BrowserWindow): void {
   });
   motionController = motion;
 
+  // ADR 0028：前台窗口吸附。koffi 不可用 → 有效模式退回 workarea（物理贴边）。
+  const snapConfig = resolveSnapConfig();
+  const reader = createForegroundWindowReader();
+  snapReader = reader;
+  const effectiveMode: 'auto' | 'workarea' =
+    snapConfig.mode === 'workarea' || !reader.supported ? 'workarea' : 'auto';
+  if (!reader.supported) {
+    logWarn('shell', '前台窗口 API 不可用，吸附退回工作区贴边（ADR 0028 D7）', {
+      error: reader.error,
+      mode: effectiveMode,
+    });
+  } else {
+    logInfo('shell', '前台窗口 API 可用（koffi）', { readerSupported: true });
+  }
+  logInfo('shell', '吸附配置（ADR 0028）', {
+    ...snapConfig,
+    effectiveMode,
+    supported: reader.supported,
+  });
+
+  const snap = createSnapController(
+    {
+      getPetBounds: () => {
+        const target = mainWindow;
+        if (!target || target.isDestroyed()) return { x: 0, y: 0, width: 0, height: 0 };
+        const bounds = target.getContentBounds();
+        return { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height };
+      },
+      setPetPosition: (x, y) => {
+        const target = mainWindow;
+        if (!target || target.isDestroyed()) return;
+        target.setPosition(Math.round(x), Math.round(y), false);
+      },
+      getWorkAreas: getAllWorkAreas,
+      getDisplays: getAllDisplayBounds,
+      getOwnHandles: ownWindowHandles,
+      readForeground: () => reader.readForeground(),
+      readHandle: (handle) => reader.readHandle(handle),
+      toDip: toDipRect,
+      isBusy: () => motion.kind !== 'idle' || dragging,
+      emitApplied: (payload) => appBus.emit('snap_applied', payload),
+      emitReleased: (payload) => appBus.emit('snap_released', payload),
+      notify: notifyUser,
+      logInfo: (message, data) => logInfo('shell', message, data),
+      logWarn: (message, data) => logWarn('shell', message, data),
+    },
+    { ...snapConfig, mode: effectiveMode },
+  );
+  snapController = snap;
+
   const poller = createPointerPoller({
     getWindow: () => mainWindow,
     cursor: createCursorSource(),
@@ -481,7 +681,13 @@ function startPointerPoller(window: BrowserWindow): void {
       target.setPosition(x, y, false);
     },
     emit: (name, payload) => appBus.emit(name, payload),
-    onTick: (now) => motion.tick(now),
+    // §12：位移与吸附跟随复用**同一个** 16ms 定时器（先推进位移，再算跟随）
+    onTick: (now) => {
+      motion.tick(now);
+      snap.tick(now);
+      // ADR 0032 D4：托盘只读诊断也挂在这同一个定时器上（内部节流，不新开定时器）
+      refreshTrayStats(now);
+    },
     isSettling: () => motion.settling,
     logInfo: (message, data) => logInfo('shell', message, data),
     logWarn: (message, data) => logWarn('shell', message, data),
@@ -489,9 +695,15 @@ function startPointerPoller(window: BrowserWindow): void {
 
   // 拖拽立即接管位移：走路被拖 → 打断；回弹被拖 → 静默取消（render 由 drag_started 收状态）
   offDragStarted = appBus.subscribe('drag_started', () => {
+    dragging = true;
     motion.cancel('interrupted');
+    // ADR 0028 D9：拖走她就解除吸附（正常路径在指针按下时已经解除，这里是兜底）
+    snap.release('dragged');
   });
   offDragReleased = appBus.subscribe('drag_released', (payload) => {
+    dragging = false;
+    // ADR 0028 D7：回退模式下拖到工作区下沿附近松手 → 直接坐在那条边上，不再走回弹
+    if (snap.trySnapOnRelease()) return;
     motion.startSettle({ vx: payload.vx, vy: payload.vy });
   });
 
@@ -523,6 +735,9 @@ function startPointerPoller(window: BrowserWindow): void {
   onPointerFact = (event, fact) => {
     // 只接受主窗口渲染页的原始指针事实；别的 sender 一律丢弃
     if (!mainWindow || event.sender !== mainWindow.webContents) return;
+    // ADR 0028 D9：点她一下就离开窗口边缘。必须在把手势交给 poller 之前解除，
+    // 否则 drag_started 会先把状态改成 dragged，多一次 "sitting → idle → dragged" 的闪回。
+    if (fact && typeof fact === 'object' && fact.phase === 'down') snap.release('clicked');
     poller.notePointerFact(fact);
   };
   ipcMain.on(IPC_CHANNELS.drag, onPointerFact);
@@ -533,6 +748,9 @@ function startPointerPoller(window: BrowserWindow): void {
     if (!envelope || typeof envelope !== 'object' || !isEventName(envelope.name)) return;
     if (envelope.name === 'model_ready') {
       const payload = envelope.payload as ModelReadyPayload;
+      // ADR 0033 D2：这个事实对 runtime 的预热有意义，而 `model_ready` 可能早于 runtime 装配完成，
+      // 所以由收到事件的 shell 落一个一次性闩锁（进程内单例，不是事件、不是 IPC、不是 setter）。
+      noteModelReady();
       logInfo('shell', '收到 model_ready', payload);
       if (mainWindow && !mainWindow.isDestroyed()) mainWindow.showInactive();
       return;
@@ -589,6 +807,10 @@ function stopPointerPoller(): void {
   pointerPoller?.stop();
   pointerPoller = null;
   motionController = null;
+  snapController = null;
+  snapReader?.dispose();
+  snapReader = null;
+  dragging = false;
   offDragStarted?.();
   offDragStarted = null;
   offDragReleased?.();
@@ -689,9 +911,14 @@ export const shell: ShellModule = {
 
     registerHotkey();
 
+    // ADR 0028 D4：吸附热键与输入条热键各自独立降级，互不影响。
+    if (snapController?.diagnostics().enabled) registerSnapHotkey();
+    else logInfo('shell', '吸附已由 PET_SNAP_DISABLE 关闭：热键与托盘项都不生效');
+
     logInfo('shell', `start 完成 hotkey=${hotkeyRegistration?.accelerator ?? '(未注册)'}`, {
       contentSize: { width: size.width, height: size.height },
       hotkeyFallbackUsed: hotkeyRegistration?.fallbackUsed ?? null,
+      snapHotkey: snapHotkeyRegistration?.accelerator ?? null,
       requestedHotkey: opts.hotkey ?? null,
     });
   },
@@ -700,6 +927,8 @@ export const shell: ShellModule = {
     // 托盘先销毁：它持有原生句柄，必须在窗口与 app 退出前释放（ADR 0018 D3）。
     shellTray?.destroy();
     shellTray = null;
+    lastTrayStats = null;
+    lastTrayStatsRefreshAt = Number.NEGATIVE_INFINITY;
     stopPointerPoller();
 
     if (hotkeyRegistration?.accelerator) {
@@ -710,6 +939,15 @@ export const shell: ShellModule = {
       }
     }
     hotkeyRegistration = null;
+
+    if (snapHotkeyRegistration?.accelerator) {
+      try {
+        globalShortcut.unregister(snapHotkeyRegistration.accelerator);
+      } catch (error) {
+        logWarn('shell', '吸附热键注销失败（继续清理）', { error: String(error) });
+      }
+    }
+    snapHotkeyRegistration = null;
 
     const bar = inputWindow;
     inputWindow = null;
@@ -754,6 +992,8 @@ export const shell: ShellModule = {
         menuLabels: [],
         tooltip: null,
         iconSize: null,
+        statLabels: [],
+        stats: { firedCount: 0, lastReason: null },
       }
     );
   },
@@ -765,6 +1005,23 @@ export const shell: ShellModule = {
   getInputBarWindow(): BrowserWindow | null {
     const window = inputWindow;
     return window && !window.isDestroyed() ? window : null;
+  },
+
+  snapToForeground(): SnapOutcome | null {
+    const outcome = snapController?.snapNow() ?? null;
+    logInfo('shell', '手动触发吸附（内部入口，与热键同一路径）', {
+      ok: outcome?.ok ?? false,
+      reason: outcome && !outcome.ok ? outcome.reason : null,
+    });
+    return outcome;
+  },
+
+  releaseSnap(): void {
+    snapController?.release('command');
+  },
+
+  snapSnapshot(): SnapDiagnostics | null {
+    return snapController?.diagnostics() ?? null;
   },
 
   notifySecondInstance(): void {

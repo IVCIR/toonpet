@@ -4,10 +4,11 @@ export type ModuleId = 'shell' | 'render' | 'orchestrator' | 'voice' | 'memory';
 export type BaseState = 'idle' | 'walking';
 export type OverlayState = 'speaking' | 'reacting';
 /**
- * Physics 层。`dragged` = 指针拖拽；`settling` = 松手后的回弹（ADR 0024 D3）。
- * 二者互斥，且都高于 Overlay：回弹期间不接受新的动作意图。
+ * Physics 层。`dragged` = 指针拖拽；`settling` = 松手后的回弹（ADR 0024 D3）；
+ * `sitting` = 吸附到前台窗口（或工作区）边缘并播放坐姿（ADR 0028 D5）。
+ * 三者互斥，且都高于 Overlay：回弹期间不接受新的动作意图，吸附期间不做行走调度。
  */
-export type PhysicsState = 'dragged' | 'settling';
+export type PhysicsState = 'dragged' | 'settling' | 'sitting';
 export type OrchestratorState = 'thinking' | 'idle';
 
 export type Emotion =

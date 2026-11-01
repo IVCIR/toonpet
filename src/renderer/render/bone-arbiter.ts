@@ -27,6 +27,15 @@ export interface BoneArbitrationState {
   roll: number;
   /** 本帧是否有非零偏移（false = 只由动画驱动） */
   offset: boolean;
+  /**
+   * 上一帧"动画基底从哪来"（诊断用）：
+   * - `'mixer'`：本帧开始时四元数不等于我们上次写入的值 → 动画重写了，基底取当前值；
+   * - `'cache'`：四元数仍等于我们上次写入的值 → 动画没重写，基底沿用上一帧的缓存。
+   * 这两个分支任一走错都会让偏移逐帧累积（"头在打转"），所以必须可观测。
+   */
+  baseFrom: 'mixer' | 'cache' | null;
+  /** 上一帧我们写出的四元数（[x,y,z,w]，诊断用） */
+  applied: [number, number, number, number];
 }
 
 /** 叠加偏移的接收端（视线、反应通道只依赖这个窄接口）。 */
@@ -39,6 +48,11 @@ export interface BoneArbiter {
   register(bone: THREE.Bone): void;
   /** 提交本帧的叠加偏移（弧度，父空间绕世界轴）。同帧多次调用会累加。 */
   add(bone: THREE.Bone, yaw: number, pitch: number, roll?: number): void;
+  /**
+   * 渲染循环第 0 步（**必须在 `mixer.update()` 之前**）：记下每根受控骨骼当前的
+   * 本地四元数。第 2 步的 `beginFrame()` 用"这中间有没有变化"判定动画是否重写了该骨骼。
+   */
+  capture(): void;
   /** 渲染循环第 2 步：抓取动画基底、清零叠加量。 */
   beginFrame(): void;
   /** 渲染循环第 5 步：写回最终四元数（每根骨骼只写一次）。 */
@@ -58,6 +72,12 @@ interface Entry {
   /** 上一帧我们写出的最终值 */
   applied: THREE.Quaternion;
   written: boolean;
+  /** `capture()` 时（mixer.update 之前）的四元数 */
+  preMixer: THREE.Quaternion;
+  /** 本帧是否调用过 `capture()` */
+  captured: boolean;
+  /** 上一次 beginFrame 的基底来源（诊断） */
+  baseFrom: 'mixer' | 'cache' | null;
   yaw: number;
   pitch: number;
   roll: number;
@@ -67,8 +87,12 @@ const WORLD_X = new THREE.Vector3(1, 0, 0);
 const WORLD_Y = new THREE.Vector3(0, 1, 0);
 const WORLD_Z = new THREE.Vector3(0, 0, 1);
 
-/** 四元数被视为"同一个朝向"的阈值（点积；写成 ±1 的等价位）。 */
-const SAME_ROTATION_EPSILON = 1e-8;
+/**
+ * "同一个朝向"的阈值（点积）。取 1e-6 而不是 1e-8：
+ * 这里只关心"mixer 有没有真的改动这根骨"，浮点末位噪声不该被当成写入
+ * （1e-6 ≈ 0.0014 rad，肉眼不可分辨）。
+ */
+const SAME_ROTATION_EPSILON = 1e-6;
 
 function sameRotation(a: THREE.Quaternion, b: THREE.Quaternion): boolean {
   return Math.abs(a.dot(b)) >= 1 - SAME_ROTATION_EPSILON;
@@ -95,6 +119,9 @@ export function createBoneArbiter(): BoneArbiter {
         prevBase: bone.quaternion.clone(),
         applied: bone.quaternion.clone(),
         written: false,
+        preMixer: bone.quaternion.clone(),
+        captured: false,
+        baseFrom: null,
         yaw: 0,
         pitch: 0,
         roll: 0,
@@ -122,12 +149,41 @@ export function createBoneArbiter(): BoneArbiter {
       entry.roll += roll;
     },
 
+    capture(): void {
+      for (const entry of entries) {
+        entry.preMixer.copy(entry.bone.quaternion);
+        entry.captured = true;
+      }
+    },
+
     beginFrame(): void {
       for (const entry of entries) {
         const quaternion = entry.bone.quaternion;
-        const animated = entry.written && sameRotation(quaternion, entry.applied);
-        if (animated) entry.base.copy(entry.prevBase);
-        else entry.base.copy(quaternion);
+        /**
+         * 动画基底从哪来？
+         *
+         * **首选**（`capture()` 已调用）：`mixer.update()` 前后这根骨的四元数变了没有。
+         * 这是直接观测，不依赖任何"我们写了什么"的记忆。
+         *
+         * 为什么必须这样：three 的 `PropertyMixer.apply()` 在"累计值和上一个 accu 相同"时
+         * **跳过 `binding.setValue()`**（`PropertyMixer.js` 的 "value has changed -> update
+         * scene graph" 分支）。`playHold` 把片段停在最后一帧后，每帧 mixer 算出的姿态完全
+         * 相同 → mixer 再也不写这根骨 → 旧判据（"骨的值 = 我上次写的值"⇒ 动画没写）
+         * 在浮点末位噪声下会误判成"动画写了"，于是把我们上一帧的偏移当成新基底，
+         * **每帧再叠一次**：真机上表现为"头疯狂打转"（实测 2.5 rad/s）。
+         *
+         * **兜底**（没调用 `capture()` 的旧调用方/单测）：沿用"骨的值是否还是我上次写的"。
+         */
+        let mixerWrote: boolean;
+        if (entry.captured) {
+          mixerWrote = !sameRotation(entry.preMixer, quaternion);
+        } else {
+          mixerWrote = !(entry.written && sameRotation(quaternion, entry.applied));
+        }
+        entry.captured = false;
+        entry.baseFrom = mixerWrote ? 'mixer' : 'cache';
+        if (mixerWrote) entry.base.copy(quaternion);
+        else entry.base.copy(entry.prevBase);
         entry.prevBase.copy(entry.base);
         entry.written = false;
         entry.yaw = 0;
@@ -186,6 +242,13 @@ export function createBoneArbiter(): BoneArbiter {
         pitch: entry.pitch,
         roll: entry.roll,
         offset: entry.yaw !== 0 || entry.pitch !== 0 || entry.roll !== 0,
+        baseFrom: entry.baseFrom,
+        applied: [
+          Number(entry.applied.x.toFixed(6)),
+          Number(entry.applied.y.toFixed(6)),
+          Number(entry.applied.z.toFixed(6)),
+          Number(entry.applied.w.toFixed(6)),
+        ],
       }));
     },
   };

@@ -71,6 +71,46 @@
         "intent": "look_at_user"
       },
       "cooldownMs": 8000
+    },
+    {
+      "id": "idle-check",
+      "match": { "on": "idle" },
+      "reply": {
+        "text": "先生、集中していますね。……邪魔はしません。でも、たまには息をしてください。",
+        "emotion": "neutral",
+        "intent": "look_at_user"
+      },
+      "cooldownMs": 900000
+    },
+    {
+      "id": "idle-tea",
+      "match": { "on": "idle" },
+      "reply": {
+        "text": "少し休憩しませんか。……お茶なら、私が淹れます。迷惑でしたら、断ってください。",
+        "emotion": "happy",
+        "intent": "tilt_head"
+      },
+      "cooldownMs": 900000
+    },
+    {
+      "id": "idle-late",
+      "match": { "on": "idle" },
+      "reply": {
+        "text": "もう夜も遅いです。……明日のあなたのためにも、そろそろ休んでください。",
+        "emotion": "sad",
+        "intent": "shake_head"
+      },
+      "cooldownMs": 900000
+    },
+    {
+      "id": "idle-aris",
+      "match": { "on": "idle" },
+      "reply": {
+        "text": "アリスは今ごろ、何をしているんでしょうね。……べ、別に、気になったわけではありません。",
+        "emotion": "happy",
+        "intent": "none"
+      },
+      "cooldownMs": 900000
     }
   ],
   "fallbacks": [

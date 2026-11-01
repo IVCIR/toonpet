@@ -21,7 +21,8 @@ const bundles = [
     format: 'cjs',
     target: 'node20',
     // better-sqlite3 是原生模块（.node），不能塞进 bundle，只能运行期 require
-    external: ['electron', 'better-sqlite3'],
+    // koffi 同理（可选依赖：前台窗口吸附用，装不上时运行期回退，ADR 0028 D1）
+    external: ['electron', 'better-sqlite3', 'koffi'],
   },
   {
     entry: 'src/preload/main.ts',
@@ -98,6 +99,34 @@ const bundles = [
   {
     entry: 'src/main/shell/passthrough-fsm.test.ts',
     outfile: 'dist/tests/passthrough-fsm.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    entry: 'src/main/shell/snap-geometry.test.ts',
+    outfile: 'dist/tests/snap-geometry.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    entry: 'src/main/shell/snap.test.ts',
+    outfile: 'dist/tests/snap.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    entry: 'src/renderer/render/sit-pose.test.ts',
+    outfile: 'dist/tests/sit-pose.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    entry: 'src/renderer/render/bone-arbiter.test.ts',
+    outfile: 'dist/tests/bone-arbiter.test.mjs',
     platform: 'node',
     format: 'esm',
     target: 'node20',
@@ -217,6 +246,79 @@ const bundles = [
   {
     entry: 'src/renderer/shell/subtitle-cue.test.ts',
     outfile: 'dist/tests/subtitle-cue.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0030：在场感（只测懒采样/降级，注入假后端，运行期不 require koffi）
+    entry: 'src/main/presence.test.ts',
+    outfile: 'dist/tests/presence.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+    external: ['koffi'],
+  },
+  {
+    // ADR 0032 D1：前台应用归一化（纯函数，标题/类名 → 标准类别）
+    entry: 'src/main/presence/app-normalizer.test.ts',
+    outfile: 'dist/tests/app-normalizer.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0032 D3：冷启动预热（本地桩 HTTP，只连回环）
+    entry: 'src/main/orchestrator/llm-client.test.ts',
+    outfile: 'dist/tests/llm-client.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0030 D4：段 3.5、相对时间、去冗余与段 3 预算
+    entry: 'src/main/orchestrator/world.test.ts',
+    outfile: 'dist/tests/world.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0031 D2：主动性的全部时间与状态边界（纯函数，假时钟）
+    entry: 'src/main/orchestrator/idle-drive.test.ts',
+    outfile: 'dist/tests/idle-drive.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0031 D6：主动性开关的优先级（自检默认硬关）
+    entry: 'src/main/proactive-config.test.ts',
+    outfile: 'dist/tests/proactive-config.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0033 D1：生命周期心跳（预热与主动性解耦、单飞、重试上限、model_ready 触发）
+    entry: 'src/main/orchestrator/heartbeat.test.ts',
+    outfile: 'dist/tests/heartbeat.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0033 D1.3：预热总闸的优先级（PET_PROACTIVE_DISABLE 不得影响它）
+    entry: 'src/main/heartbeat-config.test.ts',
+    outfile: 'dist/tests/heartbeat-config.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0033 D2.2：`model_ready` 的一次性闩锁（事件可能早于 runtime 装配）
+    entry: 'src/main/model-ready.test.ts',
+    outfile: 'dist/tests/model-ready.test.mjs',
     platform: 'node',
     format: 'esm',
     target: 'node20',

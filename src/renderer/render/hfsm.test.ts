@@ -170,3 +170,60 @@ test('行走方向由随机源决定（0.9 → right，0.1 → left）', () => {
   left.tick(0);
   assert.equal(left.tick(1000).startWalk?.direction, 'left');
 });
+
+test('吸附：snapApplied → Physics=sitting，并清空行走排期（她坐着不会迈步）', () => {
+  const hfsm = makeDeterministic([0.5, 0.5, 0.5]);
+  hfsm.tick(0);
+  hfsm.snapApplied(100);
+  assert.equal(hfsm.snapshot().physics, 'sitting');
+  assert.equal(hfsm.snapshot().base, 'idle');
+  assert.equal(hfsm.nextWalkAt, null, '进入 sitting 必须清空行走排期');
+
+  // 即使时间远超调度间隔，也不得触发行走
+  for (const now of [2000, 5000, 60000]) {
+    assert.equal(hfsm.tick(now).startWalk, null, `t=${now} 不得开始行走`);
+    assert.equal(hfsm.snapshot().physics, 'sitting');
+  }
+});
+
+test('吸附：snapApplied 打断正在进行的行走', () => {
+  const hfsm = makeDeterministic([0.1, 0.1]);
+  hfsm.tick(0);
+  assert.ok(hfsm.tick(1000).startWalk);
+  assert.equal(hfsm.snapshot().base, 'walking');
+  hfsm.snapApplied(1100);
+  assert.equal(hfsm.snapshot().base, 'idle', '行走被吸附打断（§4.1 退出条件）');
+  assert.equal(hfsm.snapshot().physics, 'sitting');
+});
+
+test('吸附解除：snapReleased 回 idle 并重新排期；非 sitting 时是空操作', () => {
+  const hfsm = makeDeterministic([0.1, 0.1]);
+  hfsm.tick(0);
+  hfsm.snapApplied(100);
+  hfsm.snapReleased(200);
+  assert.equal(hfsm.snapshot().physics, null);
+  assert.equal(hfsm.snapshot().base, 'idle');
+
+  // 之后 Scheduler 继续正常工作（时间戳按 tick 推进）
+  hfsm.tick(300);
+  assert.ok(hfsm.tick(1400).startWalk, '解除后仍会按调度行走');
+
+  // dragged 优先：拖拽后再收到 snap_released 不得把状态打回 idle
+  const other = makeDeterministic([0.1, 0.1]);
+  other.snapApplied(0);
+  other.dragStarted(10);
+  assert.equal(other.snapshot().physics, 'dragged');
+  other.snapReleased(20);
+  assert.equal(other.snapshot().physics, 'dragged', 'snap_released 不得覆盖 dragged');
+});
+
+test('吸附期间：说话、摸头、intent 仍然可以叠加（只有行走被停掉）', () => {
+  const hfsm = make();
+  hfsm.snapApplied(0);
+  hfsm.speechStarted(10, 'u-sit');
+  assert.equal(hfsm.snapshot().overlay, 'speaking');
+  hfsm.headPatted(20);
+  assert.equal(hfsm.snapshot().reaction?.kind, 'head_patted');
+  assert.equal(hfsm.intent(30, 'nod', 400), true);
+  assert.equal(hfsm.snapshot().physics, 'sitting', 'Overlay 不得改变 Physics');
+});

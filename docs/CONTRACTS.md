@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 契约版本 | 1.8.0 |
-| 生效日期 | 2026-10-31 |
+| 契约版本 | 1.12.0 |
+| 生效日期 | 2026-11-01 |
 | 适用平台 | Windows 11 x64（唯一目标平台） |
 | 权威性 | 本文件是唯一事实来源；与代码、口头约定冲突时以本文件为准 |
 | 修改方式 | 先写 ADR → 再改本文件 → 版本号按 §15 递增 |
@@ -47,6 +47,7 @@
 | 窗口 | 无边框、透明背景、置顶、不占任务栏、可点击穿透 |
 | 角色 | 站立锚定在窗口底边中心，窗口默认贴合屏幕工作区底边 |
 | 交互 | 全局热键唤出输入条 → 文本输入 → 角色回话；鼠标可拖拽；可拖到屏幕任意位置 |
+| 吸附 | 按 `Ctrl+Shift+S`（或托盘项）把窗口贴到前台应用窗口的**下/上边缘**并水平居中，角色播放坐姿；拖拽/点击/目标消失即解除（ADR 0028） |
 | 表现 | 呼吸 / 眨眼 / 视线跟随常驻；说话有口型；有情绪表情；被摸头有反应 |
 | 记忆 | 交互事件与事实写入本地 SQLite，下次启动可被关键词召回 |
 
@@ -60,11 +61,21 @@
 | `voice` | 文本 → 本地语音 + PCM RMS 口型包络，支持打断 | 主进程（合成）+ 渲染进程（播放与分析） | 不改写文本；不决定情绪；不做字幕 |
 | `memory` | 记住发生过什么，按关键词取回 | 主进程 | 不做语义推理；不引入向量库；不主动调用别人 |
 
+> `presence`（ADR 0030）不是第六个模块，而是主进程内一个**只读工具端口**：
+> 它只回答"用户离开键鼠多久、前台是什么应用"，不认识 `Reply`、不产事件、不写库，
+> 由 `runtime` 注入 `orchestrator`（见 §2.1）。
+>
+> `heartbeat`（ADR 0033）同理也不是第六个模块，而是 `runtime` 装配的一个**生命周期节拍器**：
+> 它只回答"进程活着还需要做什么"（当前唯一一件 = 冷启动预热），不认识"要不要打扰"、
+> 不产事件、不写库、不暴露对外接口方法。它与主动性开关**完全解耦**。
+
 ### 2.1 依赖方向（只允许单向）
 
 | 调用方 | 被调用方 | 允许 |
 |---|---|---|
 | `orchestrator` | `memory`、`voice`、`render`、事件总线 | 是 |
+| `orchestrator` | `presence`（只读端口，由 `runtime` 注入；不 import 其实现） | 是（ADR 0030） |
+| `heartbeat`（`runtime` 装配） | `orchestrator` 的两个只读事实（`isBusy`/`isLlmDisabled`）、本地 LLM 客户端、`presence` 端口 | 是（ADR 0033） |
 | `render` | 事件总线 | 是 |
 | `shell` | 事件总线、`render.getState()`（只读轮询） | 是 |
 | `voice` | 事件总线 | 是 |
@@ -78,13 +89,15 @@
 
 | 组件 | 位置 | 说明 |
 |---|---|---|
-| `shell` 主进程侧 | Electron main | BrowserWindow、托盘、全局热键、指针轮询器、穿透状态机、拖拽循环 |
+| `shell` 主进程侧 | Electron main | BrowserWindow、托盘（含两行只读诊断）、全局热键、指针轮询器、穿透状态机、拖拽循环、前台窗口吸附（Win32 via `koffi`，ADR 0028） |
 | `shell` 渲染侧 | renderer | alpha 掩膜采集、命中判定、字幕气泡 |
 | `shell` 输入条窗口 | Electron main + 独立渲染页 | 独立非透明小窗，唯一可聚焦窗口（ADR 0003） |
 | `render` | renderer | WebGL/Three.js、three-vrm、动画混合、口型通道 |
 | `voice` 合成侧 | main | HTTP 调本地 GPT-SoVITS，取 WAV |
 | `voice` 播放侧 | renderer | Web Audio 播放 + AnalyserNode 出 RMS 包络 |
-| `orchestrator` | main | 规则池、角色卡、LLM 调用、兜底 |
+| `orchestrator` | main | 规则池、角色卡、LLM 调用、兜底、idle-drive 节拍（ADR 0031） |
+| `heartbeat` | main（`runtime` 装配） | 生命周期节拍：15s 一个定时器（`HEARTBEAT_TICK_MS`），**只**做生命周期任务——目前唯一一件是冷启动预热（ADR 0032 D3、ADR 0033 D1）；`model_ready` 到达时立即触发一次（ADR 0033 D2） |
+| `presence` | main（只读 Win32） | `GetLastInputInfo` + `GetTickCount` + `GetForegroundWindow` + `GetWindowTextW`/`GetClassNameW`，2s 懒采样；采样点把标题/类名归一化成应用类别（ADR 0030、ADR 0032 D1） |
 | `memory` | main | `better-sqlite3` 同步访问 `data/memory.db`（WAL + FTS5，ADR 0020） |
 | GPT-SoVITS | 外部本地进程 | `http://127.0.0.1:9880`，`api_v2.py`，用户自行启动 |
 | 本地 LLM | 外部本地进程 | Ollama `http://127.0.0.1:11434`，或 OpenVINO 本地推理 |
@@ -172,6 +185,7 @@
 | `reacting` | Overlay | 状态 | 一次性反应动作（摸头、惊讶等）正在播放 | 收到 `head_patted` 或 `intent ∈ {pat_react, happy_hop, nod, shake_head, tilt_head}` | 动作自然播完 / 被同类型新反应替换 | `render` 内部 |
 | `dragged` | Physics | 状态 | 窗口被指针拖动，角色失去地面约束，身体随位移摆动 | 收到 `drag_started` | 收到 `drag_released`（转入 `settling`） | `shell` 的事件（`render` 只跟随） |
 | `settling` | Physics | 状态 | 松手后的回弹：窗口带末速度落回工作区地面线；期间**不接受**新的动作意图与摸头 | 收到 `drag_released` | 收到 `motion_ended{kind:'settle'}`，或被重新 `drag_started` 打断 | `render`（跟随 `motion_ended`；ADR 0024 D3） |
+| `sitting` | Physics | 状态 | 吸附：窗口贴在另一个应用窗口（或工作区）的**上/下边缘**且水平居中，角色播放坐姿；期间**不做 `walking` 调度**，Base 层只有 `idle` | 收到 `snap_applied` | 收到 `snap_released`（拖拽 / 点击 / 命令 / 目标消失 / 目标全屏），或 `drag_started` 直接接管 | `shell` 的事件（`render` 只跟随；ADR 0028 D5） |
 | `thinking` | 编排 | 状态 | 已收到用户话语、尚未产出回复 | `orchestrator.respond()` 开始 | 产出 `Reply` 或走到兜底 | `orchestrator` |
 | `idle` | 编排 | 状态 | 编排层没有在途话语（**与 Base 层的 `idle` 同名不同层，不是同一个状态**） | 启动完成 / 产出 `Reply` 或走到兜底 / `cancel()` | 收到 `user_utterance` 而进入 `thinking` | `orchestrator` |
 
@@ -246,6 +260,8 @@
 | 交互态 / 穿透态 | 窗口当前是否接收鼠标：交互态 `setIgnoreMouseEvents(false)`，穿透态 `true` |
 | 探针（probe） | 主进程就"当前光标处是否命中角色"向渲染侧发起的一次询问（`cmd:probe` → `cmd:interactive`） |
 | 回弹 | 拖拽松手后角色回到受地面约束姿态的过渡动画 |
+| 应用类别 | `presence` 把前台窗口标题/类名归一化后的标准取值：`coding` / `browser` / `game` / `meeting` / `video` / `other: <类名>`；**段 3.5 只发它，不发原始标题**（ADR 0032 D1） |
+| 预热（warm-up） | 本地 LLM 的一次 1-token 请求，只为把权重读进内存；不产回复、不发事件、不改熔断、不占预算。调度方是**生命周期心跳**（ADR 0033）：`model_ready` 到达时立即一次，之后 15s 节拍按需重试；**不受**主动性开关影响 |
 
 ## 5. HFSM 分层语义
 
@@ -255,7 +271,7 @@
 |---|---|---|---|---|
 | Base | 永远运行 | `idle`、`walking` | 优先级最低 | 呼吸、眨眼、视线跟随属于层内常驻通道，不是状态 |
 | Overlay | 按事件叠加 | `speaking`、`reacting` | 高于 Base，低于 Physics；**同类型互斥** | `speaking` 与 `reacting` 可同时存在（见 §5.2 通道） |
-| Physics | 按拖拽接管 | `dragged`、`settling` | 最高 | 接管身体位移与朝向；回弹（`settling`）结束后整层退出，交还 Base |
+| Physics | 按拖拽/吸附接管 | `dragged`、`settling`、`sitting` | 最高 | 接管身体位移与朝向；回弹（`settling`）结束后整层退出交还 Base；`sitting` 由 `snap_*` 事件进出（ADR 0028） |
 
 ### 5.2 混合通道（冲突裁决的唯一依据）
 
@@ -278,6 +294,9 @@
 | 拖拽松手 | 无 | 播回弹（`settling`），结束后回到 `idle` | 保持 | 松手不重置 `emotion` |
 | 回弹期间收到 `intent` | 无 | 被拒（不切动作、不进 `reacting`） | 保持 | 回弹只有"重新拖拽"能打断（ADR 0024 D3） |
 | 回弹期间被摸头 | 无 | 被拒（不切动作、不改嘴型） | 保持 | 同上 |
+| 吸附时说话 | 保持 `speaking` | `sitting` 姿势不变（口型照常驱动） | 按 `emotion` | 坐在窗口边缘说话合法（ADR 0028） |
+| 吸附时被摸头 | 无 | `reacting` 以 ≤ 0.4 权重叠加，坐姿不变 | 临时 `shy` | 坐着也能被摸头 |
+| 吸附时被拖拽 | 保持 | `drag_started` 立即把 `sitting` 改成 `dragged` | 保持 | `snap_released{reason:'dragged'}` 不得把 `dragged` 打回 `idle` |
 
 ### 5.4 禁止
 
@@ -322,6 +341,8 @@
 | `llm_failed` | `orchestrator` | `{ replyId, reason: 'unavailable'\|'timeout'\|'invalid_output'\|'aborted', detail? }` | `render`、`shell` | LLM 路径失败、即将走兜底 |
 | `model_ready` | `render` | `{ modelId, loadMs }` | `shell` | VRM 加载完成且首帧可渲染 |
 | `motion_ended` | `shell` | `{ kind: 'walk'\|'settle', reason: 'arrived'\|'edge'\|'interrupted'\|'rest' }` | `render` | 窗口位移结束：行走到达/撞边/被打断，或回弹收敛到地面线（ADR 0024 D5） |
+| `snap_applied` | `shell` | `{ edge: 'top'\|'bottom', source: 'foreground'\|'workarea' }` | `render` | 窗口已经贴到目标窗口（或工作区）的边缘并水平居中**之后**（ADR 0028 D5） |
+| `snap_released` | `shell` | `{ reason: 'dragged'\|'clicked'\|'command'\|'window-gone'\|'fullscreen' }` | `render` | 吸附解除**之后**（拖拽 / 点她 / 托盘命令 / 目标句柄失效 / 目标变全屏） |
 
 ### 6.4 发布 / 订阅规则
 
@@ -354,7 +375,7 @@ export type ModuleId = 'shell' | 'render' | 'orchestrator' | 'voice' | 'memory';
 
 export type BaseState = 'idle' | 'walking';
 export type OverlayState = 'speaking' | 'reacting';
-export type PhysicsState = 'dragged' | 'settling';
+export type PhysicsState = 'dragged' | 'settling' | 'sitting';
 export type OrchestratorState = 'thinking' | 'idle';
 
 export type Emotion =
@@ -392,8 +413,9 @@ export interface RenderState {
 | `getBounds` | `getBounds(): { x: number; y: number; width: number; height: number }` | 只读诊断用 |
 
 规则：
-- `shell` 是 `drag_*` / `head_patted` / `user_utterance` 的唯一生产者；命中与穿透判定不对外暴露方法，只体现为事件与窗口行为。
+- `shell` 是 `drag_*` / `head_patted` / `user_utterance` / `snap_*` 的唯一生产者；命中与穿透判定不对外暴露方法，只体现为事件与窗口行为。
 - 主进程持有唯一的指针轮询器与穿透状态机；它是全进程**唯一**可以调用 `setIgnoreMouseEvents` 的地方（§3.3 R-6、D-8）。
+- **前台窗口吸附（ADR 0028）**：入口是全局热键 `Ctrl+Shift+S` 与托盘两项（`吸附到前台窗口` / `离开窗口边缘`），**不新增接口方法、不新增 IPC 通道**；目标窗口来自 Win32（`GetForegroundWindow` + `DWMWA_EXTENDED_FRAME_BOUNDS`），物理像素经 Electron `screen` 换算成 DIP；结果只以 `snap_applied` / `snap_released` 广播。跟随目标窗口的轮询复用既有 16ms 轮询器（§12），节流 ~120ms。
 - **字幕显示时机（ADR 0021）**：渲染侧的字幕气泡收到 `intent_resolved` 只登记待显示文本、**不显示**；收到 `speech_started` 才显示完整字幕；收到 `speech_ended{reason:'failed'}` 立即显示作为兜底。字幕在语音播放期间不自动隐藏，`speech_ended` 后留 1.2s 尾巴淡出；15s 内未等到 `speech_started` 则由 failsafe 提前显示。**不得**为此新增事件或 IPC 通道，也**不得**回到"收到 `intent_resolved` 就显示"。
 
 ### 7.3 `render`
@@ -403,13 +425,14 @@ export interface RenderState {
 | `handleIntent` | `handleIntent(intent: Intent): void` | 立即执行动作意图；未知值降级 `none`；重复 `intent` 在 200ms 内去重 |
 | `getState` | `getState(): RenderState` | 同步返回，供 `shell` 轮询；不得触发渲染或 IO |
 
-订阅：`speech_started`、`speech_ended`（口型通道）、`drag_started`、`drag_released`（Physics 层）、`head_patted`（低权重 `pat_react`）、`intent_resolved`（**只取 `emotion`**，不触发动作——动作只由 `handleIntent` 触发）。
+订阅：`speech_started`、`speech_ended`（口型通道）、`drag_started`、`drag_released`（Physics 层）、`head_patted`（低权重 `pat_react`）、`intent_resolved`（**只取 `emotion`**，不触发动作——动作只由 `handleIntent` 触发）、`snap_applied` / `snap_released`（Physics=`sitting`，ADR 0028）。
 
 规则：
 - `handleIntent` 与 `intent_resolved` 是双轨：前者是命令，后者是事实。同一次回复只执行一次动作，不得因两条路径而播两遍。
 - `render` 不产生任何除 `model_ready` 以外的事件。
 - 模型缺失或骨骼缺失时，`getState().modelReady = false`，并渲染一个占位胶囊体，不得白屏。
 - `render` 内部负责掩膜采集与 `cmd:probe` 应答（§3.3 R-2/R-4），但掩膜不是公共接口。
+- **坐姿（ADR 0028 D8）**：`snap_applied` → Physics=`sitting`，播官方片段 `CH0335_my_event088_pastmemory_01` 的 11.2–13.5s 窗口并**停在最后一帧**（不是循环、也不自动回 `idle`），同时抵消片段自带的身体平移（身体中心 = 窗口中线、最低点 = 窗口底边）；片段缺失时降级为"悬空姿态下沉 + 大腿弯曲"。`sitting` 期间不做 `walking` 调度，`drag_started` 直接接管。
 
 **表情表现（ADR 0026）**：
 
@@ -480,7 +503,7 @@ export interface MemoryWrite {
 | 写入时机 | `orchestrator` 在**发布完成之后**用异步调度写 `kind='user'` 与 `kind='pet'` 各一条（同一 `at`）；**不得**阻塞 `voice.speak()` 的下发；摸头等无用户输入的合成话语不写 |
 | 事实标签 | `write` 自动提取「喜欢/不喜欢/好き/嫌い」句式，产出 `like:X` / `dislike:X` 标签（否定优先），与手传 `tags` 合并去重 |
 | 降级 | 文件库打不开 → 自动改 `:memory:`（本次会话可写可检索）；再失败 → `disabled`（`retrieve→[]`、`write` 空操作）；任何失败都不得阻断对话 |
-| 段 ③ 格式 | 每条一行 `[MM-DD] 用户|凯伊|系统: 文本`，最多 5 条、单条 ≤120 字；为空或失败时**必须**输出 `记忆片段：（无）` |
+| 段 ③ 格式 | 每条一行 `[相对时间] 用户|凯伊|系统: 文本`，最多 5 条、单条 ≤120 字；**相对时间**为 `今日` / `昨日` / `N日前` / `Nヶ月前` / `N年前`（按本地日历天差，ADR 0030 D4.1）；同 `tags` 且三字组 Jaccard ≥ 0.8 的条目只留最早出现的一条（ADR 0030 D4.2）；全部行合计 ≤ `MEMORY_SEGMENT_MAX_CHARS`（360 字，ADR 0030 D4.3）；为空或失败时**必须**输出 `记忆片段：（无）` |
 | 保留（ADR 0025） | 上限 `MEMORY_MAX_ROWS=2000`；超出按 `at ASC, id ASC` 删最旧，单次 ≤`MEMORY_PRUNE_BATCH_MAX=200` 行；`write` 之后用 `setImmediate` 排期（不阻塞调用方）；FTS5 由既有的 `AFTER DELETE` 触发器同步，**不得**手工删索引行 |
 
 ### 7.6 `orchestrator`
@@ -491,6 +514,28 @@ export interface MemoryWrite {
 | `cancel` | `cancel(): void` | 中断在途 LLM 请求；已发出的回复不回滚 |
 
 规则：`orchestrator` 是 `user_utterance` 的唯一消费者、`intent_resolved` / `llm_failed` 的唯一生产者、`memory.write` 的唯一调用方；它调 `voice.speak` 与 `render.handleIntent`，但不直接操作窗口、音频设备、数据库连接。
+
+**主动话语（ADR 0031）**——`Reply` 有三个合法来源，且只有这三条：
+
+| 来源 | 触发 | 进对话历史 | 写 `memory.db` | 失败时 |
+|---|---|---|---|---|
+| 用户话语 | `user_utterance` | 是（原话） | 是（user + pet 两条） | 走 ③ 兜底 |
+| 摸头 | `head_patted` | 否 | 否 | 不适用（纯规则） |
+| 主动（idle-drive） | 内部 15s 节拍 + `presence` 判定 | **是**，形态 `{user:'（彼女が自分から話しかけた）', assistant: reply.text}` | **否** | **完全沉默**：不播兜底、不发 `llm_failed` |
+
+主动路径的硬约束：
+
+| 编号 | 规则 |
+|---|---|
+| PR-1 | 触发条件全部满足才开口：编排层 `idle`、`voice` 不在播、系统键鼠空闲 ∈ (90s, 5min)、距上次交互 > 90s、每会话预算未耗尽（12 次，深夜 23:00–07:00 减半为 6）、距上次主动 ≥ 10min |
+| PR-2 | 分流固定为"先 `lines.json` 的 `on:'idle'` 规则（零推理）→ 未命中才一次 3s 超时的本地 LLM" |
+| PR-3 | LLM 路径仅在**本会话已成功健康检查且未熔断**时可用；主动路径**不得**自行发起健康检查（§11 的熔断语义属于用户触发） |
+| PR-4 | 主动路径失败即沉默：不发布 `intent_resolved`、不调 `voice.speak`、不发 `llm_failed`；只记一条 WARN |
+| PR-5 | 主动路径不检索记忆（段 3 恒为「（无）」），但**必须**注入段 3.5 |
+| PR-6 | 用户在主动推理期间开口 → 走既有打断序列，主动那次**一个字节都不发** |
+| PR-7 | `PET_SELFTEST=1` 时默认硬关；只有 `PET_SELFTEST_PROACTIVE=1` 才启用（自检对时序与截图有强断言） |
+| PR-8 | **冷启动预热**（ADR 0032 D3、ADR 0033）挂在**生命周期心跳**（`heartbeat`，与 idle-drive 无关的独立 15s 节拍）上，**不得**再挂回 idle-drive；`model_ready` 到达时**立即**触发一次（ADR 0033 D2），之后由心跳节拍在"编排层空闲 + 未熔断 + 距上次尝试 ≥ 60s + 未热好 + 未在飞"时重试，同一会话最多 3 次、成功即停。15s 心跳还要求 `presence` 正常（读不到就不做消耗 CPU 的事）；`model_ready` 触发**不受 presence 门槛约束**（启动动作本身就是在场证据，ADR 0033 D3）。它**不得**建在途话语、不得置 `thinking`、不得改 `llmHealthChecked`/`llmDisabled`、不得发 `llm_failed`、不得计入主动预算。推论：**`PET_PROACTIVE_DISABLE=1` 不影响预热**；`PET_SELFTEST=1` 时心跳整个不启动（零后台推理，无 opt-in 开关）；`PET_WARMUP_DISABLE=1` 可显式关闭 |
+| PR-9 | 托盘的**两行只读诊断**（今天主动交互 / 上次未主动原因）只能读 `proactive-stats` 进程内单例，**不得**为此新增事件、新增 IPC 通道或给 `shell` 加 setter；计数器口径是"本进程启动以来"，重启归零。第二行取值 = `idle-drive` 的九个判定原因 + 两个"判定通过但最终静默"的诊断值（`no-lines` / `llm-failed`），**不得**在她什么都没说时显示"已开口"（ADR 0032 D4.0/D4.2） |
 
 ### 7.7 接口禁令
 
@@ -600,11 +645,21 @@ flowchart TD
 |---|---|---|
 | 1 | 输出格式约束（JSON schema + 枚举全集） | 硬编码 |
 | 2 | 角色卡 | `data/character-card.md` |
-| 3 | 记忆片段（≤ 5 条，纯文本） | `memory.retrieve()` |
+| 3 | 记忆片段（≤ 5 条，纯文本，相对时间） | `memory.retrieve()` |
+| 3.5 | 环境事实（**可选**，单行 ≤160 字：时间 / 输入状态 / 前台应用类别 / 上次会话） | `presence`（ADR 0030、ADR 0032） |
 | 4 | 最近 6 轮对话 | 内存环形缓冲，不写库 |
 | 5 | 当前用户话语 | `user_utterance` |
 
 > 段 3 在 `memory` 为空或不可用时**恒为** `记忆片段：（无）`（不得整段消失，也不得改成空字符串）；每条的格式与上限见 §7.5 的实现补充（ADR 0020 D8）。段 1 自本轮起含语言硬约束（ADR 0022）。
+>
+> **段 3.5 是可选段**（ADR 0030 D2）：未注入 `WorldFacts` 时不产生任何字节变化（提示词退回 1.9.0 形态）。
+> 注入时它插在段 3 与段 4 之间，格式固定为
+> `環境: 2026-11-01 21:14 / 先生は 90 秒前まで入力中 / 前面のアプリ: coding / 先生は今、プログラミングに集中している / 前回の会話から 12 分`，
+> 缺哪一项就整项省略；超长时按"先丢编程提示 → 再截应用类别 → 再丢上次会话 → 再丢应用类别 → 再丢输入状态"降级，时间戳永远保留。
+>
+> **前台应用只发归一化类别**（ADR 0032 D1）：`coding` / `browser` / `game` / `meeting` / `video` / `other: <类名>`。
+> 原始窗口标题**不得**进提示词（可能含文档名、页面标题、搜索词）；它只留在 `presence` 的诊断读数里。
+> 类别为 `coding` 时**追加**一句 `先生は今、プログラミングに集中している`（ADR 0032 D2），其余类别不追加。
 
 ### 9.4 配置
 
@@ -686,7 +741,17 @@ flowchart TD
 | SQLite 检索失败 / 超时 | 异常 | 无感知 | 返回 `[]`，段 ③ 输出「（无）」，回复路由不变 | 无 |
 | 掩膜采集失败 | 上下文丢失 / RT 创建失败 | 命中变粗糙（矩形级） | 退回矩形判定，继续运行 | 无 |
 | DPI / 分辨率变化 | `display-metrics-changed` | 角色短暂错位后复位 | 重建窗口尺寸、锚点与掩膜映射 | 无 |
+| **前台窗口吸附不可用**（`koffi` 未安装/加载失败/架构不符） | 启动期 `require('koffi')` 失败 | 热键与托盘项仍然工作，只是吸到**工作区边缘**而不是应用窗口 | 记一条 WARN，`snap` 有效模式退回 `workarea`（ADR 0028 D7）；不阻断启动 | 无 |
+| **前台窗口全屏 / 坐标异常 / 太小** | DIP 矩形覆盖整块显示器 bounds；或宽高 < 80×40 / 非有限数 | 托盘气泡提示"已取消"（无托盘时只写 WARN） | 不移动窗口、不发 `snap_applied`；`busy`（行走/回弹中）只记日志不打扰用户 | 无 |
+| **吸附目标消失/最小化/变全屏** | 跟随轮询按句柄重读失败 | 角色留在原地并回到站立 | 发 `snap_released{window-gone\|fullscreen}`，不再跟随 | 无 |
+| **吸附目标窗口移动/缩放** | 跟随轮询（复用 16ms 定时器，节流 120ms） | 角色随边缘平移/升降 | 用同一 edge 重算位置并 `setPosition`；重算被 D-7 大幅夹取时解除吸附 | 无 |
 | 第二实例启动 | 单实例锁 | 前一个窗口获得焦点 | 新实例直接退出 | 无 |
+| **`presence` 不可用**（`koffi` 未装 / 绑定失败 / `GetLastInputInfo` 返回 0） | 启动期 `require('koffi')` 失败或调用返回 0 | 无感知 | `userIdleMs` 恒为 `null`：段 3.5 只剩时间戳；idle-drive 因 `no-presence` **永不触发**（宁可全程沉默，也不在用户打字时插嘴）。记一条 WARN | 无 |
+| **主动路径 LLM 失败 / 超时 / 输出不合法** | 3s 超时 + §9.2 校验 | 无感知（**保持沉默**） | 不发布 `intent_resolved`、不发声、不发 `llm_failed`；只记 WARN；不计入预算（ADR 0031 D4.2） | 无 |
+| **主动推理期间用户开口** | `respond()` 的既有打断序列 | 用户这次的话正常回复 | 主动会话被 `cancelled`，`await` 返回后直接丢弃，一个字节都不发（PR-6） | 无（主动路径不发 `llm_failed{aborted}`） |
+| **主动预算耗尽**（12 次 / 深夜 6 次） | `evaluateIdleDrive` 的 `budget` | 无感知（直到下个会话） | 本次会话不再主动开口；`snapshot().lastProactiveSkip='budget'` 可诊断 | 无 |
+| **冷启动预热失败 / 超时**（Ollama 未启动、模型不在本地、加载超 60s） | 预热请求的 `ok/ timeout` | 无感知（首句照旧可能慢或走兜底） | 只记一条 WARN；按 60s 间隔重试，最多 3 次后本会话放弃；**不**发 `llm_failed`、**不**置 `llmDisabled`、**不**计入预算（ADR 0032 D3 / 契约 §7.6 PR-8）。`PET_PROACTIVE_DISABLE=1` 不影响预热；`PET_SELFTEST=1` 与 `PET_WARMUP_DISABLE=1` 时不发任何预热请求（ADR 0033） | 无 |
+| **前台应用未命中任何归一化规则** | `normalizeAppCategory` 落 `other:` 分支 | 无感知 | 段 3.5 发 `other: <类名>`（不发原始标题）；记日志的仍是原始标题，只在本地（ADR 0032 D1） | 无 |
 
 ## 12. 并发与时序
 
@@ -701,6 +766,11 @@ flowchart TD
 | 语音与拖拽 | 互不打断：拖拽只接管身体通道 |
 | 指针轮询 | 单一定时器 ~16ms，同时服务穿透状态机与拖拽位移；不得再开第二个 |
 | 窗口位移 | `walking` / `settling` 复用**同一个** 16ms 轮询器（先推进位移、再读窗口矩形判定穿透）；不得新开定时器（ADR 0024 D6） |
+| 吸附跟随 | 也挂在同一个 16ms 轮询器的 `onTick` 上，内部节流 `PET_SNAP_FOLLOW_MS`（默认 120ms）；不得为跟随新开定时器（ADR 0028 D6） |
+| 托盘诊断刷新 | 也挂在同一个 16ms 轮询器的 `onTick` 上：读数变化时下一拍即刷新，无变化时每 `TRAY_STATS_REFRESH_MS`（5s）复查一次；**不得**为此新开定时器（ADR 0032 D4.3） |
+| 主动性节拍 | `orchestrator` 内部 15s 一个定时器（`PROACTIVE_TICK_MS`），只做 idle-drive 评估；**不参与**穿透、掩膜、窗口位移，与上面的"唯一 16ms 轮询器"不冲突（ADR 0031 D1）。未装配 `proactive` 时**不建任何定时器** |
+| 生命周期心跳 | `heartbeat` 独立一个 15s 定时器（`HEARTBEAT_TICK_MS`），只做生命周期任务（当前 = 预热）；与 idle-drive 那条互不引用，任一关闭都不影响另一条（ADR 0033 D1）。`PET_SELFTEST=1` 或 `PET_WARMUP_DISABLE=1` 时**整个不建**（零后台推理）。`model_ready` 到达时立即触发一次预热，不等节拍（ADR 0033 D2） |
+| presence 采样 | 2s 懒采样（`getSnapshot()` 节流），**不是定时器**；不读光标位置（那是 16ms 轮询器的事），只调 `GetLastInputInfo`（ADR 0030 D1.3） |
 | 穿透恢复延迟 | 光标进入窗口到可交互约 1–2 帧（16–32ms）；此间快速点击会落空，属已知残余缺陷 |
 | 掩膜刷新 | 窗口内 ≥ 20Hz；窗口外暂停；陈旧阈值 100ms |
 | 穿透切换迟滞 | 离开判定外扩 8px；每次切换后冷却 100ms |
@@ -719,6 +789,8 @@ flowchart TD
 | X-7 | macOS / Linux 适配 | 违反 C-2 |
 | X-8 | 自动更新、安装包签名 | 与桌宠核心无关，单独立项 |
 | X-9 | 亚像素级精确命中 | `128 × 72` 掩膜 + 双线性插值即精度上限（ADR 0002） |
+| X-10 | 吸附后跟随"新的前台窗口" | 用户切窗口时把桌宠整体搬走像"绑架"；只跟随被吸附的那一扇窗（ADR 0028 D6） |
+| X-11 | 窗口内的逐点贴边（吸附到控件/子区域边缘） | 只认窗口的外边界（DWM 扩展边框），不做 UI 元素级定位 |
 
 ## 14. 规划目录（尚未创建，仅作契约投影）
 
@@ -761,6 +833,10 @@ flowchart TD
 | 1.6.0 | 2026-10-31 | ① **walking 与窗口位移**：§3.5 新增 `cmd:walk`（render → main 命令）、§6.3 新增 `motion_ended`（shell 唯一生产者）；§12 明确位移复用唯一 16ms 轮询器。② **真实回弹**：§4.1 新增 `settling`、`dragged` 退出条件改为"转 `settling`"；§5.1 Physics 层状态集合补 `settling`；§5.3 补两条"回弹期间 intent/摸头被拒"；§7.1 `PhysicsState` 扩为 `'dragged' \| 'settling'`。③ **记忆保留**：§7.5 新增 `prune()` 接口与保留规则（上限 2000、按 `at` 升序、单次 ≤200、`setImmediate` 排期、FTS 触发器同步） | ADR 0024、ADR 0025 |
 | 1.7.0 | 2026-10-31 | ① **walking 朝向**：§4.1 `walking` 的定义补"行走期间整身朝向移动方向（±90° 平滑转身），停下回正"；§11 补一行"行走转身"的降级/行为说明。② **emotion 视觉映射**：§5.2 表情通道补"由贴图合成实现（眼型/嘴型/红晕三层），口型通道优先于表情嘴型"；§7.3 规则补"表情只走贴图合成"的四条禁令与降级要求；§11 补"表情贴图合成不可用"一行。**未新增/删除状态、事件、`intent`、`emotion`、接口方法或 `RenderState` 字段** | ADR 0026 |
 | 1.8.0 | 2026-10-31 | **表情实现路线反转**：§5.2 表情通道与 §7.3 规则改为"眼型与红晕**必须来自外部官方差分贴图**（`data/expressions/`），**禁止**运行期程序化绘制眼型/瞳孔/眼睑/红晕"；补"还原必须用 ImageData 快照写回、差分缺失只变嘴型"两条；§11 新增"官方表情差分缺失"降级行。ADR 0026 第 1 版的程序化重绘（D2/D4 的图元部分）被 D6 取代。**未新增/删除状态、事件、`intent`、`emotion`、接口方法或 `RenderState` 字段** | ADR 0026 D6 |
+| 1.9.0 | 2026-11-01 | **前台窗口吸附与 `sitting`**：① §4.1 新增 `sitting`（Physics 层，置位者是 `shell` 的 `snap_applied`），§5.1 Physics 层集合补 `sitting`，§5.3 补"吸附时说话/摸头/被拖拽"三行；② §6.3 新增 `snap_applied` / `snap_released`（唯一生产者 `shell`）；③ §7.1 `PhysicsState` 扩为 `'dragged' \| 'settling' \| 'sitting'`；④ §7.2 补"吸附不新增接口/通道，热键 `Ctrl+Shift+S` + 托盘两项，Win32→DIP 换算，跟随复用 16ms 轮询器"，§7.3 补订阅与坐姿规则（官方片段 11.2–13.5s 停帧 + 身体平移补偿 + 缺片降级）；⑤ §11 补四行降级/拒绝；⑥ §12 补"跟随复用同一个定时器"；⑦ §13 补 X-10/X-11 两条非目标。**未删除任何状态/事件/接口方法，`RenderState` 字段未增删** | ADR 0028 |
+| 1.10.0 | 2026-11-01 | **时间感与主动性**：① §2 明确 `presence` 不是第六个模块而是只读工具端口，§2.1 增"orchestrator → presence（只读端口，runtime 注入）"，§3.1 登记 presence 与 idle-drive 节拍；② §9.3 新增**可选段 3.5「环境事实」**（时间/输入状态/前台应用/上次会话，单行 ≤160 字，缺项整项省略，固定降级顺序）；③ §7.5 段 ③ 格式改为**相对时间**（`今日`/`昨日`/`N日前`/`Nヶ月前`/`N年前`）+ 去冗余（同 tags 且三字组 Jaccard ≥0.8）+ 合计 360 字预算；④ §7.6 明确 `Reply` 的三个合法来源，新增主动话语（idle-drive）规则 PR-1…PR-7：预算 12 次/会话（深夜 6）、先规则后 LLM（3s 超时）、失败即沉默、进历史但**不写** `memory.db`、自检默认硬关；⑤ §11 新增四行降级（presence 不可用 / 主动失败 / 主动期间用户开口 / 预算耗尽）；⑥ §12 补"主动性节拍 15s 不参与穿透与位移"与"presence 2s 懒采样不是定时器"。**未新增/删除事件、状态、`intent`、`emotion`、模块接口方法与 `RenderState` 字段**；`lines.json` 的 `match.on` 新增本地取值 `'idle'`（不是事件，不跨进程） | ADR 0030、ADR 0031 |
+| 1.11.0 | 2026-11-01 | **应用类别 + 冷启动预热 + 托盘诊断**：① §4.6 新增术语「应用类别」「预热」；② §9.3 段 3.5 的**前台应用分项改为归一化类别** `前面のアプリ: coding`（`coding`/`browser`/`game`/`meeting`/`video`/`other: <类名>`），**原始标题不得进提示词**；类别为 `coding` 时追加 `先生は今、プログラミングに集中している`；降级顺序插入"先丢编程提示"；③ §7.6 新增 PR-8（预热：只挂 15s 节拍、空闲+presence 正常才发、1 token、不改熔断/不发事件/不占预算、最多 3 次）与 PR-9（托盘两行只读诊断只读 `proactive-stats` 单例，不新增事件/IPC/setter，口径为"本进程启动以来"）；④ §3.1 更新 orchestrator 与 presence 行；⑤ §11 新增两行降级（预热失败 / 类别未命中）；⑥ §12 补"托盘诊断刷新复用 16ms 轮询器"。**未新增/删除事件、状态、`intent`、`emotion`、模块接口方法与 `RenderState` 字段**；`WorldFacts` 删除 `foregroundTitle`/`foregroundClass`、新增 `foregroundCategory`（内部类型，不跨进程） | ADR 0032 |
+| 1.12.0 | 2026-11-01 | **预热与主动性解耦 + 预热前置对齐（封版 1.0.0）**：① §2 / §2.1 声明 `heartbeat` 不是第六个模块，而是 `runtime` 装配的生命周期节拍器，并登记其允许读取的只读事实；② §3.1 把预热从 `orchestrator` 行迁到新增的 `heartbeat` 行；③ §4.6「预热」补调度方与"不受主动性开关影响"；④ **§7.6 PR-8 重写**：预热改挂生命周期心跳（独立 15s 定时器），`model_ready` 到达立即触发一次，`PET_PROACTIVE_DISABLE=1` 不再影响预热，`PET_SELFTEST=1` 时心跳整个不启动（零后台推理、无 opt-in），新增 `PET_WARMUP_DISABLE=1` 逃生口；`model_ready` 触发不受 presence 门槛约束（唯一一处旧规则放宽）；⑤ §11 更新预热失败行；⑥ §12 新增"生命周期心跳"一行。**未新增/删除事件、状态、`intent`、`emotion`、模块接口方法与 `RenderState` 字段**；`orchestrator.snapshot()` 移除 `llmWarmedUp`/`warmupAttempts`（内部诊断，迁至 `RuntimeSnapshot.warmup`） | ADR 0033 |
 
 ## 16. 如何在新对话中接续
 
