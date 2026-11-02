@@ -339,3 +339,29 @@ export const STARTLE_SURPRISED_MS = 400;
 export const STARTLE_CLICKED_MS = 120;
 export const STARTLE_COMMAND_MS = 260;
 export const STARTLE_LOST_MS = 320;
+
+// --- 背面法描边（ADR 0038） ---
+/**
+ * 描边宽度，单位 **屏幕像素**（不是模型单位）。
+ *
+ * 为什么用像素：相机是正交的、世界单位 = CSS px（`pixelsPerUnit` 把模型单位换算成 px），
+ * 所以"在视空间沿法线外扩 N 个像素"天然就是**粗细均匀**的线，不会因为角色缩放/
+ * 呼吸压扁/远近而变化。模型单位口径（用户建议的 0.003）在本资产上等于 0.003 × 57538 ≈
+ * **172px**，直接照抄会把整个人糊成一坨黑。
+ */
+export const OUTLINE_WIDTH = 1.5;
+/**
+ * 头发的描边宽度（比身体细）。
+ *
+ * 为什么单独一档：本资产的头发是**一张张互相重叠的卡片**，每张卡片的轮廓都会各自
+ * 外扩一圈；在几层卡片投影重合的地方（实测侧发轮廓）线宽会叠加，1.2px 叠出来能到
+ * 6px，看起来像贴纸黑边。降到 0.7px 后重叠区约 2–3px，单层发梢仍是清晰的一条线。
+ */
+export const OUTLINE_HAIR_WIDTH = 0.8;
+/** 描边颜色：深褐（`0x2a1b1a`）。不用纯黑：纯黑在浅色衣服上像"抠图锯齿" */
+export const OUTLINE_COLOR = 0x2a1b1a;
+/**
+ * 深度偏移（视空间单位 = px）：把描边壳沿视线方向**推远**一点点，避免与共面/近共面的
+ * 面部贴图 z-fighting（倒角只在轮廓处露出，推远不影响观感）。
+ */
+export const OUTLINE_DEPTH_BIAS = 0.6;

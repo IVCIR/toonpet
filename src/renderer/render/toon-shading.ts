@@ -182,6 +182,32 @@ export class ToonShading {
     this.gradient = createToonGradientMap(this.steps);
   }
 
+  /**
+   * 把一个无光照材质转成 `MeshToonMaterial`（保留 map/color/alphaTest/side/depthWrite）。
+   *
+   * 公开是为了诊断（ADR 0038 任务二：临时把光环换成 Toon 做对照），
+   * 不记 swap、不改场景；装配路径请走 `attach()`。
+   */
+  toToonMaterial(material: THREE.Material): THREE.MeshToonMaterial {
+    const source = material as THREE.MeshBasicMaterial;
+    return new THREE.MeshToonMaterial({
+      name: material.name,
+      // 贴图色彩空间沿用 GLTFLoader 的设置（baseColor = sRGB），不能重建
+      map: source.map ?? null,
+      color: source.color ? source.color.clone() : new THREE.Color(0xffffff),
+      // 本资产的 COLOR_0 只有 alpha 在变（0 / 0.5 / 1，实测见 ADR 0037 资产审查），
+      // RGB 恒为 1；一旦开启 vertexColors，alpha 会被乘进 diffuse.a —— 未来若给
+      // 头发开 alphaTest，就会把一半发丝裁掉。这里显式关掉，只用贴图颜色。
+      vertexColors: false,
+      transparent: false,
+      alphaTest: source.alphaTest ?? 0,
+      side: source.side,
+      depthWrite: source.depthWrite ?? true,
+      gradientMap: this.gradient,
+      toneMapped: false,
+    });
+  }
+
   /** 遍历 root，把命中 `isToonMaterialName` 的材质换成 `MeshToonMaterial`。可重复调用（幂等）。 */
   attach(root: THREE.Object3D): number {
     root.traverse((object) => {
@@ -195,23 +221,7 @@ export class ToonShading {
       const convert = (material: THREE.Material | undefined | null): THREE.Material => {
         if (!material) return material as unknown as THREE.Material;
         if (!isToonMaterialName(material.name)) return material;
-        const source = material as THREE.MeshBasicMaterial;
-        const toon = new THREE.MeshToonMaterial({
-          name: material.name,
-          // 贴图色彩空间沿用 GLTFLoader 的设置（baseColor = sRGB），不能重建
-          map: source.map ?? null,
-          color: source.color ? source.color.clone() : new THREE.Color(0xffffff),
-          // 本资产的 COLOR_0 只有 alpha 在变（0 / 0.5 / 1，实测见 ADR 0037 资产审查），
-          // RGB 恒为 1；一旦开启 vertexColors，alpha 会被乘进 diffuse.a —— 未来若给
-          // 头发开 alphaTest，就会把一半发丝裁掉。这里显式关掉，只用贴图颜色。
-          vertexColors: false,
-          transparent: false,
-          alphaTest: source.alphaTest ?? 0,
-          side: source.side,
-          depthWrite: source.depthWrite ?? true,
-          gradientMap: this.gradient,
-          toneMapped: false,
-        });
+        const toon = this.toToonMaterial(material);
         this.swaps.push({
           mesh: mesh.name || '(unnamed)',
           material: material.name,

@@ -2,9 +2,9 @@
 
 | 项 | 值 |
 |---|---|
-| 对应契约版本 | 1.14.0（ADR 0037：全局光照 + Body/Hair 的 3 阶 Toon，面部死守；ADR 0036 的手部顶点色烘焙已废止） |
+| 对应契约版本 | 1.15.0（ADR 0038：背面法描边 + 光环保持无光照；ADR 0037：全局光照 + 3 阶 Toon） |
 | 最后更新 | 2026-11-02 |
-| 当前里程碑 | **M16：官方 NPR 的第一步** —— 先做资产审查（没有 Mask/Ramp、顶点色 RGB 是常量），再上"主方向光 + 极低环境光 + 3 阶硬边色阶"，只让身体/头发吃光、面部保持无光照；手部发白问题由真光照正面解决（ADR 0037） |
+| 当前里程碑 | **M17：官方 NPR 收口** —— 身体/头发/脸加背面法描边（共享几何与骨骼、屏幕像素宽度），眼睛嘴/眉毛/光环不描；光环经对照实验后**保持全亮无光照**（吃光会变脏）。Toon + 描边 = 第一阶段视觉升级闭环 |
 | 维护规则 | 每个模块对话收尾时必须更新本文件；只写事实，不写计划性描述（计划进 TODO） |
 
 ## 填写口径
@@ -224,6 +224,8 @@
 ## 模块：render
 
 ### 已完成
+- **背面法描边（2026-11-02，ADR 0038）**：新增 `outline.ts`（`applyOutline(mesh)` + `OutlineSet`）。做法 = `mesh.clone(false)`（`SkinnedMesh.copy()` **共享同一 `Skeleton`** 与绑定矩阵）→ `ShaderMaterial{ side: BackSide }` → 顶点着色器里 `#include <skinning_*>` 全链拿到**蒙皮后的法线与位置**，再按 `mvPosition.xy += viewNormal.xy * smoothstep(0.02,0.30,len) * width` 外扩 → 纯色输出。**宽度单位是屏幕像素**（正交相机下 1 视空间单位 = 1 CSS px）：身体/脸 **1.5px**、头发 **0.8px**、颜色 `0x2a1b1a`、深度偏移 0.6px + `polygonOffset`。范围：`Body`/`Hair`/`Face`（3 个描边壳，共享 2 个材质实例）；`EyeMouth`/`Eyebrow*`/`Halo`/已隐藏配件**不描**。**没有后处理、没有新 RenderTarget、没有第二套动画状态**。实测：draw call **7 → 10**、三角形 9,926 → 19,130（同一几何再画一遍）、帧时间 EMA **16.7 → 16.7ms**（vsync 封顶）；描边壳与源网格**世界矩阵逐元素一致（`matrixDelta = 0`）**，所以呼吸/眨眼/拖拽/坐姿全程不穿模、不滞后。**两个实测坑**：① 归一化 `viewNormal.xy` 会把"正对镜头"的浮点噪声放大成随机方向 → 脸皮/头发卡片上出现楔形黑块（暗像素占比 16.1%→23.3%），改 `smoothstep` 后收敛到 +4.2pp；② 头发是**重叠卡片**，每张卡的描边会叠线，1.2px 档最厚处 12 设备像素（6 CSS px），单独降到 0.8px 后收敛到 2–3px。A/B 截图（`PET_OUTLINE_DIAG=1`，连拍 6 对取 16×16 缩略图差最小的一对）：整身暗像素占比 24.8%→28.7%、头部 16.0%→20.2%、外套 29.7%→33.2%。主链路自检新增 5 条结构级断言（含 `matrixDelta`）
+- **光环受光定论（2026-11-02，ADR 0038 D6）**：`PET_HALO_DIAG=1` 同姿态对照 `MeshBasicMaterial` vs `MeshToonMaterial`——区域亮度 198.2 → 193.0、暗像素占比 13.2% → 16.7%，观感从"均匀发光的粉色符号"变成"右半侧暗玫瑰 + 顶部高光被吃掉"的脏塑料片。**定论：光环保持无光照 `MeshBasicMaterial`，不吃光、不描边**。`window.diagnostics.setHaloToon(true)` 只留作一次性对照（沿 ADR 0026 的惯例），不进生产路径
 - **全局光照 + Toon（2026-11-02，ADR 0037）**：先做**资产审查**再动材质。新工具 `tools/audit-glb-assets.mjs`（只读、自带 PNG 解码）遍历 GLB：**8 张贴图全是 RGBA8 颜色贴图、10 个材质只有 `baseColorTexture` 一个槽、没有 Mask/Ramp/多通道打包图、没有第二套 UV**——本资产是"纯色平涂 + 一张颜色图"的移动端 NPR 资产，阴影信息不在贴图里。`COLOR_0`：**RGB 全为常量**（要么全 1，要么整块一个常量色），**alpha 才是真数据**（0/0.102/0.2/0.251/0.349/0.502/0.745/1，即 8 bit 量化的 26/51/64/89/128/190/255），按骨骼分布与飘带/躯干相关，**疑似描边遮罩而非阴影 ramp**；`Eyebrow`/`EyeMouth` 的 alpha 恒为 0，所以 alpha **绝不能**接进 `alphaTest`/`transparent`。实现：新增 `toon-shading.ts`（`ToonShading` 类）——主方向光（强度 2.6、方向 `(-0.38,0.72,0.58)` = 斜上方偏左前）+ 极低环境光（0.55，占受光面 17.5%），**`ambient + directional = π`** 使受光面 = 贴图原色（白外套不被压灰）；代码生成 **3 阶** `DataTexture` 色阶（32×1、`NearestFilter`、`NoColorSpace`，断点 `dot≤0.12→0.58 / ≤0.38→0.80 / >0.38→1.00`）→ 硬边二分；**只把 `CH0335_Body` 与 `CH0335_Hair`** 换成 `MeshToonMaterial`（保留 map/color/alphaTest/side/depthWrite，显式 `vertexColors:false`）。**面部死守**：`Face`/`EyeMouth`/`Eyebrow*` 由正则双重排除，永不参与。**ADR 0036 的手部顶点色烘焙整体废止**（删 `skin-shading.ts` 及其单测/诊断接口），手部改由真光照产生明暗。A/B（`PET_TOON_DIAG=1`，同表情同帧，连拍 5 对取脸部统计最接近的一对）：外套近白占比 **38.6% → 30.6%**、左手 **35.1% → 19.3%**、全身亮度只降 4.2%（受光面不变）；截图 `toon-00-before.png` / `toon-01-after.png` + 5 张局部裁剪。主链路自检 **131/131**（4 条材质级断言替换原"手部烘焙"1 条）；单测新增 `toon-shading` 6 条、删除 `skin-shading` 6 条；`tsc --noEmit` 0 错
 - **手/小臂发白修复（2026-11-02 真机，ADR 0036；已被 ADR 0037 废止）**：数据定位——`CH0335_Body_6` 的 150 个 Hand + 64 个 Forearm 顶点共用材质 `CH0335_Body`（`MeshBasicMaterial`，`map` 存在、512²、`colorSpace=srgb`）；手部 UV 只有约 `1.2 × 1.0 texel`，采样恒为 `#f1edec`；场景**没有任何灯**。根因 = **平涂身体贴图 × 无光照材质**（不是缺图、不是色彩空间、不是过曝）。当时的修法：`skin-shading.ts` 的 `bakeSkinShading()` 把 `clamp(ambient + diffuse·dot(n, light)) × tint` 只写进手/小臂顶点的 `COLOR_0`（214 个）。**2026-11-02 起该模块已删除**（ADR 0037 D4）：同一条判据（平涂贴图 × 无光照）现在由 Toon 光照正面解决，且覆盖全身而非 214 个顶点
 - **本轮四套自检全绿（exit 0）**：主链路 **128/128**（新增"手/小臂已烘焙暖色明暗"1 条）、输入条 **29/29**、语音 **30/30**、缺失模型 **4/4**；`tsc --noEmit` 0 错；单测新增 `skin-shading` 6 条（普通 Mesh 不被误伤 / 交错属性转换 / 归一化 Uint8 转换 / 幂等 / 明暗公式边界）
@@ -297,8 +299,11 @@
 
 > 内部接口（不属于 §7.3，且不跨进程暴露）：`handleEvent(event)`（`evt:broadcast` 的渲染侧入口）、`setCursor(cssX,cssY,at)`、`noteGrabPoint(cssX,cssY,at)`（ADR 0035 抓取点）、`setDebugBoneOffset/clearDebugBoneOffsets/listBones/getBoneWorld`（ADR 0035 骨骼标定）、`setWalkInterval(min,max)`（自检压缩行走间隔）、`getDiagnostics()`（含 `facial` 块：emotion/eyeShape/mouthShape/mouthOwner/blush/alpha/faceDistance/textureDigest；`toon` 块：enabled/ambient/directional/direction/gradientSteps/gradientWidth/materials/litMeshes——ADR 0037）、`applyFacial`（内部装配点，私有）、`FacialChannel.setMouth/setEyes/repaint` / `BlushChannel.setBlush/repaint` / `MaskCapture.setPaused` / `setTickListener` / `snapshot` / `markContextLost`。
 >
-> 着色与材质诊断专用（只在 `window.diagnostics` 同页暴露）：`inspectMaterials()`（网格/材质/`map`/`colorSpace`/手部顶点/UV 采样色）、`tintSkin('hand'|'both'|'none')`（只染手/小臂顶点，用于证明手在哪块网格）、`testHandMaterial(color)`（整块 Body 材质换纯色，对照实验）、**`setToon(false|true)`（ADR 0037：摘灯 + 还原无光照材质 ↔ 3 阶 Toon，before/after 截图用）**、`resetMaterials()`、`handScreenPoints()`（双手骨骼的 CSS 坐标，截图取样用）。
+> 着色与材质诊断专用（只在 `window.diagnostics` 同页暴露）：`inspectMaterials()`（网格/材质/`map`/`colorSpace`/手部顶点/UV 采样色）、`tintSkin('hand'|'both'|'none')`（只染手/小臂顶点，用于证明手在哪块网格）、`testHandMaterial(color)`（整块 Body 材质换纯色，对照实验）、**`setToon(false|true)`（ADR 0037：摘灯 + 还原无光照材质 ↔ 3 阶 Toon）**、**`setOutline(false|true)`（ADR 0038：只切描边壳 `visible`）**、**`setHaloToon(false|true)`（ADR 0038 D6：光环吃光的对照开关）**、`resetMaterials()`、`handScreenPoints()`（双手骨骼的 CSS 坐标，截图取样用）。
 > `PET_TOON_DIAG=1`（配合 `PET_SELFTEST=1`）只跑 Toon 对照：产出 `dist/diagnostics/toon-comparison.json` 与 `dist/selftest/toon-00-before.png` / `toon-01-after.png` / `toon-{before,after}-{coat,torso,face,handL,handR}.png`。
+> `PET_OUTLINE_DIAG=1` 只跑描边对照：`dist/diagnostics/outline-comparison.json` + `dist/selftest/outline-0{0-off,1-on}.png` + `outline-{off,on}-{head,hair,coat,face,hand}.png`；同一套还采 `render.calls/triangles/frameMs`（描边的性能口径）。
+> `PET_HALO_DIAG=1` 只跑光环对照：`dist/diagnostics/halo-comparison.json` + `halo-0{0-basic,1-toon}.png`（含 `-crop`）。
+> 三套对照都用"连拍多对 + 16×16 缩略图姿态对齐"挑同一姿态的两帧（`poseSignature` / `signatureDelta`）。
 > 资产审查走出独立的**只读**脚本 `tools/audit-glb-assets.mjs`（不依赖 three、自带 PNG 解码），报告落 `dist/diagnostics/asset-audit.json`——它不在运行时链路上，只在"换模型/换皮肤"时手动跑。
 
 ### 消费事件
@@ -321,6 +326,12 @@
 
 | 现象 | 影响 | 规避 |
 |---|---|---|
+| **描边外扩不能对 `viewNormal.xy` 归一化**：正对镜头的面 `|xy|→0`，归一化会把浮点噪声放大成一个随机方向，仍按满宽外扩 | 脸皮与头发卡片上出现**楔形/条状黑块**（同帧 A/B 的暗像素占比 16.1%→23.3%），看起来像贴图坏了 | 乘 `smoothstep(0.02, 0.30, len)`：轮廓处（len≈1）满宽、正对镜头的面平滑归零（ADR 0038 D2.1）；改后增量收敛到 +4pp 以内，楔形消失 |
+| **头发是"重叠的卡片"**：每张卡片的轮廓都会各外扩一圈，几层投影重合处线宽叠加 | 1.2px 档在侧发重叠处叠出 **12 设备像素（6 CSS px）**，像贴纸黑边 | 头发单独一档 **0.8px**（`OUTLINE_HAIR_WIDTH`），重叠区收敛到 2–3px；单层发梢仍是清晰一条线（ADR 0038 D4）。要根治只能合并外壳或走后处理，两条都被"不做后处理"否掉 |
+| **`Face` 是开口曲面**：`BackSide` 对正对镜头的三角形全部剔除 | 脸皮的描边**几乎看不见**（"装了但没有像素"）；下巴/颈部那条线其实来自 Body 与 Hair | 这是资产事实，不是 bug；`Face` 仍按需求接入（换成封闭脸皮的模型才会显现）。**不要**为了"看得见"改用 `DoubleSide`——那会把描边糊在脸上（ADR 0038 D5） |
+| **描边壳与近共面表面会 z-fighting**（脸皮、双层衣料） | 轮廓内侧出现闪烁的黑色碎片 | 视空间推远 0.6px（`OUTLINE_DEPTH_BIAS`）+ `polygonOffset(1,1)` 双保险 |
+| **描边会把"轮廓"算进掩膜** | 掩膜（128×72）比之前大约 ≤1.5px，轮廓也可被点中 | 这是想要的行为；R-9 的矩形退路、双线性采样与头部带比例都不变，不需要改契约 |
+| **A/B 截图会被动画污染**（呼吸/眨眼/手指微动） | 隔 300ms 拍两张可能一张闭眼一张睁眼，拿去做"有/无描边"证据不严谨 | 用 **16×16 灰度缩略图差**挑姿态最接近的一对（1px 的描边线在缩略图里被平均掉，整体位移不会）；`PET_OUTLINE_DIAG=1` 自动连拍 6 对 |
 | **本资产没有 Mask / Ramp 贴图**：8 张贴图全是 RGBA8 颜色图，10 个材质只有 `baseColorTexture` 一个槽，也没有第二套 UV | "阴影范围可画"这条路不存在；二分只能由光照模型产生 | ADR 0037：`MeshToonMaterial` + 3 阶 `gradientMap`（硬边由 `NearestFilter` 给）。**换模型/换皮肤前先跑 `node tools/audit-glb-assets.mjs`**，若新资产带 Ramp，改 `TOON_STEPS` 或直接用它 |
 | **`COLOR_0` 的 RGB 是常量、alpha 才是数据**（0/0.102/0.2/0.251/0.349/0.502/0.745/1 = 8bit 的 26/51/64/89/128/190/255，疑似描边遮罩） | 最新版本的顶点色**不能**当颜色/明暗乘子（只有常量），也**不能**接进 `alphaTest`/`transparent`——`Eyebrow`/`EyeMouth` 的 alpha 恒为 0，接进去眉毛和五官会整块消失 | Toon 材质显式 `vertexColors: false`；要消费 alpha 必须先出 ADR + 单测（ADR 0037 D4） |
 | **面部与身体的光照不一致**：`Face`/`EyeMouth` 恒为无光照材质，身体/头发吃光 | 强光侧看会有"脸比衣服亮"的割裂感（本轮实测在可接受范围） | ADR 0037 D3 的明确取舍：脸黑比脸亮更不可接受；要统一需"专用不受光 + 边缘光"材质，另开 ADR |
@@ -382,10 +393,11 @@
 ### TODO
 - [x] 资产审查（贴图/通道/Mask-Ramp/顶点色）：`tools/audit-glb-assets.mjs`（ADR 0037）
 - [x] 全局光照 + 身体/头发 Toon（3 阶硬边色阶）+ 面部死守；手部发白由真光照解决（ADR 0037）
-- [ ] **描边（outline）**：官方 NPR 观感的最大缺口。inverted-hull（反向外扩 + 背面渲染）或后处理；要先确认与 128×72 掩膜采集共用一帧时不会污染命中
-- [ ] 光环/配件是否吃光：扩 `TOON_MATERIAL_PATTERN` 即可，但要先确认 `CH0335_Halo.png` 的 alpha 与观感
-- [ ] 换模型/换皮肤后重跑 `node tools/audit-glb-assets.mjs` + `PET_TOON_DIAG=1`，按新资产重估 `TOON_STEPS` 的三档值
-- [ ] 二分线的美术微调（`TOON_LIGHT_DIRECTION` / 三档亮度），当前是"能看出明暗"的基线，还不是"官方级"
+- [x] **描边（Inverted Hull）**：Body/Hair/Face，屏幕像素宽度（1.5 / 头发 0.8），共享几何与骨骼（ADR 0038）
+- [x] **光环受光定论**：保持 `MeshBasicMaterial`（吃光会变脏，ADR 0038 D6）
+- [ ] 描边的**美术微调**：宽度（1.5/0.8）与颜色（`0x2a1b1a`）是基线值，需在浅色/深色壁纸、100%/125% 缩放下各看一遍
+- [ ] 头发卡片重叠处的叠线：若要更干净，需要研究"按材质合并外壳"（把同材质的卡片合成一个 geometry 再描边）——会动到加载管线，单独评估
+- [ ] 换模型/换皮肤后重跑 `node tools/audit-glb-assets.mjs` + `PET_TOON_DIAG=1` + `PET_OUTLINE_DIAG=1`，按新资产重估 `TOON_STEPS` / `OUTLINE_WIDTH`
 - [x] 坐姿 `sitting`（HFSM + `playHold` 停帧 + 身体平移补偿 + 光环跟随 + 程序化降级，ADR 0028）
 - [ ] 坐姿专用表情（闭眼/困倦 vs 当前 emotion 的取舍）
 - [ ] `sitting` 时的腿部遮挡检查（长裙/大衣在屈膝姿态下的穿插，需人眼复验）
@@ -693,6 +705,7 @@
 
 | 日期 | 模块 | 摘要 | 契约版本 |
 |---|---|---|---|
+| 2026-11-02 | render、全局 | **背面法描边 + 光环定论（ADR 0038）**：① 新增 `outline.ts`：`applyOutline(mesh)` = 克隆同一几何（`SkinnedMesh.copy()` 共享 `Skeleton`）+ `ShaderMaterial{side:BackSide}` + 顶点里 `#include <skinning_*>` 后按视空间法线外扩；`OutlineSet` 负责装配/开关/诊断/销毁。**宽度按屏幕像素**（身体/脸 1.5、头发 0.8）——模型单位 0.003 在本资产等于 172px，已实测否掉。② 范围：Body/Hair/Face 描边；EyeMouth/Eyebrow/Halo/配件不描。③ 两个实测修正：`viewNormal.xy` **不能归一化**（否则正对镜头的面被噪声放大成楔形黑块），改 `smoothstep(0.02,0.30,len)`；头发卡片会叠线，单独降到 0.8px。④ **光环对照定论：保持 `MeshBasicMaterial`**（亮度 198.2→193.0、暗像素 13.2%→16.7%，观感变"脏塑料"），`setHaloToon` 只作诊断。⑤ 诊断：`RenderDiagnostics.outline`（含 `tracked/matrixDelta`）与 `render`（calls/triangles/frameMs）；`PET_OUTLINE_DIAG=1` / `PET_HALO_DIAG=1`，A/B 用 16×16 缩略图做姿态对齐。**实测**：draw call 7→10、帧时间 EMA 16.7→16.7ms、`matrixDelta=0`（不穿模不滞后）。契约 **1.15.0**（§7.3 描边规则表、§11 降级行）。单测 +6（outline）、`tsc` 0 错、主链路自检 **136/136**、输入条 29 / 语音 30 / 缺失模型 4 均 exit 0；0 新依赖 / 0 新 pass / 0 新 IPC / `RenderState` 未增删字段 | 1.15.0 |
 | 2026-11-02 | render、全局 | **资产审查 + 全局光照 / Toon（ADR 0037）**：① 新增只读工具 `tools/audit-glb-assets.mjs`（自带 PNG 解码、按通道统计、判定 Mask/Ramp、统计 `COLOR_0` 直方图并按骨骼归类）：实测 **8 张贴图全是 RGBA8 颜色图、10 个材质只有 baseColor 槽、无 Mask/Ramp、无第二套 UV**；`COLOR_0` 的 **RGB 是常量、alpha 才是数据**（8bit 量化值，`Eyebrow`/`EyeMouth` 恒为 0 → 绝不能接进 alphaTest）。② 新增 `toon-shading.ts`：主方向光（2.6，斜上方偏左前）+ 极低环境光（0.55），**`ambient+directional=π`** 让受光面等于贴图原色；代码生成 **3 阶** `DataTexture` 色阶（32×1 / NearestFilter / NoColorSpace，`dot≤0.12→0.58 / ≤0.38→0.80 / >0.38→1.00`）；只替换 `CH0335_Body` 与 `CH0335_Hair` 为 `MeshToonMaterial`（显式 `vertexColors:false`）。③ **面部死守**：`Face`/`EyeMouth`/`Eyebrow*` 正则双重排除，永不参与。④ **ADR 0036 的手部顶点色烘焙整体废止**（删 `skin-shading.ts` / 单测 / `setSkinBake` / `shadeSkin` / `setShading`），`dominantBoneNames`/`matchesSkinBone` 迁入 `material-diagnostics.ts`。⑤ 诊断 `RenderDiagnostics.skin` → `toon`；`window.diagnostics.setToon(bool)`；`PET_TOON_DIAG=1` 连拍 before/after 并取脸部统计最接近的一对。**A/B 实测**：外套近白 38.6%→30.6%、左手 35.1%→19.3%、全身亮度只降 4.2%（不灰）。契约 **1.14.0**（§7.3 着色规则表、§11 一行降级）。单测 +6（toon）/ −6（skin）、`tsc` 0 错、主链路自检 **131/131**、其余三套 exit 0；0 新依赖 / 0 新 IPC / 0 新事件 / `RenderState` 未增删字段 | 1.14.0 |
 | 2026-11-01 | render | **真机 bug：坐姿时头疯狂打转**（ADR 0029）。二分结论：不是视线（提交的 yaw/pitch 只有 ±0.2 rad）、不是 `HaloRoot` 挂载（GLB 层级里它与骨架平级、只写 position）、不是 `playHold` 重入（`time` 恒为 2.3s）、不是窗口抖动。根因是骨骼仲裁的基底判定依赖"骨值 = 我上次写的值"，而 three 的 `PropertyMixer.apply()` 在**停帧**后会跳过冗余写入 → 误判成"动画写了" → 每帧把偏移叠在上一帧结果上（实测 2.51 rad/s）。修法：`arbiter.capture()` 在 `mixer.update()` 前快照受控骨骼，`beginFrame()` 用"这中间变没变"判定；阈值 1e-8 → 1e-6；新增 `baseFrom`/`applied` 诊断与 `headQuat/headWorld/headBase` 字段。修后 1s 漂移 **0.000 rad**；新增单测 `bone-arbiter` 4 条、自检 +1 条（头骨不漂移），主链路 **119/119** | 1.9.0 |
 | 2026-11-01 | shell、render、全局 | **前台窗口吸附 + 坐姿**（ADR 0028）：① shell 新增 `foreground-window.ts`（`koffi` → `GetForegroundWindow` + `DWMWA_EXTENDED_FRAME_BOUNDS`，退路 `GetWindowRect`；物理像素 → `screen.screenToDipPoint` 逐点换 DIP）、`snap-geometry.ts`（纯几何：边缘线 + 居中 + 整窗可见夹取 + 竖直 >40px 拒绝 + 覆盖式全屏判定）、`snap.ts`（控制器 + 跟随节流 120ms + 8 种拒绝 + 五条解除路径）；热键 `Ctrl+Shift+S`（降级 `Ctrl+Alt+S`）与托盘两项；无 `koffi` 时回退"工作区贴边"。② render 新增 Physics=`sitting`（`snapApplied/snapReleased`）、`playHold` 停帧播放、`clip-bank` 的 `sit` 角色（回忆片段 11.2–13.5s）、`sit-pose.ts`（呼吸 + 程序化降级）、坐姿身体平移补偿与**光环跟随头骨**。③ 修 bug：占位胶囊体位置双重偏移（缺失模型自检 4/4）。契约 **1.9.0**（§4.1 `sitting`、§5.1/§5.3、§6.3 两条事件、§7.1/§7.2/§7.3、§11 四行、§12、§13 X-10/X-11）。单测 **287**（28 文件，+15）、`tsc` 0 错、主链路自检 **119/119**（+22）、输入条 27 / 语音 30 / 缺失模型 4 套均 exit 0；截图 `window-sitting.png` + `window-sitting-desktop.png`（桌面合成） | 1.9.0 |

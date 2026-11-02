@@ -89,6 +89,8 @@ import { startleDurationMs, startlePose } from './startle';
 import type { StartleReason } from './startle';
 import { ToonShading } from './toon-shading';
 import type { ToonShadingDiagnostics } from './toon-shading';
+import { OutlineSet } from './outline';
+import type { OutlineDiagnostics } from './outline';
 
 /** 契约 §7.3 / §12：同一 intent 200ms 内只执行一次。 */
 export const INTENT_DEDUPE_MS = 200;
@@ -299,6 +301,10 @@ export interface RenderDiagnostics {
   speech: { frame: number; driven: boolean };
   /** ADR 0037：全局光照 + Toon 材质（内部诊断，不进 `RenderState`） */
   toon: ToonShadingDiagnostics;
+  /** ADR 0038：背面法描边（内部诊断，不进 `RenderState`） */
+  outline: OutlineDiagnostics;
+  /** ADR 0038：上一帧的 draw call / 三角形数与帧时间 EMA（"描边有没有拖慢"的可读口径） */
+  render: { calls: number; triangles: number; frameMs: number };
   probePoints: { head: { x: number; y: number } | null; body: { x: number; y: number } | null };
 }
 
@@ -352,6 +358,16 @@ export interface RenderModule {
    * 关闭 = 摘灯 + 还原原始无光照 `MeshBasicMaterial`（= 本轮修改前的样子）。
    */
   setToonShading(enabled: boolean): ToonShadingDiagnostics;
+  /**
+   * 内部（诊断/截图对照，ADR 0038）：开/关背面法描边。
+   * 关闭 = 隐藏所有描边壳（模型本身不动、材质不动）。
+   */
+  setOutline(enabled: boolean): OutlineDiagnostics;
+  /**
+   * 内部（诊断，ADR 0038 任务二）：把光环临时换成 `MeshToonMaterial`，
+   * 用来判断"发光体吃光会不会变脏"。返回是否找到光环网格。
+   */
+  setHaloToon(enabled: boolean): { enabled: boolean; meshes: string[]; material: string | null };
   /** 内部（诊断）：恢复材质与顶点色。 */
   resetMaterialDiagnostics(): void;
   /** 内部（诊断）：双手骨骼在内容区 CSS 坐标里的位置（用于截图取样）。 */
@@ -440,6 +456,8 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
   private width = 0;
   private height = 0;
   private lastFrameAt = performance.now();
+  /** 帧时间 EMA（ms，α=0.05；ADR 0038 性能口径） */
+  private frameMsEma = 16.7;
 
   private readonly lastIntentAt = new Map<string, number>();
   private emotion: Emotion = 'neutral';
@@ -487,6 +505,10 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
   private readonly debugBoneOffsets = new Map<string, { yaw: number; pitch: number; roll: number }>();
   /** ADR 0037：全局光照 + Toon（身体/头发）；灯在构造时挂上，材质在模型加载后替换 */
   private readonly toon: ToonShading;
+  /** ADR 0038：背面法描边（身体/头发/脸）；同样在模型加载后装配 */
+  private readonly outline: OutlineSet;
+  /** 诊断（ADR 0038 任务二）：光环临时换成 Toon 的原始材质句柄 */
+  private haloToonRestore: Map<THREE.Mesh, THREE.Material | THREE.Material[]> | null = null;
   /** 诊断用：Body 材质替换的恢复句柄 */
   private diagnosticMaterialRestore: (() => void) | null = null;
   private patMouthActive = false;
@@ -544,6 +566,8 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     // ADR 0037：全局光照（主方向光 + 极低环境光）+ 3 阶 Toon 色阶。
     // 这里只建灯与渐变贴图；材质替换发生在模型加载完成之后（`attachToon`）。
     this.toon = new ToonShading(this.scene);
+    // ADR 0038：描边材质也只建一次（所有描边网格共享），装配在模型加载之后
+    this.outline = new OutlineSet();
 
     this.placeholder = createCapsulePlaceholder();
     this.animationRoot.add(this.placeholder.group);
@@ -587,6 +611,18 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
           `meshes=${toonDiagnostics.litMeshes.join('|') || '(none)'} ` +
           `steps=[${toonDiagnostics.gradientSteps.join(',')}] ` +
           `ambient=${toonDiagnostics.ambient} directional=${toonDiagnostics.directional}`,
+      );
+
+      // ADR 0038：背面法描边（身体/头发/脸）。必须放在 Toon 之后——按材质名挑目标，
+      // 而 Toon 是"换材质"不是"改名字"，顺序其实无所谓，但放在这里可以保证
+      // 描边读到的是最终材质。描边壳共享同一 Skeleton，跟着骨骼一起动。
+      const outlineCount = this.outline.attach(loaded.root);
+      const outlineDiagnostics = this.outline.diagnostics();
+      console.log(
+        `[render] 描边已启用（ADR 0038） meshes=${outlineCount} ` +
+          `sources=${outlineDiagnostics.sources.join('|') || '(none)'} ` +
+          `width=${outlineDiagnostics.width}px color=${outlineDiagnostics.color} ` +
+          `depthBias=${outlineDiagnostics.depthBias}`,
       );
 
       if (this.placeholder) {
@@ -1526,6 +1562,60 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     return diagnostics;
   }
 
+  /**
+   * 诊断（ADR 0038）：开/关背面法描边。
+   * 关闭只是把描边壳 `visible=false`——主体、材质、骨骼一律不动，所以可以
+   * 在同一姿态下拍到"有描边 / 无描边"两张只差轮廓线的图。
+   */
+  setOutline(enabled: boolean): OutlineDiagnostics {
+    this.outline.setEnabled(enabled);
+    const diagnostics = this.outline.diagnostics();
+    console.log(
+      `[render] 诊断：描边 ${enabled ? '开' : '关'} meshes=${diagnostics.meshes.length} ` +
+        `width=${diagnostics.width}px color=${diagnostics.color}`,
+    );
+    return diagnostics;
+  }
+
+  /**
+   * 诊断（ADR 0038 任务二）：把光环换成 Toon，看"发光体吃光"是否更好看。
+   *
+   * 只在同页诊断里用；`false` 会还原成原始 `MeshBasicMaterial`。
+   */
+  setHaloToon(enabled: boolean): { enabled: boolean; meshes: string[]; material: string | null } {
+    const model = this.model;
+    if (!model) return { enabled: false, meshes: [], material: null };
+
+    if (!enabled) {
+      const restore = this.haloToonRestore;
+      if (restore) {
+        for (const [mesh, material] of restore) mesh.material = material;
+        this.haloToonRestore = null;
+      }
+      console.log('[render] 诊断：光环还原为无光照材质');
+      return { enabled: false, meshes: restore ? [...restore.keys()].map((mesh) => mesh.name) : [], material: null };
+    }
+
+    if (!this.haloToonRestore) {
+      const restore = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>();
+      model.root.traverse((object) => {
+        const mesh = object as THREE.Mesh;
+        if (!mesh.isMesh || !mesh.material || mesh.name.endsWith('__outline')) return;
+        const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        if (!materials.some((material) => /halo/i.test(material.name || ''))) return;
+        restore.set(mesh, mesh.material);
+        const source = materials[0]!;
+        const toonMaterial = this.toon.toToonMaterial(source);
+        mesh.material = Array.isArray(mesh.material) ? [toonMaterial] : toonMaterial;
+      });
+      this.haloToonRestore = restore;
+    }
+
+    const meshes = [...this.haloToonRestore.keys()].map((mesh) => mesh.name);
+    console.log(`[render] 诊断：光环换成 Toon meshes=${meshes.join('|') || '(none)'}`);
+    return { enabled: true, meshes, material: meshes.length > 0 ? 'MeshToonMaterial' : null };
+  }
+
   /** 诊断：恢复生产材质与顶点色（必须在诊断结束后调用）。 */
   resetMaterialDiagnostics(): void {
     this.diagnosticMaterialRestore?.();
@@ -1847,6 +1937,12 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       })(),
       speech: { frame: this.lipSyncFrame, driven: this.lipSyncDriven },
       toon: this.toon.diagnostics(),
+      outline: this.outline.diagnostics(),
+      render: {
+        calls: this.renderer.info.render.calls,
+        triangles: this.renderer.info.render.triangles,
+        frameMs: Math.round(this.frameMsEma * 10) / 10,
+      },
       probePoints: this.computeProbePoints(),
     };
   }
@@ -1891,6 +1987,7 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     this.model?.dispose();
     this.placeholder?.dispose();
     this.toon.dispose();
+    this.outline.dispose();
     this.renderer.dispose();
   }
 
@@ -1914,6 +2011,8 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
 
   private updateFrame(now: number): void {
     const dt = Math.min(100, Math.max(0, now - this.lastFrameAt)) / 1000;
+    // ADR 0038：帧时间 EMA（α=0.05）——给"描边有没有拖慢帧率"一个可读的数
+    this.frameMsEma += ((dt * 1000) - this.frameMsEma) * 0.05;
     this.lastFrameAt = now;
     this.updateSupportMotion(now);
 

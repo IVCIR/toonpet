@@ -3,6 +3,7 @@ import type { RenderModule } from './render-module';
 import type { MaskCapture } from './mask-capture';
 import type { MeshMaterialFacts } from './material-diagnostics';
 import type { ToonShadingDiagnostics } from './toon-shading';
+import type { OutlineDiagnostics } from './outline';
 import type { SpeechPlayerDiagnostics } from '../voice/speech-player';
 import type { SubtitleCueSnapshot } from '../shell/subtitle-cue';
 
@@ -47,6 +48,10 @@ declare global {
       testHandMaterial(color?: number): { materialName: string; meshes: string[] } | null;
       /** ADR 0037：开/关全局光照 + Toon（关 = 修改前的无光照样子，截图 A/B 用） */
       setToon(enabled: boolean): ToonShadingDiagnostics;
+      /** ADR 0038：开/关背面法描边（关 = 只隐藏描边壳，模型与材质不动） */
+      setOutline(enabled: boolean): OutlineDiagnostics;
+      /** ADR 0038 任务二：把光环临时换成 MeshToonMaterial（false 还原） */
+      setHaloToon(enabled: boolean): { enabled: boolean; meshes: string[]; material: string | null };
       /** 阶段 14：恢复材质/顶点色 */
       resetMaterials(): void;
       /** 阶段 14：双手骨骼在内容区 CSS 坐标里的位置（截图取样） */

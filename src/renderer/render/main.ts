@@ -70,6 +70,9 @@ window.diagnostics = {
   testHandMaterial: (color) => module.testHandMaterial(color),
   // ADR 0037：全局光照 + Toon 的 A/B 开关（关 = 修改前的无光照样子）
   setToon: (enabled) => module.setToonShading(enabled),
+  // ADR 0038：描边 A/B 开关 + 光环受光对照
+  setOutline: (enabled) => module.setOutline(enabled),
+  setHaloToon: (enabled) => module.setHaloToon(enabled),
   resetMaterials: () => module.resetMaterialDiagnostics(),
   handScreenPoints: () => module.handScreenPoints(),
 };

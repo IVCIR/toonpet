@@ -358,6 +358,13 @@ const bundles = [
     platform: 'node',
     format: 'esm',
     target: 'node20',
+  },  {
+    // ADR 0038：背面法描边（Inverted Hull / 共享几何与骨骼 / 屏幕像素宽度）
+    entry: 'src/renderer/render/outline.test.ts',
+    outfile: 'dist/tests/outline.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
   },
   {
     // 唯一需要跑在 Electron 的 Node 里的测试（原生模块 ABI，ADR 0020 D9）。

@@ -161,6 +161,19 @@ interface ModelDiagnostics {
     materials: Array<{ mesh: string; material: string; from: string; to: string }>;
     litMeshes: string[];
   } | null;
+  /** ADR 0038：背面法描边（内部诊断） */
+  outline: {
+    enabled: boolean;
+    width: number;
+    hairWidth: number;
+    depthBias: number;
+    color: string;
+    sources: string[];
+    meshes: Array<{ source: string; outline: string; sharedGeometry: boolean; skinned: boolean }>;
+    tracked: boolean;
+    matrixDelta: number;
+  } | null;
+  render: { calls: number; triangles: number; frameMs: number } | null;
   probePoints: { head: ProbePoint | null; body: ProbePoint | null };
 }
 
@@ -1985,6 +1998,382 @@ async function runToonDiagnostics(window: BrowserWindow): Promise<void> {
   });
 }
 
+/** 诊断：等模型就绪并返回内容区尺寸（描边/光环两套诊断共用）。 */
+async function waitForDiagnosticWindow(
+  window: BrowserWindow,
+  label: string,
+): Promise<{ width: number; height: number; diagnostics: ModelDiagnostics } | null> {
+  const diagnostics = await waitFor(
+    window,
+    MODEL_LOAD_TIMEOUT_MS,
+    (d) => d !== null && (d.ready || (!d.loading && d.error !== null)),
+  );
+  if (!diagnostics?.ready) {
+    logWarn('selftest', `${label}：模型未就绪`, { error: diagnostics?.error ?? null });
+    return null;
+  }
+  await sleep(1200);
+  const content = window.getContentBounds();
+  return { width: content.width, height: content.height, diagnostics };
+}
+
+/** 诊断：骨骼世界坐标 → 内容区 CSS 坐标（原点左上）。 */
+async function boneCssPoint(
+  window: BrowserWindow,
+  bone: string | null,
+  width: number,
+  height: number,
+): Promise<{ x: number; y: number } | null> {
+  if (!bone) return null;
+  const world = (await window.webContents.executeJavaScript(
+    `window.diagnostics.boneWorld(${JSON.stringify(bone)})`,
+    true,
+  )) as { x: number; y: number; z: number } | null;
+  if (!world) return null;
+  return { x: width / 2 + world.x, y: height / 2 - world.y };
+}
+
+/** 诊断：按名字挑骨骼（`listBones()` 只返回 humanoid 映射表里的 21 根）。 */
+async function pickBoneNames(window: BrowserWindow): Promise<(target: string) => string | null> {
+  const bones = (await window.webContents.executeJavaScript(
+    'window.diagnostics.listBones()',
+    true,
+  )) as string[];
+  return (target: string) =>
+    bones.find((name) => name.toLowerCase() === target) ??
+    bones.find((name) => name.toLowerCase().includes(target)) ??
+    null;
+}
+
+/**
+ * 姿态指纹：把整窗缩到 16×16 的灰度缩略图。
+ *
+ * 用途（ADR 0038）：描边/光环的 A/B 需要"同一姿态"的两帧，而模型一直在呼吸、眨眼。
+ * 只比"脸部亮度"会漏掉整体平移，这里直接比缩略图：16×16 每格平均了 ~50×90 个像素，
+ * 描边那几条 1px 的线在格内几乎被平均掉，而整体位移 2px 会让每一格都变——
+ * 于是"缩略图差最小的一对"就是姿态最接近的一对。
+ */
+function poseSignature(image: NativeImage): number[] {
+  try {
+    const small = image.resize({ width: 16, height: 16, quality: 'good' });
+    const bitmap = small.toBitmap();
+    const values: number[] = [];
+    for (let i = 0; i + 3 < bitmap.length; i += 4) {
+      // Windows 上 toBitmap() 是 BGRA
+      values.push(0.299 * bitmap[i + 2]! + 0.587 * bitmap[i + 1]! + 0.114 * bitmap[i]!);
+    }
+    return values;
+  } catch {
+    return [];
+  }
+}
+
+function signatureDelta(a: readonly number[], b: readonly number[]): number {
+  if (a.length === 0 || a.length !== b.length) return Number.POSITIVE_INFINITY;
+  let sum = 0;
+  for (let i = 0; i < a.length; i += 1) sum += Math.abs(a[i]! - b[i]!);
+  return sum / a.length;
+}
+
+function boxAroundPoint(
+  point: { x: number; y: number } | null,
+  size: number,
+  width: number,
+  height: number,
+): Rect | null {
+  if (!point) return null;
+  const x = Math.max(0, Math.min(width - 1, Math.round(point.x - size / 2)));
+  const y = Math.max(0, Math.min(height - 1, Math.round(point.y - size / 2)));
+  return {
+    x,
+    y,
+    width: Math.max(1, Math.min(width - x, size)),
+    height: Math.max(1, Math.min(height - y, size)),
+  };
+}
+
+/**
+ * 阶段 16 专用诊断：`PET_OUTLINE_DIAG=1` 时只跑这一套（ADR 0038）。
+ *
+ * 同一个姿态、同一相机，唯一变量是"描边壳 visible"：
+ *   - `outline-00-off.png` / `outline-01-on.png`（整窗）
+ *   - `outline-{off,on}-{head,coat,hand}.png`（局部，能数清线宽）
+ *   - 每个区域统计"暗像素占比"：描边会在轮廓处增加一圈暗像素，这是最直接的量化信号。
+ *
+ * 与 Toon 诊断一样连拍多对、取**脸部统计最接近**的一对，避免眨眼/呼吸造成姿态差。
+ */
+async function runOutlineDiagnostics(window: BrowserWindow): Promise<void> {
+  const ready = await waitForDiagnosticWindow(window, '描边诊断');
+  if (!ready) {
+    app.exit(1);
+    return;
+  }
+  const { width, height } = ready;
+  const outputDir = path.join(app.getAppPath(), 'dist', 'diagnostics');
+  const selftestDir = path.join(app.getAppPath(), 'dist', 'selftest');
+  await mkdir(outputDir, { recursive: true });
+  await mkdir(selftestDir, { recursive: true });
+
+  const outline = JSON.parse(
+    (await window.webContents.executeJavaScript(
+      'JSON.stringify(window.petModel.getDiagnostics().outline)',
+      true,
+    )) as string,
+  ) as Record<string, unknown>;
+  const materials = JSON.parse(
+    (await window.webContents.executeJavaScript(
+      'JSON.stringify(window.diagnostics.inspectMaterials())',
+      true,
+    )) as string,
+  ) as Array<Record<string, unknown>>;
+
+  const pick = await pickBoneNames(window);
+  const head = await boneCssPoint(window, pick('bip001_head'), width, height);
+  const handL = await boneCssPoint(window, pick('bip001_l_hand'), width, height);
+  const probe = ready.diagnostics.probePoints;
+  const coatCenter = probe.body ? { x: probe.body.x, y: probe.body.y - height * 0.12 } : null;
+
+  const regions: Array<{ key: string; rect: Rect }> = [
+    { key: 'all', rect: { x: 0, y: 0, width, height } },
+  ];
+  for (const [key, rect] of [
+    ['head', boxAroundPoint(head ?? probe.head, 200, width, height)],
+    ['hair', boxAroundPoint(head ? { x: head.x, y: head.y + 40 } : null, 170, width, height)],
+    ['coat', boxAroundPoint(coatCenter, 180, width, height)],
+    ['face', boxAroundPoint(head ?? probe.head, 72, width, height)],
+    ['hand', boxAroundPoint(handL, 90, width, height)],
+  ] as Array<[string, Rect | null]>) {
+    if (rect) regions.push({ key, rect });
+  }
+
+  const capture = async (): Promise<ToonCapture> => {
+    const image = await captureEvidence(window);
+    return {
+      image,
+      regions: regions.map((region) => ({
+        key: region.key,
+        rect: region.rect,
+        stats: regionColorStats(image, region.rect, width),
+      })),
+    };
+  };
+
+  let best: { off: ToonCapture; on: ToonCapture; poseDelta: number; attempt: number } | null = null;
+  const attempts: Array<{ attempt: number; poseDelta: number }> = [];
+  const MAX_ATTEMPTS = 6;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    await window.webContents.executeJavaScript('window.diagnostics.setOutline(false)', true);
+    await sleep(60);
+    const off = await capture();
+    await window.webContents.executeJavaScript('window.diagnostics.setOutline(true)', true);
+    await sleep(60);
+    const on = await capture();
+
+    // 姿态对齐用 16×16 缩略图差（描边那几条 1px 线在缩略图里几乎被平均掉，位移不会）
+    const poseDelta = signatureDelta(poseSignature(off.image), poseSignature(on.image));
+    attempts.push({ attempt, poseDelta: Math.round(poseDelta * 100) / 100 });
+    if (!best || poseDelta < best.poseDelta) best = { off, on, poseDelta, attempt };
+    if (poseDelta < 0.6) break;
+  }
+
+  const chosen = best!;
+  const offPng = path.join(selftestDir, 'outline-00-off.png');
+  const onPng = path.join(selftestDir, 'outline-01-on.png');
+  await writeFile(offPng, await chosen.off.image.toPNG());
+  await writeFile(onPng, await chosen.on.image.toPNG());
+
+  const samplesFor = async (captureValue: ToonCapture, phase: 'off' | 'on'): Promise<ToonRegionSample[]> => {
+    const samples: ToonRegionSample[] = [];
+    for (const region of captureValue.regions) {
+      samples.push({
+        key: region.key,
+        rect: region.rect,
+        stats: region.stats,
+        crop: await saveCrop(
+          captureValue.image,
+          region.rect,
+          width,
+          'selftest',
+          `outline-${phase}-${region.key}.png`,
+        ),
+      });
+    }
+    return samples;
+  };
+
+  const offSamples = await samplesFor(chosen.off, 'off');
+  const onSamples = await samplesFor(chosen.on, 'on');
+  const delta = (key: string): Record<string, unknown> | null => {
+    const left = offSamples.find((sample) => sample.key === key)?.stats ?? null;
+    const right = onSamples.find((sample) => sample.key === key)?.stats ?? null;
+    if (!left || !right) return null;
+    return {
+      lumaOff: left.luma,
+      lumaOn: right.luma,
+      lumaDelta: Math.round((right.luma - left.luma) * 10) / 10,
+      darkRatioOff: left.darkRatio,
+      darkRatioOn: right.darkRatio,
+      /** 描边增加的暗像素占比（轮廓线就是暗像素） */
+      darkDelta: Math.round((right.darkRatio - left.darkRatio) * 10000) / 10000,
+      stdDevOff: left.lumaStdDev,
+      stdDevOn: right.lumaStdDev,
+      pixels: left.pixels,
+    };
+  };
+
+  const outlineAfter = JSON.parse(
+    (await window.webContents.executeJavaScript(
+      'JSON.stringify(window.petModel.getDiagnostics().outline)',
+      true,
+    )) as string,
+  ) as Record<string, unknown>;
+  // 性能口径：draw call / 三角形数 / 帧时间 EMA，各采一次（开、关描边）
+  const readRender = async (): Promise<Record<string, unknown>> =>
+    JSON.parse(
+      (await window.webContents.executeJavaScript(
+        'JSON.stringify(window.petModel.getDiagnostics().render)',
+        true,
+      )) as string,
+    ) as Record<string, unknown>;
+  await window.webContents.executeJavaScript('window.diagnostics.setOutline(false)', true);
+  await sleep(300);
+  const perfOff = await readRender();
+  await window.webContents.executeJavaScript('window.diagnostics.setOutline(true)', true);
+  await sleep(300);
+  const perfOn = await readRender();
+
+  const summary = {
+    at: new Date().toISOString(),
+    content: { width, height },
+    outline,
+    outlineAfter,
+    materials,
+    pairSelection: {
+      maxAttempts: MAX_ATTEMPTS,
+      attempts,
+      pickedAttempt: chosen.attempt,
+      poseDelta: Math.round(chosen.poseDelta * 100) / 100,
+    },    perf: { off: perfOff, on: perfOn },
+    off: { png: path.relative(app.getAppPath(), offPng), regions: offSamples },
+    on: { png: path.relative(app.getAppPath(), onPng), regions: onSamples },
+    deltas: Object.fromEntries(regions.map((region) => [region.key, delta(region.key)])),
+  };
+  await writeFile(
+    path.join(outputDir, 'outline-comparison.json'),
+    `${JSON.stringify(summary, null, 2)}\n`,
+    'utf8',
+  );
+  logInfo('selftest', '描边诊断：汇总', {
+    json: 'dist/diagnostics/outline-comparison.json',
+    meshes: outlineAfter.meshes ?? null,
+    pair: summary.pairSelection,
+    deltas: summary.deltas,
+  });
+}
+
+/**
+ * 阶段 16 专用诊断：`PET_HALO_DIAG=1` 时只跑这一套（ADR 0038 任务二）。
+ *
+ * 把光环临时换成 `MeshToonMaterial`，同姿态拍两张：
+ *   `halo-00-basic.png`（全亮 MeshBasicMaterial）/ `halo-01-toon.png`（吃光）。
+ * 结论只看一件事：吃光后光环会不会变成"脏脏的铁丝网"。
+ */
+async function runHaloDiagnostics(window: BrowserWindow): Promise<void> {
+  const ready = await waitForDiagnosticWindow(window, '光环诊断');
+  if (!ready) {
+    app.exit(1);
+    return;
+  }
+  const { width, height } = ready;
+  const outputDir = path.join(app.getAppPath(), 'dist', 'diagnostics');
+  const selftestDir = path.join(app.getAppPath(), 'dist', 'selftest');
+  await mkdir(outputDir, { recursive: true });
+  await mkdir(selftestDir, { recursive: true });
+
+  const pick = await pickBoneNames(window);
+  const head = await boneCssPoint(window, pick('bip001_head'), width, height);
+  const probe = ready.diagnostics.probePoints;
+  // 光环浮在头顶上方：以头部为基准往上取一块
+  const haloRect =
+    boxAroundPoint(head ? { x: head.x, y: head.y - 120 } : null, 260, width, height) ?? {
+      x: 0,
+      y: 0,
+      width,
+      height,
+    };
+
+  const capture = async (): Promise<{ image: NativeImage; stats: RegionColorStats | null }> => {
+    const image = await captureEvidence(window);
+    return { image, stats: regionColorStats(image, haloRect, width) };
+  };
+
+  let best: {
+    basic: { image: NativeImage; stats: RegionColorStats | null };
+    toon: { image: NativeImage; stats: RegionColorStats | null };
+    delta: number;
+    attempt: number;
+  } | null = null;
+  const attempts: Array<{ attempt: number; poseDelta: number }> = [];
+  const MAX_ATTEMPTS = 6;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    await window.webContents.executeJavaScript('window.diagnostics.setHaloToon(false)', true);
+    await sleep(60);
+    const basic = await capture();
+    await window.webContents.executeJavaScript('window.diagnostics.setHaloToon(true)', true);
+    await sleep(60);
+    const toon = await capture();
+
+    const delta = signatureDelta(poseSignature(basic.image), poseSignature(toon.image));
+    attempts.push({ attempt, poseDelta: Math.round(delta * 100) / 100 });
+    if (!best || delta < best.delta) best = { basic, toon, delta, attempt };
+    if (delta < 0.6) break;
+  }
+
+  const chosen = best!;
+  const basicPng = path.join(selftestDir, 'halo-00-basic.png');
+  const toonPng = path.join(selftestDir, 'halo-01-toon.png');
+  await writeFile(basicPng, await chosen.basic.image.toPNG());
+  await writeFile(toonPng, await chosen.toon.image.toPNG());
+  const basicCrop = await saveCrop(chosen.basic.image, haloRect, width, 'selftest', 'halo-00-basic-crop.png');
+  const toonCrop = await saveCrop(chosen.toon.image, haloRect, width, 'selftest', 'halo-01-toon-crop.png');
+
+  const halo = JSON.parse(
+    (await window.webContents.executeJavaScript(
+      'JSON.stringify(window.diagnostics.setHaloToon(true))',
+      true,
+    )) as string,
+  ) as Record<string, unknown>;
+
+  const summary = {
+    at: new Date().toISOString(),
+    content: { width, height },
+    haloMaterialSwap: halo,
+    haloRect,
+    pairSelection: { maxAttempts: MAX_ATTEMPTS, attempts, pickedAttempt: chosen.attempt },
+    basic: {
+      png: path.relative(app.getAppPath(), basicPng),
+      crop: basicCrop,
+      stats: chosen.basic.stats,
+    },
+    toon: {
+      png: path.relative(app.getAppPath(), toonPng),
+      crop: toonCrop,
+      stats: chosen.toon.stats,
+    },
+  };
+  await writeFile(
+    path.join(outputDir, 'halo-comparison.json'),
+    `${JSON.stringify(summary, null, 2)}\n`,
+    'utf8',
+  );
+  logInfo('selftest', '光环诊断：汇总', {
+    json: 'dist/diagnostics/halo-comparison.json',
+    swap: halo,
+    basic: chosen.basic.stats,
+    toon: chosen.toon.stats,
+  });
+}
+
 export async function runSelfTestIfRequested(): Promise<void> {
   if (process.env.PET_SELFTEST !== '1') return;
 
@@ -2032,6 +2421,20 @@ export async function runSelfTestIfRequested(): Promise<void> {
   // 全局光照 / Toon 对照诊断（ADR 0037）：`PET_TOON_DIAG=1` 时只跑这一套，落 before/after 截图 + JSON 后退出。
   if (process.env.PET_TOON_DIAG === '1') {
     await runToonDiagnostics(window);
+    app.exit(0);
+    return;
+  }
+
+  // 描边对照诊断（ADR 0038）：`PET_OUTLINE_DIAG=1` 时只跑这一套。
+  if (process.env.PET_OUTLINE_DIAG === '1') {
+    await runOutlineDiagnostics(window);
+    app.exit(0);
+    return;
+  }
+
+  // 光环受光对照诊断（ADR 0038 任务二）：`PET_HALO_DIAG=1` 时只跑这一套。
+  if (process.env.PET_HALO_DIAG === '1') {
+    await runHaloDiagnostics(window);
     app.exit(0);
     return;
   }
@@ -2140,6 +2543,50 @@ export async function runSelfTestIfRequested(): Promise<void> {
       toon.ambient + toon.directional > Math.PI * 0.98 &&
       toon.ambient + toon.directional < Math.PI * 1.02,
     toon ? { ambient: toon.ambient, directional: toon.directional } : null,
+  );
+
+  // ADR 0038：背面法描边的回归断言（结构级：几何/骨骼共享、范围、参数）
+  const outline = diagnostics?.outline ?? null;
+  const outlineSources = outline?.sources ?? [];
+  const outlineMeshes = outline?.meshes ?? [];
+  check(
+    '描边：身体/头发/脸三块已加描边（ADR 0038）',
+    outline !== null &&
+      outline.enabled === true &&
+      outlineMeshes.length === 3 &&
+      outlineSources.length === 3,
+    outline ? { width: outline.width, sources: outlineSources } : null,
+  );
+  check(
+    '描边：眼睛嘴/眉毛/光环/配件不描边（只输出给 Body/Hair/Face）',
+    outline !== null &&
+      outlineMeshes.every((mesh) => /(?:^|_)(body|hair|face)$/i.test(mesh.source.replace(/_\d+$/, ''))) &&
+      !outlineSources.some((source) => /eyemouth|eyebrow|halo|weapon|prop|brush/i.test(source)),
+    outlineSources,
+  );
+  check(
+    '描边：共享几何与骨骼（描边壳随动画同步，不复制顶点）',
+    outline !== null &&
+      outlineMeshes.every((mesh) => mesh.sharedGeometry === true && mesh.skinned === true),
+    outlineMeshes,
+  );
+  check(
+    '描边：宽度是屏幕像素、颜色为深褐（不用纯黑）',
+    outline !== null &&
+      outline.width > 0 &&
+      outline.width <= 4 &&
+      outline.hairWidth > 0 &&
+      outline.hairWidth < outline.width &&
+      outline.color.toLowerCase() === '#2a1b1a' &&
+      outline.depthBias >= 0,
+    outline
+      ? { width: outline.width, hairWidth: outline.hairWidth, color: outline.color, depthBias: outline.depthBias }
+      : null,
+  );
+  check(
+    '描边：世界矩阵与源网格逐元素一致（不穿模、不滞后，ADR 0038）',
+    outline !== null && outline.tracked === true && outline.matrixDelta === 0,
+    outline ? { tracked: outline.tracked, matrixDelta: outline.matrixDelta } : null,
   );
 
   // ------------------------------------------------------------------
