@@ -1,6 +1,6 @@
 {
   "name": "aa3dpet",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Windows 11 3D desktop pet: transparent always-on-top window, 128x72 alpha mask hit testing, zero metered external calls.",
   "main": "dist/main/main.js",

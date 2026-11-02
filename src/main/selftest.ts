@@ -2241,6 +2241,49 @@ async function runOutlineDiagnostics(window: BrowserWindow): Promise<void> {
   await window.webContents.executeJavaScript('window.diagnostics.setOutline(true)', true);
   await sleep(300);
   const perfOn = await readRender();
+  // 运动中的贴附证据：拖拽把整身换成"被拎着"的垂姿（骨骼大范围变形），
+  // 连拍两帧看描边有没有跟住；再补一张 happy_hop 的落点。
+  const motionShots: string[] = [];
+  await window.webContents.executeJavaScript(
+    "window.petRender.handleEvent({ name: 'drag_started', payload: { x: 200, y: 300 } })",
+    true,
+  );
+  await sleep(420);
+  motionShots.push(
+    (await saveCrop(
+      await captureEvidence(window),
+      { x: 0, y: 0, width, height },
+      width,
+      'selftest',
+      'outline-02-drag-a.png',
+    )) ?? '',
+  );
+  await sleep(160);
+  motionShots.push(
+    (await saveCrop(
+      await captureEvidence(window),
+      { x: 0, y: 0, width, height },
+      width,
+      'selftest',
+      'outline-03-drag-b.png',
+    )) ?? '',
+  );
+  await window.webContents.executeJavaScript(
+    "window.petRender.handleEvent({ name: 'drag_released', payload: { x: 200, y: 300, vx: 0, vy: 0 } })",
+    true,
+  );
+  await sleep(120);
+  await window.webContents.executeJavaScript("window.petRender.handleIntent('happy_hop')", true);
+  await sleep(260);
+  motionShots.push(
+    (await saveCrop(
+      await captureEvidence(window),
+      { x: 0, y: 0, width, height },
+      width,
+      'selftest',
+      'outline-04-hop.png',
+    )) ?? '',
+  );
 
   const summary = {
     at: new Date().toISOString(),
@@ -2254,6 +2297,7 @@ async function runOutlineDiagnostics(window: BrowserWindow): Promise<void> {
       pickedAttempt: chosen.attempt,
       poseDelta: Math.round(chosen.poseDelta * 100) / 100,
     },    perf: { off: perfOff, on: perfOn },
+    motionShots,
     off: { png: path.relative(app.getAppPath(), offPng), regions: offSamples },
     on: { png: path.relative(app.getAppPath(), onPng), regions: onSamples },
     deltas: Object.fromEntries(regions.map((region) => [region.key, delta(region.key)])),
