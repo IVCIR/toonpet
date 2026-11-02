@@ -48,6 +48,33 @@ window.petModel = {
   getDiagnostics: () => module.getDiagnostics(),
 };
 
+/**
+ * 骨骼轴向标定（ADR 0035 D5，仅开发/自检用；不属于 §7.3，也不跨进程）：
+ *
+ *   diagnostics.listBones()
+ *   diagnostics.setBone('Bip001_Spine', 0, 0.2, 0)   // yaw, pitch, roll
+ *   diagnostics.clear()
+ *   diagnostics.boneWorld('Bip001_L_Hand')          // 看手往哪边动
+ *
+ * 约定：pitch 绕世界 X、roll 绕世界 Z、yaw 绕世界 Y（BoneArbiter 会转到父空间）。
+ */
+window.diagnostics = {
+  listBones: () => module.listBones(),
+  setBone: (name: string, yaw: number, pitch: number, roll: number) =>
+    module.setDebugBoneOffset(name, yaw, pitch, roll),
+  clear: () => module.clearDebugBoneOffsets(),
+  boneWorld: (name: string) => module.getBoneWorld(name),
+  // 阶段 14：手部发白诊断（只读 + 临时换材质；不改变生产默认路径）
+  inspectMaterials: () => module.inspectMaterials(),
+  tintSkin: (scope) => module.tintSkinVertices(scope),
+  shadeSkin: (options) => module.shadeSkinVertices(options),
+  testHandMaterial: (color) => module.testHandMaterial(color),
+  setShading: (mode) => module.setDiagnosticShading(mode),
+  setSkinBake: (enabled) => module.setSkinBake(enabled),
+  resetMaterials: () => module.resetMaterialDiagnostics(),
+  handScreenPoints: () => module.handScreenPoints(),
+};
+
 // --- 字幕气泡（§8.3：TTS/LLM 不可用时的纯文本降级；§3.2 R-1 允许的唯一 DOM） ---
 // 时序不在这一层决定：`intent_resolved` 只登记，`speech_started` 才显示（ADR 0021）。
 const subtitle = createSubtitle();
@@ -180,6 +207,8 @@ function reportPointer(phase: 'down' | 'up', event: PointerEvent): void {
 window.addEventListener('pointerdown', (event) => {
   if (ignoreTrustedPointer && event.isTrusted) return;
   if (!event.isPrimary || event.button !== 0) return;
+  // ADR 0035 D1：抓取点事实留在渲染进程，不跨 IPC；drag_started 到达时消费。
+  module.noteGrabPoint(event.clientX, event.clientY, performance.now());
   // 拖到屏幕外时窗口会被 D-7 钳制停住，指针可能离开窗口；
   // 尽量用指针捕获把抬起事件留在本页（合成事件没有活动指针时会抛错，忽略即可）。
   try {

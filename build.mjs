@@ -132,6 +132,34 @@ const bundles = [
     target: 'node20',
   },
   {
+    entry: 'src/renderer/render/drag-motion.test.ts',
+    outfile: 'dist/tests/drag-motion.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    entry: 'src/renderer/render/landing.test.ts',
+    outfile: 'dist/tests/landing.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    entry: 'src/renderer/render/startle.test.ts',
+    outfile: 'dist/tests/startle.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    entry: 'src/main/shell/approach.test.ts',
+    outfile: 'dist/tests/approach.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
     entry: 'src/main/shell/drag-gesture.test.ts',
     outfile: 'dist/tests/drag-gesture.test.mjs',
     platform: 'node',
@@ -319,6 +347,14 @@ const bundles = [
     // ADR 0033 D2.2：`model_ready` 的一次性闩锁（事件可能早于 runtime 装配）
     entry: 'src/main/model-ready.test.ts',
     outfile: 'dist/tests/model-ready.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0036：手/小臂肤色烘焙（顶点色 + 法线明暗）
+    entry: 'src/renderer/render/skin-shading.test.ts',
+    outfile: 'dist/tests/skin-shading.test.mjs',
     platform: 'node',
     format: 'esm',
     target: 'node20',

@@ -86,6 +86,9 @@ interface ModelDiagnostics {
   /** ADR 0028：吸附与坐姿 */
   sit?: {
     sitting: boolean;
+    /** ADR 0034：false = 接近阶段，true = 已落座 */
+    arrived?: boolean;
+    approach?: { mode: 'walk' | 'leap'; durationMs: number; progress: number } | null;
     edge: 'top' | 'bottom' | null;
     procedural: boolean;
     clip: string | null;
@@ -97,6 +100,19 @@ interface ModelDiagnostics {
     headQuat?: [number, number, number, number] | null;
     headWorld?: { x: number; y: number } | null;
     headBase?: { baseFrom: string | null; yaw: number; pitch: number; roll: number } | null;
+  };
+  /** ADR 0035：拖拽抓取点/受迫摆/落地分级 */
+  drag?: {
+    phase: 'idle' | 'dragged' | 'settling';
+    band: 'head' | 'body' | 'foot' | null;
+    pivot: { x: number; y: number };
+    angle: number;
+    omega: number;
+    gain: number;
+    supportAcceleration: { x: number; y: number };
+    landingImpact: number | null;
+    landingSquash?: number;
+    startle: string | null;
   };
   facial?: {
     emotion: string;
@@ -133,6 +149,8 @@ interface ModelDiagnostics {
   };
   pat: { active: boolean; weight: number; allowMouthChange: boolean; mouthFrame: number | null };
   speech: { frame: number; driven: boolean };
+  /** ADR 0036：手/小臂顶点烘焙光照（内部诊断） */
+  skin: { meshes: number; vertices: number; minShade: number; maxShade: number; meanColor: [number, number, number] } | null;
   probePoints: { head: ProbePoint | null; body: ProbePoint | null };
 }
 
@@ -1316,6 +1334,508 @@ async function runSpeechSuite(window: BrowserWindow, checks: AcceptanceCheck[]):
   app.exit(failed.length === 0 ? 0 : 1);
 }
 
+async function dispatchPointerFor(
+  window: BrowserWindow,
+  phase: 'down' | 'up',
+  x: number,
+  y: number,
+): Promise<void> {
+  const type = phase === 'down' ? 'pointerdown' : 'pointerup';
+  await window.webContents.executeJavaScript(
+    `(() => {
+      const event = new PointerEvent('${type}', {
+        bubbles: true, cancelable: true, composed: true,
+        clientX: ${String(x)}, clientY: ${String(y)},
+        pointerId: 1, pointerType: 'mouse', isPrimary: true,
+        button: 0, buttons: ${phase === 'down' ? '1' : '0'},
+      });
+      window.dispatchEvent(event);
+    })()`,
+    true,
+  );
+}
+
+/**
+ * 抓取部位标定（ADR 0035 D1/D2）：分别从头部/身体/脚部按下去拖，落三张截图，
+ * 记录抓取带、支点与摆角，人眼确认"垂/拎/挣扎"三种姿态。
+ *
+ * 运行：`$env:PET_GRAB_CALIBRATE='1'; $env:PET_SELFTEST='1'; node scripts/start.mjs --selftest`
+ */
+async function runGrabCalibration(window: BrowserWindow): Promise<void> {
+  const ready = await waitFor(
+    window,
+    MODEL_LOAD_TIMEOUT_MS,
+    (diagnostics) => diagnostics !== null && diagnostics.ready === true,
+  );
+  if (!ready?.ready) {
+    console.error('[grab-calibrate] 模型未就绪');
+    return;
+  }
+  await window.webContents.executeJavaScript('window.petRender.setWalkInterval(600000, 600001)', true);
+  shell.releaseSnap();
+  await sleep(500);
+
+  const content = window.getContentBounds();
+  const points = ready.probePoints;
+  const footCandidate = (await window.webContents.executeJavaScript(
+    `(() => {
+      const m = window.petMask;
+      const w = window.innerWidth, h = window.innerHeight;
+      for (let yy = 0.98; yy >= 0.84; yy -= 0.01) {
+        for (let xx = 0.30; xx <= 0.70; xx += 0.02) {
+          const x = w * xx, y = h * yy;
+          if (m.probe(x, y).hit) return { x, y };
+        }
+      }
+      return null;
+    })()`,
+    true,
+  )) as { x: number; y: number } | null;
+  const candidates: Array<{ band: 'head' | 'body' | 'foot'; x: number; y: number }> = [
+    { band: 'head', x: points?.head?.x ?? content.width / 2, y: points?.head?.y ?? content.height * 0.28 },
+    { band: 'body', x: points?.body?.x ?? content.width / 2, y: points?.body?.y ?? content.height * 0.72 },
+    {
+      band: 'foot',
+      x: footCandidate?.x ?? content.width / 2,
+      y: footCandidate?.y ?? content.height * 0.94,
+    },
+  ];
+
+  for (const item of candidates) {
+    const current = window.getContentBounds();
+    pushScriptedCursor(current.x + item.x, current.y + item.y);
+    await sleep(360);
+    const hit = (await window.webContents.executeJavaScript(
+      `window.petMask.probe(${item.x}, ${item.y}).hit`,
+      true,
+    )) as boolean;
+    if (!hit) {
+      logWarn('selftest', 'grab-calibrate: 候选点未命中，跳过', item);
+      continue;
+    }
+    await dispatchPointerFor(window, 'down', item.x, item.y);
+    await sleep(40);
+    pushScriptedCursor(current.x + item.x + 60, current.y + item.y - 24);
+    await sleep(380);
+    const pngPath = await captureScreenshot(window, `grab-${item.band}.png`, `grab-${item.band}`);
+    const diag = await readDiagnostics(window);
+    logInfo('selftest', 'grab-calibrate: case', {
+      expected: item.band,
+      point: { x: item.x, y: item.y },
+      band: diag?.drag?.band ?? null,
+      pivot: diag?.drag?.pivot ?? null,
+      angle: diag?.drag?.angle ?? null,
+      omega: diag?.drag?.omega ?? null,
+      pngPath,
+    });
+    await dispatchPointerFor(window, 'up', item.x, item.y);
+    await waitFor(window, 4000, (diagnostics) => diagnostics?.hfsm.physics === null);
+    await sleep(700);
+  }
+  resetScriptedCursor();
+  logInfo('selftest', 'grab-calibrate: done', { output: 'dist/selftest/grab-*.png' });
+}
+
+/**
+ * 落地冲击分级标定（ADR 0035 D4）：从 10px / 300px 两处回弹，落两张"落地帧"截图，
+ * 记录 impact 与 landingSquash，肉眼对比压扁幅度与脊柱前倾。
+ *
+ * 运行：`$env:PET_LANDING_CALIBRATE='1'; $env:PET_SELFTEST='1'; node scripts/start.mjs --selftest`
+ */
+async function runLandingCalibration(window: BrowserWindow): Promise<void> {
+  const ready = await waitFor(
+    window,
+    MODEL_LOAD_TIMEOUT_MS,
+    (diagnostics) => diagnostics !== null && diagnostics.ready === true,
+  );
+  if (!ready?.ready) {
+    console.error('[landing-calibrate] 模型未就绪');
+    return;
+  }
+  shell.releaseSnap();
+  await sleep(400);
+
+  for (const heightPx of [10, 300]) {
+    const dropped = shell.debugDropFromHeight(heightPx);
+    logInfo('selftest', 'landing-calibrate: drop', { heightPx, dropped });
+    // 不能用 waitFor（250ms 轮询会错过 300ms 的下蹲）：16ms 紧凑轮询
+    let landed: ModelDiagnostics | null = null;
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      landed = await readDiagnostics(window);
+      const impact = landed?.drag?.landingImpact;
+      if (typeof impact === 'number') break;
+      await sleep(16);
+    }
+    // 吸震峰值在落地后 ~50ms；capturePage 本身约 60ms，直接抓
+    await sleep(20);
+    const immediate = await window.webContents.capturePage();
+    const outputDir = path.join(app.getAppPath(), 'dist', 'selftest');
+    await mkdir(outputDir, { recursive: true });
+    const pngPath = path.join(outputDir, `landing-${heightPx}px.png`);
+    await writeFile(pngPath, await immediate.toPNG());
+    const atPeak = await readDiagnostics(window);
+    logInfo('selftest', 'landing-calibrate: frame', {
+      heightPx,
+      impact: landed?.drag?.landingImpact ?? null,
+      squash: atPeak?.drag?.landingSquash ?? null,
+      pngPath,
+    });
+    await waitFor(window, 4000, (diagnostics) => diagnostics?.hfsm.physics === null);
+    await sleep(600);
+  }
+  logInfo('selftest', 'landing-calibrate: done', { output: 'dist/selftest/landing-*.png' });
+}
+
+/**
+ * 骨骼轴向标定（ADR 0035 D5）：只通过渲染页的 `window.diagnostics` 施加偏移，
+ * 每个 case 落一张截图 + 记录"探针骨骼的世界坐标变化方向"。
+ *
+ * 运行：`$env:PET_CALIBRATE='1'; $env:PET_SELFTEST='1'; node scripts/start.mjs --selftest`
+ */
+async function runBoneCalibration(window: BrowserWindow): Promise<void> {
+  const ready = await waitFor(
+    window,
+    MODEL_LOAD_TIMEOUT_MS,
+    (diagnostics) => diagnostics !== null && diagnostics.ready === true,
+  );
+  if (!ready?.ready) {
+    console.error('[calibrate] 模型未就绪，无法标定骨骼');
+    return;
+  }
+
+  const bones = (await window.webContents.executeJavaScript(
+    'window.diagnostics.listBones()',
+  )) as string[];
+  logInfo('selftest', 'calibrate: bones', { count: bones.length, bones });
+  const pick = (target: string): string | null =>
+    bones.find((name) => name.toLowerCase() === target) ??
+    bones.find((name) => name.toLowerCase().includes(target)) ??
+    null;
+
+  const spine = pick('bip001_spine');
+  const neck = pick('bip001_neck');
+  const armL = pick('bip001_l_upperarm');
+  const armR = pick('bip001_r_upperarm');
+  const handL = pick('bip001_l_hand');
+  const handR = pick('bip001_r_hand');
+  const head = pick('bip001_head');
+
+  const world = async (bone: string | null): Promise<unknown> => {
+    if (!bone) return null;
+    return window.webContents.executeJavaScript(
+      `window.diagnostics.boneWorld(${JSON.stringify(bone)})`,
+    );
+  };
+
+  const thighL = pick('bip001_l_thigh');
+  const calfL = pick('bip001_l_calf');
+  const footL = pick('bip001_l_foot');
+
+  const cases: Array<{
+    name: string;
+    bone: string | null;
+    probe: string | null;
+    yaw: number;
+    pitch: number;
+    roll: number;
+  }> = [
+    { name: 'spine-pitch-plus', bone: spine, probe: head, yaw: 0, pitch: 0.25, roll: 0 },
+    { name: 'spine-pitch-minus', bone: spine, probe: head, yaw: 0, pitch: -0.25, roll: 0 },
+    { name: 'neck-pitch-plus', bone: neck, probe: head, yaw: 0, pitch: 0.25, roll: 0 },
+    { name: 'neck-pitch-minus', bone: neck, probe: head, yaw: 0, pitch: -0.25, roll: 0 },
+    { name: 'upperarm-l-roll-plus', bone: armL, probe: handL, yaw: 0, pitch: 0, roll: 0.5 },
+    { name: 'upperarm-l-roll-minus', bone: armL, probe: handL, yaw: 0, pitch: 0, roll: -0.5 },
+    { name: 'upperarm-r-roll-plus', bone: armR, probe: handR, yaw: 0, pitch: 0, roll: 0.5 },
+    { name: 'upperarm-r-roll-minus', bone: armR, probe: handR, yaw: 0, pitch: 0, roll: -0.5 },
+    { name: 'upperarm-l-pitch-plus', bone: armL, probe: handL, yaw: 0, pitch: 0.5, roll: 0 },
+    { name: 'thigh-l-pitch-plus', bone: thighL, probe: footL, yaw: 0, pitch: 0.3, roll: 0 },
+    { name: 'thigh-l-pitch-minus', bone: thighL, probe: footL, yaw: 0, pitch: -0.3, roll: 0 },
+    { name: 'calf-l-pitch-plus', bone: calfL, probe: footL, yaw: 0, pitch: 0.3, roll: 0 },
+    { name: 'calf-l-pitch-minus', bone: calfL, probe: footL, yaw: 0, pitch: -0.3, roll: 0 },
+  ];
+
+  for (const item of cases) {
+    if (!item.bone) {
+      logWarn('selftest', 'calibrate: 骨骼缺失，跳过', { case: item.name, bone: item.bone });
+      continue;
+    }
+    await window.webContents.executeJavaScript('window.diagnostics.clear()');
+    await sleep(120);
+    const before = await world(item.probe);
+    const applied = await window.webContents.executeJavaScript(
+      `window.diagnostics.setBone(${JSON.stringify(item.bone)}, ${item.yaw}, ${item.pitch}, ${item.roll})`,
+    );
+    await sleep(320);
+    const after = await world(item.probe);
+    const pngPath = await captureScreenshot(window, `calib-${item.name}.png`, 'calibration');
+    logInfo('selftest', 'calibrate: case', {
+      case: item.name,
+      bone: item.bone,
+      applied,
+      offset: { yaw: item.yaw, pitch: item.pitch, roll: item.roll },
+      probe: item.probe,
+      before,
+      after,
+      pngPath,
+    });
+  }
+  await window.webContents.executeJavaScript('window.diagnostics.clear()');
+  logInfo('selftest', 'calibrate: done', { output: 'dist/selftest/calib-*.png' });
+}
+
+interface RegionColorStats {
+  mean: [number, number, number];
+  /** 红色像素占比（r>140 且 g/b < 90）：验证"手被染红" */
+  redRatio: number;
+  /** 近白像素占比（三通道都 > 235）：验证"手看起来像白板" */
+  whiteRatio: number;
+  pixels: number;
+}
+
+/** 从一个 NativeImage 的 CSS 矩形区域取像素统计（capturePage 是物理像素，先按 DPR 缩放）。 */
+function regionColorStats(
+  image: NativeImage,
+  rectCss: Rect,
+  contentWidth: number,
+): RegionColorStats | null {
+  const size = image.getSize();
+  if (size.width <= 0 || size.height <= 0 || contentWidth <= 0) return null;
+  const scale = size.width / contentWidth;
+  const x = Math.max(0, Math.min(size.width - 1, Math.round(rectCss.x * scale)));
+  const y = Math.max(0, Math.min(size.height - 1, Math.round(rectCss.y * scale)));
+  const width = Math.max(1, Math.min(size.width - x, Math.round(rectCss.width * scale)));
+  const height = Math.max(1, Math.min(size.height - y, Math.round(rectCss.height * scale)));
+  try {
+    const bitmap = image.crop({ x, y, width, height }).toBitmap();
+    let r = 0;
+    let g = 0;
+    let b = 0;
+    let red = 0;
+    let white = 0;
+    let count = 0;
+    for (let i = 0; i + 3 < bitmap.length; i += 4) {
+      const alpha = bitmap[i + 3]!;
+      if (alpha < 128) continue;
+      const blue = bitmap[i]!;
+      const green = bitmap[i + 1]!;
+      const redValue = bitmap[i + 2]!;
+      r += redValue;
+      g += green;
+      b += blue;
+      if (redValue > 140 && green < 90 && blue < 90) red += 1;
+      if (redValue > 235 && green > 235 && blue > 235) white += 1;
+      count += 1;
+    }
+    if (count === 0) return null;
+    return {
+      mean: [Math.round(r / count), Math.round(g / count), Math.round(b / count)],
+      redRatio: red / count,
+      whiteRatio: white / count,
+      pixels: count,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** 手部诊断截图（不额外 sleep：手在 Idle 里会轻微移动，取样点必须和这一帧对齐）。 */
+async function captureHandEvidence(window: BrowserWindow, fileName: string): Promise<CapturedImage> {
+  const image = await window.webContents.capturePage();
+  const outputDir = path.join(app.getAppPath(), 'dist', 'selftest');
+  await mkdir(outputDir, { recursive: true });
+  const pngPath = path.join(outputDir, fileName);
+  await writeFile(pngPath, await image.toPNG());
+  return { image, pngPath };
+}
+
+/**
+ * 阶段 14 专用诊断：`PET_HAND_DIAG=1` 时只跑这一套。
+ *
+ * 目的不是"断言通过"，而是**把现象量化**：
+ *  1. 枚举 SkinnedMesh / 材质 / map / colorSpace / 手部顶点数；
+ *  2. 手部 UV 采到的贴图颜色；
+ *  3. 只把手部顶点染红 → 证明手在哪块网格上；
+ *  4. 整块 Body 材质染红 → 证明手与衣服/腿共用材质；
+ *  5. 无光照 vs Toon+光照 → 证明"白"是不是缺阴影。
+ */
+async function runHandDiagnostics(window: BrowserWindow): Promise<void> {
+  const diagnostics = await waitFor(
+    window,
+    MODEL_LOAD_TIMEOUT_MS,
+    (d) => d !== null && (d.ready || (!d.loading && d.error !== null)),
+  );
+  if (!diagnostics?.ready) {
+    logWarn('selftest', '手部诊断：模型未就绪', { error: diagnostics?.error ?? null });
+    app.exit(1);
+    return;
+  }
+  await sleep(1200);
+
+  const outputDir = path.join(app.getAppPath(), 'dist', 'diagnostics');
+  await mkdir(outputDir, { recursive: true });
+  const content = window.getContentBounds();
+  const width = content.width;
+  const height = content.height;
+
+  const materials = JSON.parse(
+    (await window.webContents.executeJavaScript(
+      'JSON.stringify(window.diagnostics.inspectMaterials())',
+      true,
+    )) as string,
+  ) as Array<Record<string, unknown>>;
+  logInfo('selftest', '手部诊断：网格与材质', materials);
+
+  interface Point {
+    x: number;
+    y: number;
+  }
+  const points = JSON.parse(
+    (await window.webContents.executeJavaScript(
+      'JSON.stringify(window.diagnostics.handScreenPoints())',
+      true,
+    )) as string,
+  ) as { left: Point | null; right: Point | null };
+
+  const box = (p: Point): Rect => ({
+    x: Math.max(0, p.x - 45),
+    y: Math.max(0, p.y - 45),
+    width: Math.min(90, width - Math.max(0, p.x - 45)),
+    height: Math.min(90, height - Math.max(0, p.y - 45)),
+  });
+
+  const shots: Array<{
+    step: string;
+    file: string;
+    left: RegionColorStats | null;
+    right: RegionColorStats | null;
+  }> = [];
+
+  async function captureStep(step: string, file: string): Promise<void> {
+    const captured = await captureHandEvidence(window, file);
+    const currentPoints = JSON.parse(
+      (await window.webContents.executeJavaScript(
+        'JSON.stringify(window.diagnostics.handScreenPoints())',
+        true,
+      )) as string,
+    ) as { left: Point | null; right: Point | null };
+    shots.push({
+      step,
+      file: path.relative(app.getAppPath(), captured.pngPath),
+      left: currentPoints.left ? regionColorStats(captured.image, box(currentPoints.left), width) : null,
+      right: currentPoints.right ? regionColorStats(captured.image, box(currentPoints.right), width) : null,
+    });
+    logInfo('selftest', '手部诊断：截图', shots[shots.length - 1]);
+  }
+
+  // A/B 对照：同一姿态、同一帧光源下，先关掉烘焙（还原模型原始白色顶点色），再打开。
+  await window.webContents.executeJavaScript('window.diagnostics.setSkinBake(false)', true);
+  await sleep(120);
+  await captureStep('before-bake-white', 'hand-00-before-bake.png');
+  await window.webContents.executeJavaScript('window.diagnostics.setSkinBake(true)', true);
+  await sleep(120);
+  await captureStep('baseline-basic', 'hand-00-baseline.png');
+
+  const tintHand = await window.webContents.executeJavaScript(
+    "JSON.stringify(window.diagnostics.tintSkin('hand'))",
+    true,
+  );
+  await sleep(120);
+  await captureStep('tint-hand-red', 'hand-01-tint-hand.png');
+
+  const tintBoth = await window.webContents.executeJavaScript(
+    "JSON.stringify(window.diagnostics.tintSkin('both'))",
+    true,
+  );
+  await sleep(120);
+  await captureStep('tint-hand-forearm-red', 'hand-02-tint-both.png');
+
+  await window.webContents.executeJavaScript("window.diagnostics.tintSkin('none')", true);
+
+  const shadeSoft = await window.webContents.executeJavaScript(
+    'JSON.stringify(window.diagnostics.shadeSkin({ambient:0.80,diffuse:0.20,light:[-0.35,0.65,0.68],tint:[1,0.95,0.91]}))',
+    true,
+  );
+  await sleep(120);
+  await captureStep('shade-soft', 'hand-03-shade-soft.png');
+
+  const shadeStrong = await window.webContents.executeJavaScript(
+    'JSON.stringify(window.diagnostics.shadeSkin({ambient:0.68,diffuse:0.32,light:[-0.35,0.65,0.68],tint:[1,0.92,0.86]}))',
+    true,
+  );
+  await sleep(120);
+  await captureStep('shade-strong', 'hand-04-shade-strong.png');
+
+  const shadeWarm = await window.webContents.executeJavaScript(
+    'JSON.stringify(window.diagnostics.shadeSkin({ambient:0.78,diffuse:0.22,light:[-0.35,0.65,0.68],tint:[1,0.90,0.85]}))',
+    true,
+  );
+  await sleep(120);
+  await captureStep('shade-warm', 'hand-05-shade-warm.png');
+
+  await window.webContents.executeJavaScript("window.diagnostics.tintSkin('none')", true);
+  const bodyRed = await window.webContents.executeJavaScript(
+    'JSON.stringify(window.diagnostics.testHandMaterial(0xff0000))',
+    true,
+  );
+  await sleep(120);
+  await captureStep('body-material-red', 'hand-06-body-red.png');
+  await window.webContents.executeJavaScript('window.diagnostics.resetMaterials()', true);
+
+  const toonBody = await window.webContents.executeJavaScript(
+    "JSON.stringify(window.diagnostics.setShading('toon-body'))",
+    true,
+  );
+  await sleep(250);
+  await captureStep('toon-body-only', 'hand-07-toon-body.png');
+
+  const toonAll = await window.webContents.executeJavaScript(
+    "JSON.stringify(window.diagnostics.setShading('toon-all'))",
+    true,
+  );
+  await sleep(250);
+  await captureStep('toon-all-materials', 'hand-08-toon-all.png');
+
+  await window.webContents.executeJavaScript("window.diagnostics.setShading('basic')", true);
+  await sleep(200);
+  await captureStep('restored-basic', 'hand-09-restored.png');
+  await window.webContents.executeJavaScript('window.diagnostics.resetMaterials()', true);
+
+  const summary = {
+    at: new Date().toISOString(),
+    content,
+    diagnostics: {
+      modelId: diagnostics.modelId,
+      meshNames: diagnostics.meshNames,
+      hiddenMeshes: diagnostics.hiddenMeshes,
+    },
+    materials,
+    handScreenPoints: points,
+    tintHand: JSON.parse(tintHand as string),
+    tintBoth: JSON.parse(tintBoth as string),
+    shadeSoft: JSON.parse(shadeSoft as string),
+    shadeStrong: JSON.parse(shadeStrong as string),
+    shadeWarm: JSON.parse(shadeWarm as string),
+    bodyMaterialReplacement: JSON.parse(bodyRed as string),
+    toonBody: JSON.parse(toonBody as string),
+    toonAll: JSON.parse(toonAll as string),
+    shots,
+  };
+  await writeFile(
+    path.join(outputDir, 'hand-diagnosis.json'),
+    `${JSON.stringify(summary, null, 2)}\n`,
+    'utf8',
+  );
+  logInfo('selftest', '手部诊断：汇总', {
+    json: 'dist/diagnostics/hand-diagnosis.json',
+    shots: shots.map((shot) => ({
+      step: shot.step,
+      left: shot.left,
+      right: shot.right,
+    })),
+  });
+}
+
 export async function runSelfTestIfRequested(): Promise<void> {
   if (process.env.PET_SELFTEST !== '1') return;
 
@@ -1352,6 +1872,34 @@ export async function runSelfTestIfRequested(): Promise<void> {
   const check = (name: string, pass: boolean, detail?: unknown): void => {
     checks.push({ name, pass, detail });
   };
+
+  // 骨骼轴向标定（ADR 0035 D5）：`PET_CALIBRATE=1` 时只跑这一套，落截图后退出。
+  if (process.env.PET_CALIBRATE === '1') {
+    await runBoneCalibration(window);
+    app.exit(0);
+    return;
+  }
+
+  // 手部发白诊断（阶段 14）：`PET_HAND_DIAG=1` 时只跑这一套，落截图 + JSON 后退出。
+  if (process.env.PET_HAND_DIAG === '1') {
+    await runHandDiagnostics(window);
+    app.exit(0);
+    return;
+  }
+
+  // 落地冲击分级标定（ADR 0035 D4）：`PET_LANDING_CALIBRATE=1` 时只跑这一套。
+  if (process.env.PET_LANDING_CALIBRATE === '1') {
+    await runLandingCalibration(window);
+    app.exit(0);
+    return;
+  }
+
+  // 抓取部位标定（ADR 0035 D1/D2）：`PET_GRAB_CALIBRATE=1` 时只跑这一套。
+  if (process.env.PET_GRAB_CALIBRATE === '1') {
+    await runGrabCalibration(window);
+    app.exit(0);
+    return;
+  }
 
   if (fallbackMode) {
     await runFallbackSuite(window, checks);
@@ -1407,6 +1955,20 @@ export async function runSelfTestIfRequested(): Promise<void> {
       diagnostics?.mouth.atlasLoaded === true &&
       diagnostics?.mouth.calibrated === true,
     diagnostics?.mouth,
+  );
+  // ADR 0036：手部发白修复的回归断言（几何级，不依赖截图里的姿势/背景）
+  const skin = diagnostics?.skin ?? null;
+  check(
+    '肤色：手/小臂已烘焙暖色明暗（不再是纯白板，ADR 0036）',
+    skin !== null &&
+      skin.meshes === 1 &&
+      skin.vertices >= 200 &&
+      skin.minShade >= 0.7 &&
+      skin.maxShade <= 1.0001 &&
+      skin.meanColor[0] < 0.95 &&
+      skin.meanColor[0] > skin.meanColor[1] &&
+      skin.meanColor[1] > skin.meanColor[2],
+    skin,
   );
 
   // ------------------------------------------------------------------
@@ -1773,6 +2335,15 @@ export async function runSelfTestIfRequested(): Promise<void> {
     ),
     dragDiag?.animation?.actions ?? null,
   );
+  check(
+    '拖拽：抓取带与支点已建立（ADR 0035 D1/D2）',
+    dragDiag?.drag?.band !== null &&
+      dragDiag?.drag?.gain !== undefined &&
+      dragDiag.drag.gain > 0.2 &&
+      dragDiag.drag.pivot.x > 0 &&
+      dragDiag.drag.pivot.y > 0,
+    dragDiag?.drag ?? null,
+  );
   await captureScreenshot(window, 'window-drag.png', 'dragged');
 
   // D-6 末速度只看抬手前 ~100ms 的光标采样；截图会停住光标，松手前补两次位移
@@ -1840,6 +2411,11 @@ export async function runSelfTestIfRequested(): Promise<void> {
     '回弹结束：窗口落到工作区地面线（±2px，ADR 0024 D2）',
     Math.abs(groundBounds.y - expectedGroundY) <= 2,
     { y: groundBounds.y, expectedGroundY },
+  );
+  check(
+    '落地：按向下峰值速度分级触发下蹲（impact > 0，ADR 0035 D4）',
+    typeof settledDiag?.drag?.landingImpact === 'number' && settledDiag.drag.landingImpact > 0,
+    settledDiag?.drag ?? null,
   );
 
   await sleep(300);
@@ -2060,6 +2636,15 @@ export async function runSelfTestIfRequested(): Promise<void> {
   shell.releaseSnap();
   await waitFor(window, 3000, (diagnostics) => diagnostics?.hfsm.physics === null);
 
+  // ADR 0034：把桌宠先挪回地面左侧，确保下一步"脚本化前台吸附"真的需要接近，
+  // 否则她可能还站在刚才的窗沿上，距离 ≤8px 会直接落座（观察不到接近阶段）。
+  window.setPosition(
+    display.workArea.x + 100,
+    display.workArea.y + display.workArea.height - contentSize.height,
+    false,
+  );
+  await sleep(160);
+
   // 从这里开始把"前台窗口"指向自检自己造的那扇记事本窗口（PET_SELFTEST=1 才生效）。
   // 传入的是**物理像素**，仍然走真实的 `screenToDipPoint` 换算与真实的吸附控制器。
   pushScriptedForeground(dipRectToPhysical(notepad.getBounds()));
@@ -2072,6 +2657,24 @@ export async function runSelfTestIfRequested(): Promise<void> {
     '吸附：Win32 前台窗口读取可用（auto 模式 / koffi，ADR 0028 D1）',
     snapDiag?.mode === 'foreground',
     snapDiag ?? null,
+  );
+  check(
+    '吸附：先进入接近阶段，不瞬移（ADR 0034 D1/D3）',
+    snapDiag?.approaching === true && snapDiag?.approachProgress !== null,
+    snapDiag ?? null,
+  );
+
+  // ADR 0034：必须等"到达并落座"之后再量几何；physics=sitting 在接近阶段就为真，
+  // 不能再拿它当"已经坐下"的判据。
+  const arrived = await waitFor(
+    window,
+    4000,
+    (diagnostics) => diagnostics?.sit?.arrived === true,
+  );
+  check(
+    '吸附：接近结束后进入落座阶段（sit.arrived=true，ADR 0034 D2）',
+    arrived?.sit?.arrived === true && arrived?.hfsm.physics === 'sitting',
+    arrived?.sit ?? null,
   );
 
   const notepadBounds = notepad.getBounds();
@@ -2092,7 +2695,7 @@ export async function runSelfTestIfRequested(): Promise<void> {
     },
   );
 
-  const seated = await waitFor(window, 3000, (diagnostics) => diagnostics?.hfsm.physics === 'sitting');
+  const seated = arrived;
   check(
     '吸附：render 进入 Physics=sitting（§4.1 新增状态，ADR 0028 D5）',
     seated?.hfsm.physics === 'sitting',
@@ -2116,6 +2719,25 @@ export async function runSelfTestIfRequested(): Promise<void> {
     sitDone?.sit?.done === true &&
       (sitDone?.animation?.current?.name ?? '').includes('pastmemory'),
     { sit: sitDone?.sit ?? null, current: sitDone?.animation?.current ?? null },
+  );
+
+  // ADR 0034 D5：坐姿不锁死上身——视线通道仍在跑（把光标放到左上角，头部 yaw 应变化）
+  const gazeBefore = sitDone?.gaze?.yaw ?? 0;
+  await window.webContents.executeJavaScript(
+    'window.petRender.setCursor(8, 8, performance.now())',
+    true,
+  );
+  await sleep(600);
+  const gazeSitting = await readDiagnostics(window);
+  check(
+    '坐姿：视线仍跟随光标（sitting 不锁死上身，ADR 0034 D5）',
+    gazeSitting?.hfsm.physics === 'sitting' &&
+      Math.abs((gazeSitting?.gaze?.yaw ?? 0) - gazeBefore) > 0.01,
+    { before: gazeBefore, after: gazeSitting?.gaze ?? null },
+  );
+  await window.webContents.executeJavaScript(
+    'window.petRender.setCursor(211, 360, performance.now())',
+    true,
   );
   const sittingShot = await captureScreenshot(window, 'window-sitting.png', 'sitting');
   // 桌面抓取（desktopCapturer）在合成透明置顶窗口时可能拿到稍早的一帧：
@@ -2206,6 +2828,11 @@ export async function runSelfTestIfRequested(): Promise<void> {
       clickedOff?.sit?.sitting === false &&
       shell.snapSnapshot()?.sitting === false,
     { hfsm: clickedOff?.hfsm ?? null, sit: clickedOff?.sit ?? null },
+  );
+  check(
+    '解除：clicked 播放短促惊跳/起身（ADR 0034 D5）',
+    clickedOff?.drag?.startle === 'clicked' || clickedOff?.drag?.startle === 'command',
+    clickedOff?.drag ?? null,
   );
   const clickReleaseLog = lastJsonAfter(await runLogText(), '吸附解除（ADR 0028 D9）');
   check(

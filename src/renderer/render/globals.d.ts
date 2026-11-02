@@ -1,6 +1,13 @@
 import type { PetShellApi } from '../../preload/main';
 import type { RenderModule } from './render-module';
 import type { MaskCapture } from './mask-capture';
+import type {
+  DiagnosticShading,
+  MeshMaterialFacts,
+  ShadingResult,
+  SkinShadingOptions,
+} from './material-diagnostics';
+import type { SkinShadingStats } from './skin-shading';
 import type { SpeechPlayerDiagnostics } from '../voice/speech-player';
 import type { SubtitleCueSnapshot } from '../shell/subtitle-cue';
 
@@ -23,6 +30,44 @@ declare global {
     /** 内部：字幕时序诊断（pending / visible / failsafe；ADR 0021） */
     petSubtitle: {
       getDiagnostics(): SubtitleCueSnapshot;
+    };
+    /**
+     * 内部：骨骼轴向标定（ADR 0035 D5，仅开发/自检用）。
+     * pitch 绕世界 X、roll 绕世界 Z、yaw 绕世界 Y。
+     */
+    diagnostics: {
+      listBones(): string[];
+      setBone(name: string, yaw: number, pitch: number, roll: number): boolean;
+      clear(): void;
+      boneWorld(name: string): { x: number; y: number; z: number } | null;
+      /** 阶段 14：手部发白诊断（只读网格/材质/贴图事实） */
+      inspectMaterials(): MeshMaterialFacts[];
+      /** 阶段 14：只把手/小臂顶点染色（红=手），证明手在哪块网格上 */
+      tintSkin(scope: 'none' | 'hand' | 'both'): {
+        meshes: number;
+        handVertices: number;
+        forearmVertices: number;
+      };
+      /** 阶段 14：把手部法线明暗写进顶点色（不换材质、不加灯） */
+      shadeSkin(options: SkinShadingOptions): {
+        meshes: number;
+        vertices: number;
+        minShade: number;
+        maxShade: number;
+      };
+      /** 阶段 14：整块 Body 材质换纯色（对照实验） */
+      testHandMaterial(color?: number): { materialName: string; meshes: string[] } | null;
+      /** 阶段 14：无光照 ↔ Toon + 光照（验证阴影） */
+      setShading(mode: DiagnosticShading): ShadingResult;
+      /** 阶段 14：开/关手部肤色烘焙（A/B 对照） */
+      setSkinBake(enabled: boolean): SkinShadingStats | null;
+      /** 阶段 14：恢复材质/顶点色/光照 */
+      resetMaterials(): void;
+      /** 阶段 14：双手骨骼在内容区 CSS 坐标里的位置（截图取样） */
+      handScreenPoints(): {
+        left: { x: number; y: number } | null;
+        right: { x: number; y: number } | null;
+      } | null;
     };
   }
 }

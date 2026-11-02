@@ -26,8 +26,23 @@ const HEAD_BONE = 'Bip001 Head';
 const EYE_L_BONE = 'Bip001 eye_L';
 const EYE_R_BONE = 'Bip001 eye_R';
 const PELVIS_BONE = 'Bip001 Pelvis';
+const SPINE_BONE = 'Bip001 Spine';
+const SPINE1_BONE = 'Bip001 Spine1';
+const NECK_BONE = 'Bip001 Neck';
+const CLAVICLE_L_BONE = 'Bip001 L Clavicle';
+const CLAVICLE_R_BONE = 'Bip001 R Clavicle';
+const UPPER_ARM_L_BONE = 'Bip001 L UpperArm';
+const UPPER_ARM_R_BONE = 'Bip001 R UpperArm';
+const FOREARM_L_BONE = 'Bip001 L Forearm';
+const FOREARM_R_BONE = 'Bip001 R Forearm';
+const HAND_L_BONE = 'Bip001 L Hand';
+const HAND_R_BONE = 'Bip001 R Hand';
 const THIGH_L_BONE = 'Bip001 L Thigh';
 const THIGH_R_BONE = 'Bip001 R Thigh';
+const CALF_L_BONE = 'Bip001 L Calf';
+const CALF_R_BONE = 'Bip001 R Calf';
+const FOOT_L_BONE = 'Bip001 L Foot';
+const FOOT_R_BONE = 'Bip001 R Foot';
 
 /**
  * GLTFLoader 会对节点名做 `sanitizeNodeName`（空格→下划线、去掉保留字符），
@@ -43,8 +58,23 @@ const BONE_TARGETS = {
   eyeL: normalizeBoneName(EYE_L_BONE),
   eyeR: normalizeBoneName(EYE_R_BONE),
   pelvis: normalizeBoneName(PELVIS_BONE),
+  spine: normalizeBoneName(SPINE_BONE),
+  spine1: normalizeBoneName(SPINE1_BONE),
+  neck: normalizeBoneName(NECK_BONE),
+  clavicleL: normalizeBoneName(CLAVICLE_L_BONE),
+  clavicleR: normalizeBoneName(CLAVICLE_R_BONE),
+  upperArmL: normalizeBoneName(UPPER_ARM_L_BONE),
+  upperArmR: normalizeBoneName(UPPER_ARM_R_BONE),
+  forearmL: normalizeBoneName(FOREARM_L_BONE),
+  forearmR: normalizeBoneName(FOREARM_R_BONE),
+  handL: normalizeBoneName(HAND_L_BONE),
+  handR: normalizeBoneName(HAND_R_BONE),
   thighL: normalizeBoneName(THIGH_L_BONE),
   thighR: normalizeBoneName(THIGH_R_BONE),
+  calfL: normalizeBoneName(CALF_L_BONE),
+  calfR: normalizeBoneName(CALF_R_BONE),
+  footL: normalizeBoneName(FOOT_L_BONE),
+  footR: normalizeBoneName(FOOT_R_BONE),
 } as const;
 
 export interface ModelBones {
@@ -52,9 +82,25 @@ export interface ModelBones {
   eyeL: THREE.Bone | null;
   eyeR: THREE.Bone | null;
   pelvis: THREE.Bone | null;
-  /** 大腿（ADR 0028 D8 的程序化坐姿降级用；缺失只是降级，不影响 modelReady） */
+  /** 脊柱/颈（拖拽姿态与坐姿活体用；缺失只降级，不影响 modelReady） */
+  spine: THREE.Bone | null;
+  spine1: THREE.Bone | null;
+  neck: THREE.Bone | null;
+  clavicleL: THREE.Bone | null;
+  clavicleR: THREE.Bone | null;
+  upperArmL: THREE.Bone | null;
+  upperArmR: THREE.Bone | null;
+  forearmL: THREE.Bone | null;
+  forearmR: THREE.Bone | null;
+  handL: THREE.Bone | null;
+  handR: THREE.Bone | null;
+  /** 大腿/小腿/脚（拖拽悬挂、坐姿降级、落地缓冲用） */
   thighL: THREE.Bone | null;
   thighR: THREE.Bone | null;
+  calfL: THREE.Bone | null;
+  calfR: THREE.Bone | null;
+  footL: THREE.Bone | null;
+  footR: THREE.Bone | null;
 }
 
 export interface LoadedModel {
@@ -325,8 +371,23 @@ export async function loadModel(options: LoadModelOptions): Promise<LoadedModel>
     eyeL: null,
     eyeR: null,
     pelvis: null,
+    spine: null,
+    spine1: null,
+    neck: null,
+    clavicleL: null,
+    clavicleR: null,
+    upperArmL: null,
+    upperArmR: null,
+    forearmL: null,
+    forearmR: null,
+    handL: null,
+    handR: null,
     thighL: null,
     thighR: null,
+    calfL: null,
+    calfR: null,
+    footL: null,
+    footR: null,
   };
   const materialNames = new Set<string>();
   let triangleCount = 0;
@@ -342,8 +403,23 @@ export async function loadModel(options: LoadModelOptions): Promise<LoadedModel>
       else if (normalized === BONE_TARGETS.eyeL) bones.eyeL = bone;
       else if (normalized === BONE_TARGETS.eyeR) bones.eyeR = bone;
       else if (normalized === BONE_TARGETS.pelvis) bones.pelvis = bone;
+      else if (normalized === BONE_TARGETS.spine) bones.spine = bone;
+      else if (normalized === BONE_TARGETS.spine1) bones.spine1 = bone;
+      else if (normalized === BONE_TARGETS.neck) bones.neck = bone;
+      else if (normalized === BONE_TARGETS.clavicleL) bones.clavicleL = bone;
+      else if (normalized === BONE_TARGETS.clavicleR) bones.clavicleR = bone;
+      else if (normalized === BONE_TARGETS.upperArmL) bones.upperArmL = bone;
+      else if (normalized === BONE_TARGETS.upperArmR) bones.upperArmR = bone;
+      else if (normalized === BONE_TARGETS.forearmL) bones.forearmL = bone;
+      else if (normalized === BONE_TARGETS.forearmR) bones.forearmR = bone;
+      else if (normalized === BONE_TARGETS.handL) bones.handL = bone;
+      else if (normalized === BONE_TARGETS.handR) bones.handR = bone;
       else if (normalized === BONE_TARGETS.thighL) bones.thighL = bone;
       else if (normalized === BONE_TARGETS.thighR) bones.thighR = bone;
+      else if (normalized === BONE_TARGETS.calfL) bones.calfL = bone;
+      else if (normalized === BONE_TARGETS.calfR) bones.calfR = bone;
+      else if (normalized === BONE_TARGETS.footL) bones.footL = bone;
+      else if (normalized === BONE_TARGETS.footR) bones.footR = bone;
     }
     // `HaloRoot` 是光环的枢轴（`CH0335_Halo` 的父节点）：它是普通 Object3D，
     // 不在骨骼层级里，也不会被任何片段驱动 —— 角色一移动，光环就留在原地。

@@ -110,6 +110,11 @@ export interface ShellModule {
   releaseSnap(): void;
   /** 内部诊断（非契约）：吸附状态、目标窗口、最近一次结果（ADR 0028）。 */
   snapSnapshot(): SnapDiagnostics | null;
+  /**
+   * 内部（非契约，标定用）：把窗口抬到地面上方 `heightPx` 后开始回弹。
+   * 只用于落地冲击分级截图（ADR 0035 D4），不暴露给渲染侧。
+   */
+  debugDropFromHeight(heightPx: number): boolean;
 }
 
 let mainWindow: BrowserWindow | null = null;
@@ -655,6 +660,7 @@ function startPointerPoller(window: BrowserWindow): void {
       readHandle: (handle) => reader.readHandle(handle),
       toDip: toDipRect,
       isBusy: () => motion.kind !== 'idle' || dragging,
+      emitApproach: (payload) => appBus.emit('snap_approach_started', payload),
       emitApplied: (payload) => appBus.emit('snap_applied', payload),
       emitReleased: (payload) => appBus.emit('snap_released', payload),
       notify: notifyUser,
@@ -1022,6 +1028,33 @@ export const shell: ShellModule = {
 
   snapSnapshot(): SnapDiagnostics | null {
     return snapController?.diagnostics() ?? null;
+  },
+
+  debugDropFromHeight(heightPx: number): boolean {
+    const window = mainWindow;
+    if (!window || window.isDestroyed()) return false;
+    const bounds = window.getContentBounds();
+    const areas = getAllWorkAreas();
+    if (areas.length === 0) return false;
+    let best = areas[0];
+    let bestOverlap = -1;
+    for (const area of areas) {
+      const width = Math.min(bounds.x + bounds.width, area.x + area.width) - Math.max(bounds.x, area.x);
+      const height = Math.min(bounds.y + bounds.height, area.y + area.height) - Math.max(bounds.y, area.y);
+      const overlap = Math.max(0, width) * Math.max(0, height);
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        best = area;
+      }
+    }
+    const groundY = best.y + best.height - bounds.height;
+    const dropHeight = Math.max(0, Math.min(2000, heightPx));
+    window.setPosition(Math.round(bounds.x), Math.round(groundY - dropHeight), false);
+    // 走与真实松手相同的事件链：render 进入 settling 才能记录向下峰值；
+    // shell 的 drag_released 订阅者会启动 settle（不再直接调 motion，避免双重启动）。
+    appBus.emit('drag_released', { x: 0, y: 0, vx: 0, vy: 0 });
+    logInfo('shell', '标定：从指定高度回弹（ADR 0035 D4）', { heightPx: dropHeight, groundY });
+    return true;
   },
 
   notifySecondInstance(): void {

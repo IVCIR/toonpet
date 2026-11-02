@@ -246,3 +246,96 @@ export const SNAP_MAX_CLAMP_PX = 40;
  * 不超过这么多像素，就吸到下沿并坐下（她本来就落在这条线上，只是把姿态换成坐）。
  */
 export const SNAP_EDGE_DRAG_THRESHOLD_PX = 24;
+
+// --- 吸附接近（契约 §4.1 `sitting` 生命周期、§6.3；ADR 0034） ---
+/** 小于这个距离直接落座，不做接近动画（视觉上无感） */
+export const SNAP_APPROACH_INSTANT_PX = 8;
+/** |dy| 不超过这个值算"同一地面线"，走水平接近；否则用跳跃弧线 */
+export const SNAP_APPROACH_WALK_MAX_DY_PX = 16;
+/** 接近时长钳制（ms）：太短像瞬移，太长像卡住 */
+export const SNAP_APPROACH_MIN_MS = 220;
+export const SNAP_APPROACH_MAX_MS = 900;
+/** 水平接近的巡航速度（px/s）；复用行走的速度量级 */
+export const SNAP_APPROACH_WALK_SPEED_PX_PER_SEC = 260;
+/** 跳跃接近的基准时长与距离除数：duration = clamp(base + dist/divisor, min, max) */
+export const SNAP_APPROACH_LEAP_BASE_MS = 300;
+export const SNAP_APPROACH_LEAP_DISTANCE_DIVISOR = 2400;
+/** 跳跃弧高：max(最小, 比值 × 水平距离)，再钳制到最大（屏幕坐标向上为负） */
+export const SNAP_APPROACH_ARC_RATIO = 0.12;
+export const SNAP_APPROACH_ARC_MIN_PX = 16;
+export const SNAP_APPROACH_ARC_MAX_PX = 80;
+
+// --- 拖拽手感（ADR 0035） ---
+/** 抓取带：头部 = 包围盒顶部 22%（与 R-10 同源）；脚部 = 底部 20% */
+export const GRAB_FOOT_BAND_RATIO = 0.2;
+/** 像素世界里的等效重力；只用于单摆，不参与窗口位移 */
+export const DRAG_GRAVITY_PX_PER_SEC2 = 2600;
+/** 单摆积分固定子步长（与 shared/motion.ts 的 stepSpring 同手法） */
+export const DRAG_PENDULUM_SUBSTEP_SECONDS = 0.004;
+/** 支撑点速度/加速度滤波：两级 EMA + 死区，压住窗口 1px 量化的噪声 */
+export const DRAG_SUPPORT_VELOCITY_EMA_MS = 55;
+export const DRAG_SUPPORT_ACCEL_EMA_MS = 90;
+export const DRAG_SUPPORT_ACCEL_DEADBAND = 80;
+export const DRAG_SUPPORT_ACCEL_MAX = 6000;
+/** 姿态增益淡入/淡出（ms） */
+export const DRAG_POSE_RAMP_MS = 180;
+export const DRAG_RELEASE_POSE_FADE_MS = 420;
+
+/**
+ * 三种抓取的单摆参数（初始标定值，实机可调）。
+ * - L：有效摆长（px）；越大越"慢"；
+ * - damping：角速度阻尼（1/s）；越小越"甩"；
+ * - angleLimit：根骨骼摆角上限（rad），同时受窗口尺寸约束；
+ * - struggleHz/struggleRad：抓脚时叠的高频挣扎。
+ */
+export const DRAG_PENDULUM = {
+  head: {
+    lengthPx: 374,
+    damping: 3.2,
+    angleLimitRad: 0.35,
+    struggleHz: 0,
+    struggleRad: 0,
+    /** "被拎起"的整身抬升（px）；抓头时只轻抬，靠支点旋转表现下垂 */
+    liftPx: 4,
+  },
+  body: {
+    lengthPx: 230,
+    damping: 4.2,
+    angleLimitRad: 0.32,
+    struggleHz: 0,
+    struggleRad: 0,
+    liftPx: 12,
+  },
+  foot: {
+    lengthPx: 130,
+    damping: 0.9,
+    angleLimitRad: 0.25,
+    struggleHz: 2.5,
+    struggleRad: 0.045,
+    liftPx: 8,
+  },
+} as const;
+
+/** 抓脚挣扎的踢腿包络周期（ms）：每 0.8–1.4s 一次 */
+export const DRAG_FOOT_KICK_MIN_INTERVAL_MS = 800;
+export const DRAG_FOOT_KICK_MAX_INTERVAL_MS = 1400;
+export const DRAG_FOOT_KICK_DURATION_MS = 180;
+
+// --- 落地冲击（契约 §5.3、D-6；ADR 0035 D4） ---
+/** 下蹲包络总时长/吸震段：0–50ms 压到最低，50–300ms 回正 */
+export const LANDING_DURATION_MS = 300;
+export const LANDING_ABSORB_MS = 50;
+/** 冲击速度归一化区间（px/s）：低于 min 视为轻放，高于 max 视为重摔 */
+export const LANDING_IMPACT_MIN_PX_PER_SEC = 150;
+export const LANDING_IMPACT_MAX_PX_PER_SEC = 1000;
+/** 最大压扁比例（只缩 Y，脚底不动） */
+export const LANDING_MAX_SQUASH = 0.08;
+/** 骨骼辅助：脊柱前倾/膝盖弯曲上限（膝盖再大就会让脚离地，实机标定后可能降为 0） */
+export const LANDING_SPINE_MAX_RAD = 0.16;
+export const LANDING_KNEE_MAX_RAD = 0.16;
+
+// --- 坐姿惊跳（ADR 0034 D5） ---
+export const STARTLE_SURPRISED_MS = 400;
+export const STARTLE_CLICKED_MS = 120;
+export const STARTLE_COMMAND_MS = 260;
+export const STARTLE_LOST_MS = 320;

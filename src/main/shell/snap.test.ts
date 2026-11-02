@@ -3,7 +3,7 @@ import test from 'node:test';
 import type { Rect } from '../../shared/geometry';
 import type { WindowInfo } from './foreground-window';
 import { createSnapController, resolveSnapConfig } from './snap';
-import type { SnapDeps } from './snap';
+import type { SnapController, SnapDeps } from './snap';
 
 const DISPLAY: Rect = { x: 0, y: 0, width: 1600, height: 1000 };
 const WORK_AREA: Rect = { x: 0, y: 0, width: 1600, height: 952 };
@@ -12,6 +12,7 @@ const PET: Rect = { x: 500, y: 232, width: 422, height: 720 };
 interface Harness {
   deps: SnapDeps;
   positions: { x: number; y: number }[];
+  approaches: { mode: string; durationMs: number }[];
   applied: { edge: string; source: string }[];
   released: { reason: string }[];
   notices: string[];
@@ -46,6 +47,7 @@ function makeHarness(scale = 1): Harness {
 
   const harness: Harness = {
     positions: [],
+    approaches: [],
     applied: [],
     released: [],
     notices: [],
@@ -80,6 +82,7 @@ function makeHarness(scale = 1): Harness {
         height: (physical.bottom - physical.top) / scale,
       }),
       isBusy: () => busy,
+      emitApproach: (payload) => harness.approaches.push({ mode: payload.mode, durationMs: payload.durationMs }),
       emitApplied: (payload) => harness.applied.push(payload),
       emitReleased: (payload) => harness.released.push(payload),
       notify: (message) => harness.notices.push(message),
@@ -91,6 +94,12 @@ function makeHarness(scale = 1): Harness {
 }
 
 const CONFIG = resolveSnapConfig({});
+
+/** 把接近阶段一次跑完（第一个 tick 校准，第二个 tick 的大 dt 直接到 1）。 */
+function finishApproach(snap: SnapController): void {
+  snap.tick(0);
+  snap.tick(2000);
+}
 
 test('配置：默认下边缘、auto 模式、跟随 120ms、启用', () => {
   assert.deepEqual(resolveSnapConfig({}), {
@@ -112,16 +121,21 @@ test('配置：env 覆盖（edge/mode/disable/follow），非法值回落默认'
   assert.equal(resolveSnapConfig({ PET_SNAP_EDGE: 'left' }).edge, 'bottom');
 });
 
-test('吸附：前台窗口下边缘 → 窗口贴到边缘线并发出 snap_applied', () => {
+test('吸附：前台窗口下边缘 → 接近后贴到边缘线并发出 snap_applied', () => {
   const h = makeHarness();
   const snap = createSnapController(h.deps, CONFIG);
   const outcome = snap.snapNow();
   assert.equal(outcome.ok, true);
   if (!outcome.ok) return;
+  assert.equal(outcome.approaching, true);
+  assert.deepEqual(h.positions, [], '接近开始时不瞬移');
+  assert.equal(h.approaches.length, 1, '应发 snap_approach_started');
+  finishApproach(snap);
   // 前台 200..1100 × 200..800（DIP）→ 边缘线 800 → y = 80；x = 200 + (900-422)/2 = 439
   assert.deepEqual(h.positions, [{ x: 439, y: 80 }]);
   assert.deepEqual(h.applied, [{ edge: 'bottom', source: 'foreground' }]);
   assert.equal(snap.sitting, true);
+  assert.equal(snap.diagnostics().approaching, false);
   assert.equal(snap.diagnostics().target?.handle, '4242');
   assert.equal(snap.diagnostics().target?.title, '记事本');
 });
@@ -131,6 +145,7 @@ test('吸附：自动换算 DIP（200% 缩放）——物理 400..2200 等于 DI
   h.setForeground(windowInfo({}, { left: 400, top: 400, right: 2200, bottom: 1600 }));
   const snap = createSnapController(h.deps, CONFIG);
   snap.snapNow();
+  finishApproach(snap);
   assert.deepEqual(h.positions, [{ x: 439, y: 80 }]);
 });
 
@@ -181,6 +196,7 @@ test('拒绝：拿不到前台窗口（auto 模式）→ 回退到工作区贴�
   assert.equal(outcome.ok, true);
   if (!outcome.ok) return;
   assert.equal(outcome.source, 'workarea');
+  finishApproach(snap);
   // 工作区 0..952 → y = 952 - 720 = 232；x 在 1600 宽的工作区居中 = 589
   assert.deepEqual(h.positions, [{ x: 589, y: 232 }]);
   assert.deepEqual(h.applied, [{ edge: 'bottom', source: 'workarea' }]);
@@ -201,6 +217,7 @@ test('跟随：目标窗口移动后窗口跟着走（节流 120ms）', () => {
   const h = makeHarness();
   const snap = createSnapController(h.deps, CONFIG);
   snap.snapNow();
+  finishApproach(snap);
   assert.equal(h.positions.length, 1);
 
   // 第一个 tick 只校准节流起点，不做窗口查询
@@ -226,6 +243,7 @@ test('跟随：目标窗口消失 / 变成全屏 → 立即解除吸附并发出
   const gone = makeHarness();
   const snapGone = createSnapController(gone.deps, CONFIG);
   snapGone.snapNow();
+  finishApproach(snapGone);
   gone.setHandle(null);
   snapGone.tick(200);
   snapGone.tick(400);
@@ -235,6 +253,7 @@ test('跟随：目标窗口消失 / 变成全屏 → 立即解除吸附并发出
   const fullscreen = makeHarness();
   const snapFull = createSnapController(fullscreen.deps, CONFIG);
   snapFull.snapNow();
+  finishApproach(snapFull);
   fullscreen.setHandle(
     windowInfo({}, { left: 0, top: 0, right: DISPLAY.width, bottom: DISPLAY.height }),
   );
@@ -250,6 +269,7 @@ test('解除：幂等（没有吸附时不发事件），解除后跟随停止',
   assert.deepEqual(h.released, []);
 
   snap.snapNow();
+  finishApproach(snap);
   snap.release('clicked');
   snap.release('clicked');
   assert.deepEqual(h.released, [{ reason: 'clicked' }]);
@@ -263,6 +283,7 @@ test('重复吸附：允许改吸到新的前台窗口（旧目标不残留）',
   const h = makeHarness();
   const snap = createSnapController(h.deps, CONFIG);
   snap.snapNow();
+  finishApproach(snap);
   // 第二扇窗：DIP 0..800 × 700..900 → 边缘线 900 → y=180
   const second = windowInfo({ handle: '777' }, { left: 0, top: 700, right: 800, bottom: 900 });
   h.setForeground(second);
@@ -282,6 +303,7 @@ test('工作区模式（无 Win32）：按工作区边缘吸附，不读前台�
   assert.equal(outcome.ok, true);
   if (!outcome.ok) return;
   assert.equal(outcome.source, 'workarea');
+  finishApproach(snap);
   assert.deepEqual(h.positions, [{ x: 589, y: 232 }]);
   assert.equal(snap.sitting, true);
 });
@@ -293,6 +315,7 @@ test('工作区模式：上沿放不下坐姿 → 自动退回下沿（PET_SNAP_
   assert.equal(outcome.ok, true);
   if (!outcome.ok) return;
   assert.equal(outcome.edge, 'bottom');
+  finishApproach(snap);
   assert.deepEqual(h.positions, [{ x: 589, y: 232 }]);
 });
 
@@ -316,6 +339,63 @@ test('工作区模式：拖到下沿附近松手 → 坐在边上；太远或 au
   const autoSnap = createSnapController(auto.deps, CONFIG);
   auto.setPet({ x: 100, y: 230, width: 422, height: 720 });
   assert.equal(autoSnap.trySnapOnRelease(), null);
+});
+
+test('接近：开始时不瞬移，tick 推进进度，到达后才发 snap_applied（ADR 0034）', () => {
+  const h = makeHarness();
+  const snap = createSnapController(h.deps, CONFIG);
+  snap.snapNow();
+  assert.equal(h.approaches.length, 1);
+  assert.equal(h.positions.length, 0);
+  assert.equal(h.applied.length, 0);
+  assert.equal(snap.diagnostics().approaching, true);
+  assert.equal(snap.diagnostics().approachProgress, 0);
+
+  snap.tick(0); // 校准第一个 tick
+  snap.tick(160);
+  const before = snap.diagnostics();
+  assert.ok(before.approachProgress !== null && before.approachProgress > 0);
+  assert.ok(before.approachProgress < 1);
+  assert.equal(h.positions.length, 1, '中间 tick 移动窗口');
+  assert.equal(h.applied.length, 0, '未到达不得发 snap_applied');
+
+  // 大步长直接到 1
+  snap.tick(2000);
+  assert.equal(h.applied.length, 1);
+  assert.equal(snap.diagnostics().approaching, false);
+  assert.deepEqual(h.positions[h.positions.length - 1], { x: 439, y: 80 });
+});
+
+test('接近：拖拽立即中断，不补发 snap_applied', () => {
+  const h = makeHarness();
+  const snap = createSnapController(h.deps, CONFIG);
+  snap.snapNow();
+  snap.release('dragged');
+  assert.deepEqual(h.released, [{ reason: 'dragged' }]);
+  assert.equal(h.applied.length, 0);
+  assert.equal(snap.sitting, false);
+  snap.tick(2000);
+  assert.equal(h.applied.length, 0, '中断后不得再落座');
+});
+
+test('接近：点击/命令/目标消失延迟到到达后释放（ADR 0034 D4）', () => {
+  const h = makeHarness();
+  const snap = createSnapController(h.deps, CONFIG);
+  snap.snapNow();
+  snap.release('window-gone');
+  assert.deepEqual(h.released, [], '延迟期间不发 snap_released');
+  finishApproach(snap);
+  assert.equal(h.applied.length, 1);
+  assert.deepEqual(h.released, [{ reason: 'window-gone' }]);
+});
+
+test('接近：进行中再次 snapNow 返回 busy', () => {
+  const h = makeHarness();
+  const snap = createSnapController(h.deps, CONFIG);
+  snap.snapNow();
+  const second = snap.snapNow();
+  assert.equal(second.ok, false);
+  if (!second.ok) assert.equal(second.reason, 'busy');
 });
 
 test('禁用：PET_SNAP_DISABLE=1 时热键路径直接跳过', () => {

@@ -13,6 +13,7 @@ export const EVENT_NAMES = [
   'llm_failed',
   'model_ready',
   'motion_ended',
+  'snap_approach_started',
   'snap_applied',
   'snap_released',
 ] as const;
@@ -90,6 +91,20 @@ export interface MotionEndedPayload {
 }
 
 /**
+ * ADR 0034 D1：吸附**接近开始**（事实，不是命令）。
+ *
+ * 唯一生产者 `shell`；`render` 收到后进入 `sitting` 的"接近阶段"并播走路/跳跃，
+ * 到达后由 `snap_applied` 切到坐姿。不新增 IPC 通道、不新增状态名。
+ */
+export interface SnapApproachStartedPayload {
+  edge: 'top' | 'bottom';
+  source: 'foreground' | 'workarea';
+  mode: 'walk' | 'leap';
+  distancePx: number;
+  durationMs: number;
+}
+
+/**
  * ADR 0028 D5：`shell` 已把窗口贴到一条边缘上，并进入 `sitting`（**事实**，不是命令）。
  *
  * - `edge: 'bottom'`：坐在下边缘（脚/臀压在这条线上，身体在其上方）；
@@ -124,6 +139,7 @@ export interface EventPayloads {
   llm_failed: LlmFailedPayload;
   model_ready: ModelReadyPayload;
   motion_ended: MotionEndedPayload;
+  snap_approach_started: SnapApproachStartedPayload;
   snap_applied: SnapAppliedPayload;
   snap_released: SnapReleasedPayload;
 }

@@ -11,7 +11,7 @@
  * - 因此连续掩膜坐标在单元中心处取整数，`cssToMask` 的 −0.5 偏移就是这个约定；
  * - 掩膜覆盖整个窗口内容区，CSS 坐标按内容区宽高等比映射（R-3）。
  */
-import { HEAD_BAND_RATIO, HIT_ALPHA_THRESHOLD, MASK_HEIGHT, MASK_WIDTH } from './constants';
+import { HEAD_BAND_RATIO, HIT_ALPHA_THRESHOLD, MASK_HEIGHT, MASK_WIDTH, GRAB_FOOT_BAND_RATIO } from './constants';
 
 export interface MaskPoint {
   mx: number;
@@ -162,6 +162,35 @@ export function isInHeadRegion(
   // 连续坐标下包围盒覆盖 [minX, maxX + 1) × [minY, maxY + 1)
   if (mx < bbox.minX || mx >= bbox.maxX + 1) return false;
   return my >= bbox.minY && my < headBandBottomRow(bbox, ratio);
+}
+
+/**
+ * 抓取部位（ADR 0035 D1）：头 / 身体 / 脚。
+ *
+ * 仅作为**骨骼不可用时的降级路径**。骨骼可用时渲染侧优先用头骨/骨盆/脚骨的
+ * 世界坐标做最近点分类（掩膜包围盒顶部可能包含光环，不适合当头部基准）。
+ *
+ * 三段带与 R-10 共用同一个头部比例；脚部是底部 20%。返回 `null` 表示
+ * 坐标不在包围盒内（调用方按"身体"或"无效"处理）。
+ */
+export type GrabBand = 'head' | 'body' | 'foot';
+
+export function grabBandAt(
+  bbox: MaskBoundingBox | null,
+  mx: number,
+  my: number,
+  headRatio: number = HEAD_BAND_RATIO,
+  footRatio: number = GRAB_FOOT_BAND_RATIO,
+): GrabBand | null {
+  if (!bbox) return null;
+  if (!Number.isFinite(mx) || !Number.isFinite(my)) return null;
+  if (mx < bbox.minX || mx >= bbox.maxX + 1) return null;
+  if (my < bbox.minY || my >= bbox.maxY + 1) return null;
+  if (isInHeadRegion(bbox, mx, my, headRatio)) return 'head';
+  const rows = bbox.maxY - bbox.minY + 1;
+  const footTop = bbox.maxY + 1 - rows * footRatio;
+  if (my >= footTop) return 'foot';
+  return 'body';
 }
 
 /** 一次完整的命中判定：内容区矩形 → 双线性 alpha → 阈值。 */

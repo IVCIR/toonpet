@@ -171,8 +171,21 @@ test('行走方向由随机源决定（0.9 → right，0.1 → left）', () => {
   assert.equal(left.tick(1000).startWalk?.direction, 'left');
 });
 
-test('吸附：snapApplied → Physics=sitting，并清空行走排期（她坐着不会迈步）', () => {
-  const hfsm = makeDeterministic([0.5, 0.5, 0.5]);
+test('吸附接近：snapApproaching 提前进入 sitting 并清空行走排期（ADR 0034 D2）', () => {
+  const hfsm = makeDeterministic([0.5, 0.5]);
+  hfsm.tick(0);
+  hfsm.tick(2000);
+  assert.equal(hfsm.snapshot().base, 'walking');
+  hfsm.snapApproaching(2100);
+  assert.equal(hfsm.snapshot().physics, 'sitting');
+  assert.equal(hfsm.snapshot().base, 'idle', '接近阶段也必须打断行走');
+  assert.equal(hfsm.nextWalkAt, null, '接近阶段不得再排期行走');
+  // 到达后仍然坐在同一状态里，不产生第二个状态
+  hfsm.snapApplied(2500);
+  assert.equal(hfsm.snapshot().physics, 'sitting');
+});
+
+test('吸附：snapApplied → Physics=sitting，并清空行走排期（她坐着不会迈步）', () => {  const hfsm = makeDeterministic([0.5, 0.5, 0.5]);
   hfsm.tick(0);
   hfsm.snapApplied(100);
   assert.equal(hfsm.snapshot().physics, 'sitting');

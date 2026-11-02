@@ -5,6 +5,7 @@ import {
   alphaAt,
   alphaBoundingBox,
   cssToMask,
+  grabBandAt,
   headBandBottomRow,
   hitTest,
   isInHeadRegion,
@@ -129,6 +130,29 @@ test('头部区是包围盒顶部 22% 的横带（R-10）', () => {
   assert.equal(isInHeadRegion(bbox, 10, 40), false); // 横向在包围盒外
   assert.equal(isInHeadRegion(bbox, 104, 40), false); // maxX + 1 为开边界
   assert.equal(isInHeadRegion(null, 60, 40), false);
+});
+
+test('抓取带：顶部 22% 为头、底部 20% 为脚、中间为身体（ADR 0035）', () => {
+  const mask = emptyMask();
+  for (let y = 36; y <= 71; y += 1) {
+    for (let x = 24; x <= 103; x += 1) {
+      mask[y * MASK_WIDTH + x] = 255;
+    }
+  }
+  const bbox = alphaBoundingBox(mask, MASK_WIDTH, MASK_HEIGHT);
+  assert.ok(bbox);
+  // 36 行高：头部 < 43.92，脚部 >= 64.8
+  assert.equal(grabBandAt(bbox, 60, 36), 'head');
+  assert.equal(grabBandAt(bbox, 60, 43), 'head');
+  assert.equal(grabBandAt(bbox, 60, 44), 'body');
+  assert.equal(grabBandAt(bbox, 60, 64), 'body');
+  assert.equal(grabBandAt(bbox, 60, 65), 'foot');
+  assert.equal(grabBandAt(bbox, 60, 71), 'foot');
+  // 越界 / 无包围盒
+  assert.equal(grabBandAt(bbox, 60, 35), null);
+  assert.equal(grabBandAt(bbox, 60, 72), null);
+  assert.equal(grabBandAt(bbox, 10, 50), null);
+  assert.equal(grabBandAt(null, 60, 50), null);
 });
 
 test('hitTest 在内容区外一律不命中（即使掩膜不透明）', () => {

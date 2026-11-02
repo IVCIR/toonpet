@@ -18,6 +18,8 @@ import {
   SNAP_MIN_TARGET_WIDTH_PX,
 } from '../../shared/constants';
 import type { Rect } from '../../shared/geometry';
+import { approachDelta, planApproach, sampleApproach } from './approach';
+import type { ApproachPlan } from './approach';
 import type { WindowInfo } from './foreground-window';
 import {
   computeSnapTarget,
@@ -51,6 +53,8 @@ export type SnapOutcome =
       x: number;
       y: number;
       clamped: boolean;
+      /** ADR 0034：本次是接近开始（true）还是直接落座（false/缺省） */
+      approaching?: boolean;
       target: { handle: string | null; title: string; dip: Rect } | null;
     }
   | { ok: false; reason: SnapRefusalReason; hint: string | null; detail?: unknown };
@@ -98,6 +102,13 @@ export interface SnapDeps {
   toDip(physical: WindowInfo['physical']): Rect;
   /** 正在行走/回弹/拖拽（此时不抢窗口位置） */
   isBusy(): boolean;
+  emitApproach(payload: {
+    edge: SnapEdge;
+    source: 'foreground' | 'workarea';
+    mode: 'walk' | 'leap';
+    distancePx: number;
+    durationMs: number;
+  }): void;
   emitApplied(payload: { edge: SnapEdge; source: 'foreground' | 'workarea' }): void;
   emitReleased(payload: {
     reason: 'dragged' | 'clicked' | 'command' | 'window-gone' | 'fullscreen';
@@ -114,6 +125,11 @@ export interface SnapDiagnostics {
   configuredMode: SnapConfig['mode'];
   edge: SnapEdge;
   sitting: boolean;
+  /** ADR 0034：是否在接近阶段 */
+  approaching: boolean;
+  /** 接近进度 0..1；不在接近为 null */
+  approachProgress: number | null;
+  approachMode: 'walk' | 'leap' | null;
   target: { handle: string; title: string; className: string; rect: Rect } | null;
   lastOutcome: SnapOutcome | null;
   followChecks: number;
@@ -167,7 +183,22 @@ export function createSnapController(deps: SnapDeps, config: SnapConfig): SnapCo
     rect: Rect;
   }
 
+  type ReleaseReason = 'dragged' | 'clicked' | 'command' | 'window-gone' | 'fullscreen';
+
+  interface ApproachRuntime {
+    plan: ApproachPlan;
+    progress: number;
+    lastTickAt: number | null;
+    edge: SnapEdge;
+    source: 'foreground' | 'workarea';
+    target: { handle: string | null; title: string; className: string };
+    anchor: Rect;
+    /** ADR 0034 D4：非拖拽的解除延迟到到达之后再发 */
+    deferredRelease: ReleaseReason | null;
+  }
+
   let applied: Applied | null = null;
+  let approach: ApproachRuntime | null = null;
   let lastOutcome: SnapOutcome | null = null;
   let followChecks = 0;
   let lastFollowAt: number | null = null;
@@ -184,12 +215,27 @@ export function createSnapController(deps: SnapDeps, config: SnapConfig): SnapCo
     return lastOutcome;
   }
 
-  function apply(
+  interface TargetPlan {
+    edge: SnapEdge;
+    source: 'foreground' | 'workarea';
+    anchor: Rect;
+    target: { handle: string | null; title: string; className: string };
+    x: number;
+    y: number;
+    clamped: boolean;
+    desired: { x: number; y: number };
+  }
+
+  type ResolvedTarget =
+    | { ok: true; plan: TargetPlan }
+    | { ok: false; outcome: SnapOutcome };
+
+  function resolveTarget(
     edge: SnapEdge,
     source: 'foreground' | 'workarea',
     anchor: Rect,
     target: { handle: string | null; title: string; className: string },
-  ): SnapOutcome {
+  ): ResolvedTarget {
     const pet = deps.getPetBounds();
     const result = computeSnapTarget({
       edge,
@@ -197,49 +243,122 @@ export function createSnapController(deps: SnapDeps, config: SnapConfig): SnapCo
       pet: { width: pet.width, height: pet.height },
       workAreas: deps.getWorkAreas(),
     });
-
-    if (!result.ok) return refuse(result.reason as SnapRefusalReason, result.detail);
-
-    const previous = applied;
-    deps.setPetPosition(result.x, result.y);
-    applied = {
-      handle: target.handle,
-      title: target.title,
-      className: target.className,
-      edge,
-      source,
-      rect: anchor,
+    if (!result.ok) {
+      return { ok: false, outcome: refuse(result.reason as SnapRefusalReason, result.detail) };
+    }
+    return {
+      ok: true,
+      plan: {
+        edge,
+        source,
+        anchor,
+        target,
+        x: result.x,
+        y: result.y,
+        clamped: result.clamped,
+        desired: result.desired,
+      },
     };
+  }
+
+  /** 直接落座（瞬时距离 / 已在 sitting 时重吸附 / 拖到边缘松手）。 */
+  function commit(plan: TargetPlan): SnapOutcome {
+    const pet = deps.getPetBounds();
+    const previous = applied;
+    deps.setPetPosition(plan.x, plan.y);
+    applied = {
+      handle: plan.target.handle,
+      title: plan.target.title,
+      className: plan.target.className,
+      edge: plan.edge,
+      source: plan.source,
+      rect: plan.anchor,
+    };
+    approach = null;
     lastFollowAt = null;
     lastOutcome = {
       ok: true,
-      edge,
-      source,
-      x: result.x,
-      y: result.y,
-      clamped: result.clamped,
-      target: { handle: target.handle, title: target.title, dip: anchor },
+      edge: plan.edge,
+      source: plan.source,
+      x: plan.x,
+      y: plan.y,
+      clamped: plan.clamped,
+      approaching: false,
+      target: { handle: plan.target.handle, title: plan.target.title, dip: plan.anchor },
     };
 
-    if (result.clamped) {
+    if (plan.clamped) {
       deps.logWarn('吸附位置被 D-7 钳制（目标边缘贴不到，只保证可见）', {
-        desired: result.desired,
-        actual: { x: result.x, y: result.y },
+        desired: plan.desired,
+        actual: { x: plan.x, y: plan.y },
       });
     }
     deps.logInfo('吸附完成（ADR 0028）', {
-      edge,
-      source,
-      handle: target.handle,
-      title: target.title,
-      className: target.className,
+      edge: plan.edge,
+      source: plan.source,
+      handle: plan.target.handle,
+      title: plan.target.title,
+      className: plan.target.className,
       from: { x: pet.x, y: pet.y },
-      to: { x: result.x, y: result.y },
-      anchor,
-      clamped: result.clamped,
+      to: { x: plan.x, y: plan.y },
+      anchor: plan.anchor,
+      clamped: plan.clamped,
       repeated: previous !== null,
     });
-    deps.emitApplied({ edge, source });
+    deps.emitApplied({ edge: plan.edge, source: plan.source });
+    return lastOutcome;
+  }
+
+  /** ADR 0034 D1/D3：开始接近；距离在瞬时阈值内则直接 commit。 */
+  function startPlan(plan: TargetPlan): SnapOutcome {
+    // 已在 sitting 时再次吸附保持直接重定位（契约 X-12），不做"从窗沿再跳一次"
+    if (applied) return commit(plan);
+
+    const from = deps.getPetBounds();
+    const approachPlan = planApproach(
+      { x: from.x, y: from.y },
+      { x: plan.x, y: plan.y },
+    );
+    if (!approachPlan) return commit(plan);
+
+    approach = {
+      plan: approachPlan,
+      progress: 0,
+      lastTickAt: null,
+      edge: plan.edge,
+      source: plan.source,
+      target: plan.target,
+      anchor: plan.anchor,
+      deferredRelease: null,
+    };
+    lastOutcome = {
+      ok: true,
+      edge: plan.edge,
+      source: plan.source,
+      x: plan.x,
+      y: plan.y,
+      clamped: plan.clamped,
+      approaching: true,
+      target: { handle: plan.target.handle, title: plan.target.title, dip: plan.anchor },
+    };
+    deps.logInfo('吸附接近开始（ADR 0034）', {
+      edge: plan.edge,
+      source: plan.source,
+      mode: approachPlan.mode,
+      distancePx: Math.round(Math.hypot(plan.x - from.x, plan.y - from.y)),
+      durationMs: Math.round(approachPlan.durationMs),
+      from: { x: from.x, y: from.y },
+      to: { x: plan.x, y: plan.y },
+      handle: plan.target.handle,
+      title: plan.target.title,
+    });
+    deps.emitApproach({
+      edge: plan.edge,
+      source: plan.source,
+      mode: approachPlan.mode,
+      distancePx: Math.round(Math.hypot(plan.x - from.x, plan.y - from.y)),
+      durationMs: Math.round(approachPlan.durationMs),
+    });
     return lastOutcome;
   }
 
@@ -266,35 +385,65 @@ export function createSnapController(deps: SnapDeps, config: SnapConfig): SnapCo
       return refuse('fullscreen', { dip, displays: deps.getDisplays() });
     }
 
-    return apply(config.edge, 'foreground', dip, {
+    const resolved = resolveTarget(config.edge, 'foreground', dip, {
       handle: info.handle,
       title: info.title,
       className: info.className,
     });
+    return resolved.ok ? startPlan(resolved.plan) : resolved.outcome;
   }
 
   function workareaTarget(): SnapOutcome {
     const area = pickWorkArea(deps.getPetBounds(), deps.getWorkAreas());
     if (!area) return refuse('geometry', { reason: 'no-work-area' });
-    const direct = apply(config.edge, 'workarea', area, {
+    const direct = resolveTarget(config.edge, 'workarea', area, {
       handle: null,
       title: '工作区',
       className: '',
     });
-    if (direct.ok || config.edge === 'bottom' || direct.reason !== 'geometry') return direct;
+    if (direct.ok) {
+      const outcome = startPlan(direct.plan);
+      if (outcome.ok || config.edge === 'bottom' || outcome.reason !== 'geometry') return outcome;
+    }
     // 上沿要 720px 的身体悬在屏幕之外：物理上放不下 → 退回下沿（她本来就站在那条线上）
     deps.logWarn('工作区上沿放不下坐姿，退回下沿贴边（ADR 0028 D7）', { area });
-    return apply('bottom', 'workarea', area, {
+    const fallback = resolveTarget('bottom', 'workarea', area, {
       handle: null,
       title: '工作区下沿',
       className: '',
     });
+    return fallback.ok ? startPlan(fallback.plan) : fallback.outcome;
+  }
+
+  /** 接近到达：精确落到目标并补发 snap_applied；若有延迟解除，紧接着释放。 */
+  function commitApproach(): void {
+    const runtime = approach;
+    if (!runtime) return;
+    const deferred = runtime.deferredRelease;
+    commit({
+      edge: runtime.edge,
+      source: runtime.source,
+      anchor: runtime.anchor,
+      target: runtime.target,
+      x: runtime.plan.to.x,
+      y: runtime.plan.to.y,
+      clamped: false,
+      desired: runtime.plan.to,
+    });
+    deps.logInfo('吸附接近到达（ADR 0034）', {
+      edge: runtime.edge,
+      source: runtime.source,
+      mode: runtime.plan.mode,
+      durationMs: Math.round(runtime.plan.durationMs),
+      x: runtime.plan.to.x,
+      y: runtime.plan.to.y,
+      deferredRelease: deferred,
+    });
+    if (deferred) releaseApplied(deferred);
   }
 
   /** 解除吸附的唯一出口（`release` 方法与跟随轮询共用）。 */
-  function releaseApplied(
-    reason: 'dragged' | 'clicked' | 'command' | 'window-gone' | 'fullscreen',
-  ): void {
+  function releaseApplied(reason: ReleaseReason): void {
     if (!applied) return;
     const previous = applied;
     applied = null;
@@ -312,6 +461,7 @@ export function createSnapController(deps: SnapDeps, config: SnapConfig): SnapCo
   return {
     snapNow(): SnapOutcome {
       if (!config.enabled) return refuse('disabled');
+      if (approach) return refuse('busy');
       if (deps.isBusy()) return refuse('busy');
       const useForeground = config.mode === 'auto';
       if (!useForeground) return workareaTarget();
@@ -326,11 +476,55 @@ export function createSnapController(deps: SnapDeps, config: SnapConfig): SnapCo
     },
 
     release(reason): void {
+      if (approach) {
+        // 拖拽是唯一能立即中断接近的解除；其余延迟到到达后再释放（ADR 0034 D4）
+        if (reason === 'dragged') {
+          const runtime = approach;
+          approach = null;
+          deps.logInfo('吸附接近被拖拽中断（ADR 0034 D4）', {
+            edge: runtime.edge,
+            source: runtime.source,
+            progress: Number(runtime.progress.toFixed(3)),
+          });
+          deps.emitReleased({ reason });
+          return;
+        }
+        if (!approach.deferredRelease) {
+          approach.deferredRelease = reason;
+          deps.logInfo('吸附接近中解除被延迟到到达（ADR 0034 D4）', { reason });
+        }
+        return;
+      }
       releaseApplied(reason);
     },
 
     tick(now: number): void {
-      if (!applied || !config.enabled) return;
+      if (!config.enabled) return;
+
+      // ADR 0034 D3：接近倒计时挂在既有 16ms tick 上，不新建定时器
+      if (approach) {
+        if (approach.lastTickAt === null) {
+          approach.lastTickAt = now;
+          return;
+        }
+        const dt = now - approach.lastTickAt;
+        approach.lastTickAt = now;
+        const delta =
+          dt > approach.plan.durationMs * 2
+            ? 1
+            : approachDelta(approach.plan, dt);
+        approach.progress = Math.min(1, approach.progress + delta);
+        if (approach.progress >= 1) {
+          // 到达：由 commit 写精确目标，避免同一 tick 先写 sample 再写目标造成两次 setPosition
+          commitApproach();
+          return;
+        }
+        const sample = sampleApproach(approach.plan, approach.progress);
+        deps.setPetPosition(Math.round(sample.x), Math.round(sample.y));
+        return;
+      }
+
+      if (!applied) return;
       // 刚吸附完的第一个 tick 只校准节流起点，不做窗口查询
       if (lastFollowAt === null) {
         lastFollowAt = now;
@@ -401,7 +595,7 @@ export function createSnapController(deps: SnapDeps, config: SnapConfig): SnapCo
     },
 
     trySnapOnRelease(): SnapOutcome | null {
-      if (!config.enabled || applied) return null;
+      if (!config.enabled || applied || approach) return null;
       if (config.mode !== 'workarea') return null;
       if (deps.isBusy()) return null;
       const bounds = deps.getPetBounds();
@@ -416,11 +610,18 @@ export function createSnapController(deps: SnapDeps, config: SnapConfig): SnapCo
         area,
         thresholdPx: SNAP_EDGE_DRAG_THRESHOLD_PX,
       });
-      return apply('bottom', 'workarea', area, { handle: null, title: '工作区下沿', className: '' });
+      // 拖到边缘松手是"已经在边上"，直接落座，不走接近（ADR 0028 D7）
+      const resolved = resolveTarget('bottom', 'workarea', area, {
+        handle: null,
+        title: '工作区下沿',
+        className: '',
+      });
+      return resolved.ok ? commit(resolved.plan) : resolved.outcome;
     },
 
     get sitting(): boolean {
-      return applied !== null;
+      // ADR 0034：sitting 是"吸附生命周期"，接近阶段也算
+      return applied !== null || approach !== null;
     },
 
     diagnostics(): SnapDiagnostics {
@@ -429,7 +630,10 @@ export function createSnapController(deps: SnapDeps, config: SnapConfig): SnapCo
         mode: config.mode === 'workarea' ? 'workarea' : 'foreground',
         configuredMode: config.mode,
         edge: config.edge,
-        sitting: applied !== null,
+        sitting: applied !== null || approach !== null,
+        approaching: approach !== null,
+        approachProgress: approach ? Number(approach.progress.toFixed(3)) : null,
+        approachMode: approach ? approach.plan.mode : null,
         target: applied
           ? {
               handle: applied.handle ?? '',
@@ -437,7 +641,14 @@ export function createSnapController(deps: SnapDeps, config: SnapConfig): SnapCo
               className: applied.className,
               rect: applied.rect,
             }
-          : null,
+          : approach
+            ? {
+                handle: approach.target.handle ?? '',
+                title: approach.target.title,
+                className: approach.target.className,
+                rect: approach.anchor,
+              }
+            : null,
         lastOutcome,
         followChecks,
         lastFollowAt,

@@ -16,9 +16,20 @@
  */
 import * as THREE from 'three';
 import { DEFAULT_HIDE_ATTACHMENTS } from '../../shared/attachments';
-import { MOUTH_FRAME_CLOSED, REBOUND_SETTLE_MS } from '../../shared/constants';
+import {
+  DRAG_POSE_RAMP_MS,
+  DRAG_RELEASE_POSE_FADE_MS,
+  DRAG_SUPPORT_ACCEL_DEADBAND,
+  DRAG_SUPPORT_ACCEL_EMA_MS,
+  DRAG_SUPPORT_ACCEL_MAX,
+  DRAG_SUPPORT_VELOCITY_EMA_MS,
+  LANDING_DURATION_MS,
+  MOUTH_FRAME_CLOSED,
+  REBOUND_SETTLE_MS,
+} from '../../shared/constants';
 import type { BroadcastEvent } from '../../shared/events';
 import { isIntent } from '../../shared/intents';
+import { cssToMask, grabBandAt } from '../../shared/mask';
 import type { Bounds3 } from '../../shared/model-frame';
 import { DEFAULT_FRAME_EXCLUDE } from '../../shared/model-frame';
 import type { Emotion, Intent, RenderState } from '../../shared/types';
@@ -27,6 +38,15 @@ import type { ActionStatus, AnimationSlot, ModelAnimations } from './animation-c
 import { createBoneArbiter } from './bone-arbiter';
 import type { BoneArbiter } from './bone-arbiter';
 import type { ClipRole } from './clip-bank';
+import {
+  createDragPendulum,
+  dragBoneOffsets,
+  pendulumConfigFor,
+  pivotCompensation,
+  stepDragPendulum,
+  struggleOffset,
+} from './drag-motion';
+import type { DragBand, DragPendulumState } from './drag-motion';
 import { approach, walkYawFor, EMOTION_FACE, EMOTION_FADE_MS, fadeProgress, resolveMouthOwner } from './emotion-face';
 import type { BlushLevel, EmotionFace, EyeAssetKey, MouthOwner, MouthShape } from './emotion-face';
 import { loadExpressionAssets } from './expression-assets';
@@ -48,15 +68,34 @@ import { createGazeController } from './gaze';
 import type { GazeController, GazeState } from './gaze';
 import { createHfsm } from './hfsm';
 import type { Hfsm, HfsmSnapshot, WalkPlan } from './hfsm';
+import { impactFromDownVelocity, landingPose } from './landing';
 import { createMaskCapture } from './mask-capture';
 import type { MaskCapture } from './mask-capture';
+import {
+  inspectMeshMaterials,
+  replaceMaterialByName,
+  resetDiagnosticMaterials,
+  setDiagnosticShading,
+  shadeSkinVertices,
+  tintSkinVertices,
+} from './material-diagnostics';
+import type {
+  DiagnosticShading,
+  MeshMaterialFacts,
+  ShadingResult,
+  SkinShadingOptions,
+} from './material-diagnostics';
 import { loadModel, measureAnimatedMinY, measureAnimatedBounds, placeModel } from './model-loader';
-import type { LoadedModel } from './model-loader';
+import type { LoadedModel, ModelBones } from './model-loader';
 import { PAT_DURATION_MS, PAT_MOUTH_FRAME, patPose } from './pat-react';
 import type { PatPose } from './pat-react';
 import { createCapsulePlaceholder, PLACEHOLDER_BOTTOM_MARGIN_PX } from './placeholder';
 import type { PlaceholderModel } from './placeholder';
 import { sitPose } from './sit-pose';
+import { bakeSkinShading, clearSkinShadingCache, restoreSkinShading } from './skin-shading';
+import type { SkinShadingStats } from './skin-shading';
+import { startleDurationMs, startlePose } from './startle';
+import type { StartleReason } from './startle';
 
 /** 契约 §7.3 / §12：同一 intent 200ms 内只执行一次。 */
 export const INTENT_DEDUPE_MS = 200;
@@ -74,13 +113,6 @@ const SIT_IN_FADE_SECONDS = 0.45;
 const SIT_OUT_FADE_SECONDS = 0.35;
 /** 加载期"临时切到坐姿采样"用的淡入（不能是 0：three 的权重插值需要正时长） */
 const CALIBRATION_FADE_SECONDS = 0.001;
-
-/** 拖拽期间的"整体轻微摇摆"与"被拎起"抬升（不写骨骼，只转/抬 animationRoot）。 */
-const DRAG_SWAY_PERIOD_S = 1.6;
-const DRAG_SWAY_RAD = 0.05;
-const DRAG_SWAY_RAMP_MS = 220;
-const DRAG_LIFT_PX = 18;
-const DRAG_LIFT_SMOOTHING = 12;
 
 /** 待机姿态轮换（ADR 0023 D5）：22–40s 在 Cafe_Idle / Formation_Idle 之间换。 */
 const IDLE_VARIANT_ROLES: readonly ClipRole[] = ['idle', 'idle.alt1'];
@@ -229,9 +261,28 @@ export interface RenderDiagnostics {
     walkYaw: number;
     walkYawTarget: number;
   };
+  /** ADR 0035：拖拽抓取点、受迫摆、落地分级（内部诊断，不进 `RenderState`） */
+  drag: {
+    phase: 'idle' | 'dragged' | 'settling';
+    band: DragBand | null;
+    /** 抓取点在内容区 CSS 坐标中的位置 */
+    pivot: { x: number; y: number };
+    angle: number;
+    omega: number;
+    gain: number;
+    supportAcceleration: { x: number; y: number };
+    landingImpact: number | null;
+    /** 本帧实际减掉的 scale.y（0..0.08） */
+    landingSquash: number;
+    startle: StartleReason | null;
+  };
   /** ADR 0028：前台窗口吸附与坐姿（内部诊断，不进 `RenderState`） */
   sit: {
     sitting: boolean;
+    /** ADR 0034：false = 接近阶段，true = 已落座 */
+    arrived: boolean;
+    /** ADR 0034：接近阶段的模式/时长/进度（未接近为 null） */
+    approach: { mode: 'walk' | 'leap'; durationMs: number; progress: number } | null;
     /** 吸附在哪条边；未吸附为 null */
     edge: 'top' | 'bottom' | null;
     /** 官方坐姿片段缺失 → 程序化降级（下沉 + 弯腿） */
@@ -253,6 +304,8 @@ export interface RenderDiagnostics {
   };
   pat: PatDiagnostics;
   speech: { frame: number; driven: boolean };
+  /** ADR 0036：手/小臂顶点烘焙光照（内部诊断，不进 `RenderState`） */
+  skin: SkinShadingStats | null;
   probePoints: { head: { x: number; y: number } | null; body: { x: number; y: number } | null };
 }
 
@@ -265,6 +318,11 @@ export interface RenderModule {
   dispose(): void;
   /** 内部：`cmd:probe` 的光标位置，用于视线跟随（不跨进程暴露） */
   setCursor(cssX: number, cssY: number, at?: number): void;
+  /**
+   * 内部（ADR 0035 D1）：`pointerdown` 的抓取事实。只留在渲染进程，
+   * 不跨 IPC；在 `drag_started` 到达时消费。
+   */
+  noteGrabPoint(cssX: number, cssY: number, at?: number): void;
   /** 内部：语音播放器的口型驱动入口（ADR 0015 D4） */
   setMouthFrame(frame: number): void;
   /** 内部：交还闭嘴帧（`speech_ended` / 打断时调用） */
@@ -275,6 +333,39 @@ export interface RenderModule {
   getDiagnostics(): RenderDiagnostics;
   /** 内部：自检把 20–40s 的行走调度压到 1.5–2s */
   setWalkInterval(minIntervalMs: number, maxIntervalMs: number): void;
+  /**
+   * 内部（标定用，ADR 0035 D5）：给单根骨骼叠加一个持久偏移。
+   * 用于确认 3ds Max 导出的骨骼"哪个方向是低头/抬手"，**不是**生产姿态入口。
+   */
+  setDebugBoneOffset(boneName: string, yaw: number, pitch: number, roll: number): boolean;
+  clearDebugBoneOffsets(): void;
+  listBones(): string[];
+  /** 标定辅助：骨骼当前世界坐标（three 场景坐标） */
+  getBoneWorld(boneName: string): { x: number; y: number; z: number } | null;
+  /**
+   * 内部（阶段 14 手部发白诊断）：
+   * 遍历场景所有 SkinnedMesh，报告材质/贴图/色彩空间/手部顶点数。
+   */
+  inspectMaterials(): MeshMaterialFacts[];
+  /** 内部（诊断）：把"手/小臂主导"的顶点临时染成指定颜色（保留贴图）。 */
+  tintSkinVertices(
+    scope: 'none' | 'hand' | 'both',
+    color?: [number, number, number],
+  ): { meshes: number; handVertices: number; forearmVertices: number };
+  /** 内部（诊断）：把法线明暗写进手/小臂顶点色（验证"不换材质也能有阴影"）。 */
+  shadeSkinVertices(
+    options: SkinShadingOptions,
+  ): { meshes: number; vertices: number; minShade: number; maxShade: number };
+  /** 内部（诊断）：把 Body 材质整体换成纯色，确认"手是不是在这块网格上"。 */
+  testHandMaterial(color?: number): { materialName: string; meshes: string[] } | null;
+  /** 内部（诊断）：无光照 ↔ Toon（环境光 + 方向光）切换，验证"加光照手会不会有阴影"。 */
+  setDiagnosticShading(mode: DiagnosticShading): ShadingResult;
+  /** 内部（诊断）：开/关手部肤色烘焙（A/B 对照；关 = 还原到模型原始白色顶点色）。 */
+  setSkinBake(enabled: boolean): SkinShadingStats | null;
+  /** 内部（诊断）：恢复材质与顶点色。 */
+  resetMaterialDiagnostics(): void;
+  /** 内部（诊断）：双手骨骼在内容区 CSS 坐标里的位置（用于截图取样）。 */
+  handScreenPoints(): { left: { x: number; y: number } | null; right: { x: number; y: number } | null } | null;
 }
 
 export interface RenderModuleOptions {
@@ -294,8 +385,28 @@ export interface RenderModuleOptions {
   }) => void;
 }
 
-class StageRender implements RenderModule {
-  private readonly renderer: THREE.WebGLRenderer;
+function distance(a: { x: number; y: number }, b: { x: number; y: number }): number {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function pickNearestPoint(
+  point: { x: number; y: number },
+  candidates: Array<{ x: number; y: number } | null>,
+): { x: number; y: number } | null {
+  let best: { x: number; y: number } | null = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const d = distance(point, candidate);
+    if (d < bestDistance) {
+      bestDistance = d;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+class StageRender implements RenderModule {  private readonly renderer: THREE.WebGLRenderer;
   private readonly scene = new THREE.Scene();
   private readonly camera: THREE.OrthographicCamera;
   /** Physics/Overlay 的位移与旋转挂在这里；它的原点 = 内容区底边中心（脚底） */
@@ -313,7 +424,11 @@ class StageRender implements RenderModule {
 
   /** ADR 0028 D5/D8：吸附（`sitting`）与坐姿 */
   private sitting = false;
+  /** ADR 0034：false = 接近阶段，true = 已落座 */
+  private sitArrived = false;
   private sitStartedAt = 0;
+  /** ADR 0034：接近阶段的播放信息（诊断用，不进 RenderState） */
+  private sitApproach: { mode: 'walk' | 'leap'; durationMs: number; startedAt: number } | null = null;
   /** 官方坐姿片段缺失 → 程序化降级（悬空姿态下沉 + 大腿弯曲） */
   private sitProcedural = false;
   private sitEdge: 'top' | 'bottom' | null = null;
@@ -350,8 +465,45 @@ class StageRender implements RenderModule {
   private reaction: { spec: ReactionSpec; startedAt: number } | null = null;
   private dragStartedAt: number | null = null;
   private dragging = false;
-  private dragSwayGain = 0;
-  private dragLiftPx = 0;
+
+  /** ADR 0035：待定抓取事实（pointerdown 记录，drag_started 消费） */
+  private pendingGrab: { band: DragBand; cssX: number; cssY: number; at: number } | null = null;
+  private dragBand: DragBand = 'body';
+  private dragPendulum: DragPendulumState = createDragPendulum();
+  /** 抓取点在 animationRoot 局部坐标中的位置（绕它旋转） */
+  private dragPivot = { x: 0, y: 0 };
+  /** 抓取点在内容区 CSS 坐标中的位置（诊断/标定用） */
+  private dragPivotCss = { x: 0, y: 0 };
+  /** 姿态增益：拖拽淡入、松手淡出 */
+  private dragPoseGain = 0;
+  /** 本帧实际提交给根节点的摆角（诊断用） */
+  private dragAngle = 0;
+  /** 支撑点（窗口 screenX/Y）的运动滤波 */
+  private supportSample: { x: number; y: number; at: number } | null = null;
+  private supportVelocity = { x: 0, y: 0 };
+  private supportAcceleration = { x: 0, y: 0 };
+  /** settling 期间窗口向下的峰值速度（px/s），用于落地分级 */
+  private settlePeakDownVelocity = 0;
+  /** 落地缓冲：motion_ended{settle} 之后的一段短姿态 */
+  private landing: { startedAt: number; impact: number } | null = null;
+  /** 本帧实际减掉的 scale.y（诊断用） */
+  private landingSquash = 0;
+  /** 惊跳起身：snap_released 之后的一段短姿态（不新增状态） */
+  private startle: { reason: StartleReason; startedAt: number; durationMs: number } | null = null;
+  /** 惊跳把表情临时投影为 surprised（ADR 0034 D5） */
+  private startleSurprised = false;
+
+  /** 标定用：单根骨骼的持久偏移（ADR 0035 D5，不是生产姿态入口） */
+  private readonly debugBoneOffsets = new Map<string, { yaw: number; pitch: number; roll: number }>();
+  /** 诊断用：Toon 模式的光照（阶段 14 手部发白排查） */
+  private diagnosticLights: {
+    ambient: THREE.AmbientLight;
+    directional: THREE.DirectionalLight;
+  } | null = null;
+  /** 诊断用：Body 材质替换的恢复句柄 */
+  private diagnosticMaterialRestore: (() => void) | null = null;
+  /** ADR 0036：手/小臂肤色烘焙结果（内部诊断） */
+  private skinShading: SkinShadingStats | null = null;
   private patMouthActive = false;
   /** 摸头是否由官方整身片段承担（true 时不再叠加程序化头部偏移，ADR 0023 D4） */
   private officialPat = false;
@@ -437,6 +589,18 @@ class StageRender implements RenderModule {
 
       this.model = loaded;
 
+      // ADR 0036：手/小臂顶点烘焙暖肤色 + 法线明暗。
+      // 本资产的身体贴图是平涂色块、手部 UV 只覆盖 1–2 texel，而无光照材质
+      // 不做明暗计算 → 手会是一块纯白发光板。这里把明暗写进 COLOR_0，
+      // 不换材质、不加灯、不影响其它部位。
+      this.skinShading = bakeSkinShading(loaded.root);
+      console.log(
+        `[render] 手/小臂肤色已烘焙（ADR 0036） meshes=${this.skinShading.meshes} ` +
+          `vertices=${this.skinShading.vertices} ` +
+          `shade=${this.skinShading.minShade.toFixed(2)}–${this.skinShading.maxShade.toFixed(2)} ` +
+          `mean=(${this.skinShading.meanColor.map((c) => c.toFixed(3)).join(',')})`,
+      );
+
       if (this.placeholder) {
         this.animationRoot.remove(this.placeholder.group);
         this.placeholder.dispose();
@@ -451,7 +615,8 @@ class StageRender implements RenderModule {
       this.calibrateSitPose();
 
       this.arbiter = createBoneArbiter();
-      for (const bone of [loaded.bones.head, loaded.bones.eyeL, loaded.bones.eyeR]) {
+      // 所有会接收程序化偏移的骨骼都登记进来（ADR 0035：悬挂/落地/坐姿/惊跳）
+      for (const bone of Object.values(loaded.bones)) {
         if (bone) this.arbiter.register(bone);
       }
       this.gaze = createGazeController(loaded.bones);
@@ -694,7 +859,12 @@ class StageRender implements RenderModule {
     const speaking = snapshot.speakingUtteranceId !== null;
     const pat = this.patState(now);
     const patActive = pat !== null;
-    const effective: Emotion = patActive ? 'shy' : this.emotion;
+    // ADR 0034 D5：惊跳时临时投影 surprised（优先于摸头的 shy）
+    const effective: Emotion = this.startleSurprised
+      ? 'surprised'
+      : patActive
+        ? 'shy'
+        : this.emotion;
 
     if (effective !== this.appliedEmotion) {
       this.appliedEmotion = effective;
@@ -772,7 +942,7 @@ class StageRender implements RenderModule {
     if (!facial) return null;
     const snapshot = this.hfsm.snapshot();
     const speaking = snapshot.speakingUtteranceId !== null;
-    const effective: Emotion = pat ? 'shy' : this.emotion;
+    const effective: Emotion = this.startleSurprised ? 'surprised' : pat ? 'shy' : this.emotion;
     const face: EmotionFace = EMOTION_FACE[effective] ?? EMOTION_FACE.neutral;
     const alpha = fadeProgress(now - this.emotionFadeStartedAt, EMOTION_FADE_MS);
     const owner = resolveMouthOwner({
@@ -819,15 +989,6 @@ class StageRender implements RenderModule {
         eyeImageLabel: facial.eyeImageLabel,
       },
     };
-  }
-
-  /** 拖拽期间的轻微摇摆（ADR 0014 D3）。 */
-  private dragSway(now: number): number {
-    if (this.dragStartedAt === null || this.dragSwayGain <= 0.001) return 0;
-    const elapsedMs = Math.max(0, now - this.dragStartedAt);
-    const ramp = Math.min(1, elapsedMs / DRAG_SWAY_RAMP_MS);
-    const phase = (elapsedMs / 1000 / DRAG_SWAY_PERIOD_S) * Math.PI * 2;
-    return Math.sin(phase) * DRAG_SWAY_RAD * ramp * this.dragSwayGain;
   }
 
   /**
@@ -1047,18 +1208,30 @@ class StageRender implements RenderModule {
         this.stopWalk('drag_started');
         // ADR 0028 D9：拖走她就离开窗口边缘（shell 也会发 snap_released，这里同时兜底）
         this.sitting = false;
+        this.sitArrived = false;
+        this.sitApproach = null;
         this.sitEdge = null;
         this.sitProcedural = false;
         this.hfsm.dragStarted(now);
         this.dragStartedAt = now;
         this.dragging = true;
-        this.playAnimation('held', DRAG_IN_CROSSFADE_SECONDS, 'drag_started');
+        this.beginDrag(now);
+        // 抓头用普通站姿做底（手臂自然下垂），抓身/抓脚用 Formation_Pickup（蜷缩被拎起）
+        if (this.dragBand === 'head') {
+          const limp = this.animations?.playRole('held.limp', DRAG_IN_CROSSFADE_SECONDS, 'held') ?? false;
+          if (!limp) this.playAnimation('held', DRAG_IN_CROSSFADE_SECONDS, 'drag_started（held.limp 缺失，降级）');
+          else console.log('[render] 动作切换 drag_started → held.limp=CH0335_Carrier_Idle');
+        } else {
+          this.playAnimation('held', DRAG_IN_CROSSFADE_SECONDS, 'drag_started');
+        }
         break;
       }
       case 'drag_released': {
         // D-6 / ADR 0024 D3：松手先进入 settling，回弹过程中淡回 Idle
         this.hfsm.dragReleased(now);
         this.dragging = false;
+        // settling 期间重新累积向下峰值，落地时按冲击分级（ADR 0035 D4）
+        this.settlePeakDownVelocity = 0;
         this.playAnimation('idle', SETTLE_FADE_SECONDS, 'drag_released → settling（回弹中）');
         break;
       }
@@ -1074,13 +1247,34 @@ class StageRender implements RenderModule {
         }
         if (payload.kind === 'settle') {
           this.hfsm.settleEnded(now);
-          // 落地缓冲：极短的下蹲（ADR 0024 D3），不参与窗口位移
-          this.reaction = {
-            spec: { durationMs: 180, squash: 0.06 },
-            startedAt: now,
-          };
-          console.log(`[render] 回弹结束（${reason}）→ 落地缓冲 180ms`);
+          // 落地缓冲：按 settling 期间记录的向下峰值速度分级（ADR 0035 D4）
+          const impact = impactFromDownVelocity(this.settlePeakDownVelocity);
+          this.landing = { startedAt: now, impact };
+          this.dragPendulum = { angle: this.dragPendulum.angle, angularVelocity: 0 };
+          console.log(
+            `[render] 回弹结束（${reason}）→ 落地缓冲 impact=${impact.toFixed(2)} ` +
+              `vDown=${Math.round(this.settlePeakDownVelocity)}px/s`,
+          );
+          this.settlePeakDownVelocity = 0;
         }
+        break;
+      }
+      case 'snap_approach_started': {
+        // ADR 0034 D2/D5：吸附生命周期进入接近阶段（Physics 仍是 sitting）
+        const payload = event.payload as {
+          edge?: unknown;
+          source?: unknown;
+          mode?: unknown;
+          durationMs?: unknown;
+        };
+        const edge: 'top' | 'bottom' = payload.edge === 'top' ? 'top' : 'bottom';
+        const source = typeof payload.source === 'string' ? payload.source : 'foreground';
+        const mode: 'walk' | 'leap' = payload.mode === 'leap' ? 'leap' : 'walk';
+        const durationMs =
+          typeof payload.durationMs === 'number' && Number.isFinite(payload.durationMs)
+            ? Math.max(1, payload.durationMs)
+            : 400;
+        this.enterApproach(now, edge, source, mode, durationMs);
         break;
       }
       case 'snap_applied': {
@@ -1112,20 +1306,73 @@ class StageRender implements RenderModule {
     this.gaze?.setCursor(cssX, cssY, at);
   }
 
+  /** ADR 0035：消费 `pendingGrab`，确定抓取带/支点，重置单摆与支撑运动。 */
+  private beginDrag(now: number): void {
+    const grab = this.pendingGrab;
+    const fresh = grab !== null && now - grab.at <= 1500;
+    this.dragBand = fresh ? grab.band : 'body';
+    const cssX = fresh ? grab.cssX : this.width / 2;
+    const cssY = fresh ? grab.cssY : this.height * 0.45;
+    const pivot = this.computeDragPivot(this.dragBand, cssX, cssY);
+    this.dragPivot = pivot.local;
+    this.dragPivotCss = pivot.css;
+    this.dragPendulum = createDragPendulum();
+    this.dragPoseGain = 0;
+    this.supportSample = null;
+    this.supportVelocity = { x: 0, y: 0 };
+    this.supportAcceleration = { x: 0, y: 0 };
+    this.settlePeakDownVelocity = 0;
+    this.pendingGrab = null;
+    console.log(
+      `[render] 拖拽抓取 band=${this.dragBand} pivot=(${Math.round(pivot.css.x)},${Math.round(pivot.css.y)}) ` +
+        `local=(${Math.round(pivot.local.x)},${Math.round(pivot.local.y)})`,
+    );
+  }
+
   /**
-   * ADR 0028 D8：进入 `sitting`。
+   * ADR 0034 D2/D5：`snap_approach_started` → 进入 `sitting` 的接近阶段。
+   * 不播坐姿，只播走路/跳跃；`snap_applied` 到达后才 `playHold('sit')`。
+   */
+  private enterApproach(
+    now: number,
+    edge: 'top' | 'bottom',
+    source: string,
+    mode: 'walk' | 'leap',
+    durationMs: number,
+  ): void {
+    this.stopWalk('snap_approach_started');
+    this.hfsm.snapApproaching(now);
+    this.sitting = true;
+    this.sitArrived = false;
+    this.sitStartedAt = now;
+    this.sitEdge = edge;
+    this.sitProcedural = false;
+    this.sitApproach = { mode, durationMs, startedAt: now };
+    // 接近阶段用行走循环；leap 的窗口弧线由 shell 负责，模型不自己位移
+    this.playAnimation('walk', 0.2, `snap_approach_started(${mode}, ${Math.round(durationMs)}ms)`);
+    console.log(
+      `[render] sitting 接近 edge=${edge} source=${source} mode=${mode} ` +
+        `duration=${Math.round(durationMs)}ms`,
+    );
+  }
+
+  /**
+   * ADR 0028 D8：进入 `sitting` 的落座阶段。
    *
    * 顺序是刻意的：先收步（正在走的话立即停），再让 HFSM 进 Physics（这会清空行走排期），
    * 最后播坐姿——`sitting` 期间 Base 层不再有任何调度，她不会在窗口边缘上迈步。
    */
   private enterSit(now: number, edge: 'top' | 'bottom', source: string): void {
     const wasSitting = this.sitting;
+    const wasArrived = this.sitArrived;
     this.stopWalk('snap_applied');
     this.hfsm.snapApplied(now);
     this.sitting = true;
-    this.sitStartedAt = wasSitting ? this.sitStartedAt : now;
+    this.sitArrived = true;
+    this.sitStartedAt = wasArrived ? this.sitStartedAt : now;
     this.sitEdge = edge;
-    if (wasSitting && this.animations?.hold()) {
+    this.sitApproach = null;
+    if (wasSitting && wasArrived && this.animations?.hold()) {
       // 改吸到另一扇窗：保持当前坐姿，不重播"坐下去"
       console.log(`[render] sitting 目标更新 edge=${edge} source=${source}（保持坐姿）`);
       return;
@@ -1142,14 +1389,29 @@ class StageRender implements RenderModule {
     );
   }
 
-  /** ADR 0028 D9：离开 `sitting` —— 淡出坐姿、站回 Idle，并重新排期行走。 */
+  /** ADR 0028 D9 / ADR 0034 D5：离开 `sitting` —— 淡出坐姿、站回 Idle，并重新排期行走。 */
   private exitSit(now: number, reason: string): void {
     if (!this.sitting) return;
     this.sitting = false;
+    this.sitArrived = false;
+    this.sitApproach = null;
     this.sitEdge = null;
     this.sitProcedural = false;
     this.hfsm.snapReleased(now);
     this.animations?.clearHold(SIT_OUT_FADE_SECONDS);
+    // ADR 0034 D5：按解除原因播"惊跳/起身"；拖拽由 drag_started 接管，不叠惊跳
+    if (reason !== 'dragged') {
+      const mapped: StartleReason =
+        reason === 'clicked' || reason === 'window-gone' || reason === 'fullscreen'
+          ? reason
+          : 'command';
+      this.startle = {
+        reason: mapped,
+        startedAt: now,
+        durationMs: startleDurationMs(mapped),
+      };
+      this.startleSurprised = false;
+    }
     this.playAnimation('idle', SIT_OUT_FADE_SECONDS, `snap_released(${reason}) → 站立`);
     console.log(`[render] sitting 结束 reason=${reason}`);
   }
@@ -1174,6 +1436,279 @@ class StageRender implements RenderModule {
     if (minIntervalMs <= 0 || maxIntervalMs < minIntervalMs) return;
     this.hfsm.setWalkSchedule({ minIntervalMs, maxIntervalMs }, performance.now());
     console.log(`[render] 行走调度间隔改为 ${minIntervalMs}–${maxIntervalMs}ms（自检用）`);
+  }
+
+  /** 标定：列出模型里实际存在的骨骼名（归一化前的 three 名字）。 */
+  listBones(): string[] {
+    const model = this.model;
+    if (!model) return [];
+    const names: string[] = [];
+    for (const bone of Object.values(model.bones)) {
+      if (bone) names.push(bone.name);
+    }
+    return names;
+  }
+
+  private findBone(name: string): THREE.Bone | null {
+    const model = this.model;
+    if (!model || typeof name !== 'string') return null;
+    const lower = name.toLowerCase();
+    for (const bone of Object.values(model.bones)) {
+      if (!bone) continue;
+      if (bone.name === name || bone.name.toLowerCase() === lower) return bone;
+    }
+    return null;
+  }
+
+  setDebugBoneOffset(boneName: string, yaw: number, pitch: number, roll: number): boolean {
+    const bone = this.findBone(boneName);
+    if (!bone) return false;
+    if (!Number.isFinite(yaw) || !Number.isFinite(pitch) || !Number.isFinite(roll)) return false;
+    this.debugBoneOffsets.set(bone.name, { yaw, pitch, roll });
+    console.log(
+      `[render] 标定骨骼 ${bone.name}: yaw=${yaw.toFixed(3)} pitch=${pitch.toFixed(3)} roll=${roll.toFixed(3)}`,
+    );
+    return true;
+  }
+
+  clearDebugBoneOffsets(): void {
+    if (this.debugBoneOffsets.size > 0) console.log('[render] 清除标定骨骼偏移');
+    this.debugBoneOffsets.clear();
+  }
+
+  getBoneWorld(boneName: string): { x: number; y: number; z: number } | null {
+    const bone = this.findBone(boneName);
+    if (!bone) return null;
+    this.scene.updateMatrixWorld(true);
+    const world = new THREE.Vector3();
+    bone.getWorldPosition(world);
+    return { x: world.x, y: world.y, z: world.z };
+  }
+
+  /**
+   * 诊断（阶段 14）：遍历场景里所有 Mesh/SkinnedMesh，回答"手在哪块网格、
+   * 材质是不是 Basic、贴图在不在、贴图色彩空间是什么、手部 UV 采到什么颜色"。
+   * 只读，不改变渲染状态。
+   */
+  inspectMaterials(): MeshMaterialFacts[] {
+    return inspectMeshMaterials(this.model ? this.model.root : this.scene);
+  }
+
+  /** 诊断：只把手/小臂的顶点染色（保留贴图），用来证明"红的那块就是手"。 */
+  tintSkinVertices(
+    scope: 'none' | 'hand' | 'both',
+    color: [number, number, number] = [1, 0, 0],
+  ): { meshes: number; handVertices: number; forearmVertices: number } {
+    const root = this.model ? this.model.root : this.scene;
+    const result = tintSkinVertices(root, scope, color);
+    console.log(
+      `[render] 诊断：顶点染色 scope=${scope} meshes=${result.meshes} ` +
+        `hand=${result.handVertices} forearm=${result.forearmVertices}`,
+    );
+    return result;
+  }
+
+  /** 诊断：把法线明暗写进手/小臂顶点色（不换材质、不加灯）。 */
+  shadeSkinVertices(options: SkinShadingOptions): {
+    meshes: number;
+    vertices: number;
+    minShade: number;
+    maxShade: number;
+  } {
+    const root = this.model ? this.model.root : this.scene;
+    const result = shadeSkinVertices(root, options);
+    console.log(
+      `[render] 诊断：手部顶点烘焙明暗 meshes=${result.meshes} vertices=${result.vertices} ` +
+        `shade=${result.minShade.toFixed(2)}–${result.maxShade.toFixed(2)}`,
+    );
+    return result;
+  }
+
+  /** 诊断：把 Body 材质整体换成纯红（证明手与衣服/腿共用同一块网格与材质）。 */
+  testHandMaterial(color = 0xff0000): { materialName: string; meshes: string[] } | null {
+    if (!this.model) return null;
+    const name =
+      this.model.materialNames.find((candidate) => /^CH0335_Body$/i.test(candidate)) ??
+      this.model.materialNames.find((candidate) => /body/i.test(candidate)) ??
+      null;
+    if (!name) return null;
+    this.diagnosticMaterialRestore?.();
+    const replacement = replaceMaterialByName(this.model.root, name, color);
+    this.diagnosticMaterialRestore = replacement.restore;
+    console.log(`[render] 诊断：材质 ${name} → 纯色 #${color.toString(16)}，覆盖网格=${replacement.meshes.join('|')}`);
+    return { materialName: name, meshes: replacement.meshes };
+  }
+
+  /** 诊断：无光照（生产）↔ Toon + 光照（验证阴影）。 */
+  setDiagnosticShading(mode: DiagnosticShading): ShadingResult {
+    const root = this.model ? this.model.root : this.scene;
+    const { result, lights } = setDiagnosticShading(this.scene, root, mode, this.diagnosticLights);
+    this.diagnosticLights = lights;
+    console.log(
+      `[render] 诊断：着色模式=${result.mode} 材质数=${result.materials.length} ` +
+        `光照=${result.lights ? `ambient ${result.lights.ambient} + directional ${result.lights.directional}` : '无'}`,
+    );
+    return result;
+  }
+
+  /** 诊断：开/关手部肤色烘焙（A/B 对照；关 = 还原模型原始白色顶点色）。 */
+  setSkinBake(enabled: boolean): SkinShadingStats | null {
+    if (!this.model) return null;
+    if (enabled) {
+      this.skinShading = bakeSkinShading(this.model.root);
+      console.log(
+        `[render] 诊断：手部肤色烘焙已开启 vertices=${this.skinShading.vertices}`,
+      );
+      return this.skinShading;
+    }
+    const restored = restoreSkinShading(this.model.root);
+    this.skinShading = null;
+    console.log(`[render] 诊断：手部肤色烘焙已关闭（还原 ${restored.meshes} 块网格）`);
+    return null;
+  }
+
+  /** 诊断：恢复生产材质与顶点色（必须在诊断结束后调用）。 */
+  resetMaterialDiagnostics(): void {
+    this.diagnosticMaterialRestore?.();
+    this.diagnosticMaterialRestore = null;
+    resetDiagnosticMaterials(this.model ? this.model.root : this.scene);
+    if (this.diagnosticLights) {
+      this.scene.remove(this.diagnosticLights.ambient, this.diagnosticLights.directional);
+      this.diagnosticLights.ambient.dispose();
+      this.diagnosticLights.directional.dispose();
+      this.diagnosticLights = null;
+    }
+    console.log('[render] 诊断：材质与光照已恢复');
+  }
+
+  /** 诊断：双手骨骼的内容区 CSS 坐标（截图取样用；窗口坐标原点在左上角）。 */
+  handScreenPoints(): {
+    left: { x: number; y: number } | null;
+    right: { x: number; y: number } | null;
+  } | null {
+    if (!this.model) return null;
+    return {
+      left: this.boneCss(this.model.bones.handL),
+      right: this.boneCss(this.model.bones.handR),
+    };
+  }
+
+  noteGrabPoint(cssX: number, cssY: number, at: number = performance.now()): void {
+    if (!Number.isFinite(cssX) || !Number.isFinite(cssY)) return;
+    const band = this.classifyGrab(cssX, cssY);
+    this.pendingGrab = { band, cssX, cssY, at };
+    console.log(`[render] 抓取候选 band=${band} at=(${Math.round(cssX)},${Math.round(cssY)})`);
+  }
+
+  /** 抓取分类（ADR 0035 D1）：骨骼最近点优先，掩膜 bbox 三段带兜底。 */
+  private classifyGrab(cssX: number, cssY: number): DragBand {
+    const model = this.model;
+    const bbox = this.maskCapture.snapshot().bbox;
+    const width = Math.max(1, this.width);
+    const height = Math.max(1, this.height);
+    if (model) {
+      const head = this.boneCss(model.bones.head);
+      const pelvis = this.boneCss(model.bones.pelvis ?? model.bones.spine ?? model.bones.spine1);
+      const footL = this.boneCss(model.bones.footL);
+      const footR = this.boneCss(model.bones.footR);
+      const foot = pickNearestPoint({ x: cssX, y: cssY }, [footL, footR]);
+      if (head && pelvis && foot) {
+        const point = { x: cssX, y: cssY };
+        const dHead = distance(point, head);
+        const dBody = distance(point, pelvis);
+        const dFoot = distance(point, foot);
+        // 头部：接近头骨，且不低到胸口以下
+        if (point.y <= head.y + height * 0.08 && dHead <= height * 0.18) return 'head';
+        // 脚部：接近脚骨，且落在下半身
+        if (point.y >= foot.y - height * 0.12 && dFoot <= height * 0.16) return 'foot';
+        if (dFoot < dBody * 0.75 && point.y > height * 0.72) return 'foot';
+        if (dHead < dBody * 0.6 && point.y < height * 0.45) return 'head';
+        return 'body';
+      }
+    }
+    if (bbox) {
+      const { mx, my } = cssToMask(cssX, cssY, width, height);
+      return grabBandAt(bbox, mx, my) ?? 'body';
+    }
+    return 'body';
+  }
+
+  private boneCss(bone: THREE.Bone | null): { x: number; y: number } | null {
+    if (!bone) return null;
+    this.scene.updateMatrixWorld(true);
+    const world = new THREE.Vector3();
+    bone.getWorldPosition(world);
+    return {
+      x: this.width / 2 + world.x,
+      y: this.height / 2 - world.y,
+    };
+  }
+
+  /**
+   * 抓取点为支点（ADR 0035 D2）：**用真实按下点**而不是骨骼中心。
+   *
+   * 按下点已经过掩膜命中（alpha ≥ 0.5），就是"手抓住的那个像素"；用骨骼中心会让
+   * 抓头发时支点跑到头部中心（实测差 140px），看起来像"站在光标旁边"。
+   * `band` 只决定姿态，不决定支点。
+   */
+  private computeDragPivot(band: DragBand, cssX: number, cssY: number): {
+    local: { x: number; y: number };
+    css: { x: number; y: number };
+  } {
+    void band;
+    return {
+      // animationRoot 的常态原点 = 内容区底边中心：local = (x - W/2, y - 0) with y up
+      local: { x: cssX - this.width / 2, y: this.height - cssY },
+      css: { x: cssX, y: cssY },
+    };
+  }
+
+  /**
+   * 支撑点运动（ADR 0035 D3）：窗口 screenX/Y → 速度 → 加速度。
+   * 两级 EMA + 死区 + 限幅，压住 1px 量化噪声；只在拖拽/回弹时被消费。
+   */
+  private updateSupportMotion(now: number): void {
+    const x = window.screenX;
+    const y = window.screenY;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    const previous = this.supportSample;
+    if (!previous) {
+      this.supportSample = { x, y, at: now };
+      return;
+    }
+    const dtMs = now - previous.at;
+    if (!(dtMs > 0) || dtMs > 250) {
+      this.supportSample = { x, y, at: now };
+      this.supportVelocity = { x: 0, y: 0 };
+      return;
+    }
+
+    const rawVx = ((x - previous.x) / dtMs) * 1000;
+    const rawVy = ((y - previous.y) / dtMs) * 1000;
+    const velocityAlpha = 1 - Math.exp(-dtMs / DRAG_SUPPORT_VELOCITY_EMA_MS);
+    const previousVx = this.supportVelocity.x;
+    const previousVy = this.supportVelocity.y;
+    const vx = previousVx + (rawVx - previousVx) * velocityAlpha;
+    const vy = previousVy + (rawVy - previousVy) * velocityAlpha;
+
+    const rawAx = ((vx - previousVx) / dtMs) * 1000;
+    const rawAy = ((vy - previousVy) / dtMs) * 1000;
+    const accelAlpha = 1 - Math.exp(-dtMs / DRAG_SUPPORT_ACCEL_EMA_MS);
+    let ax = this.supportAcceleration.x + (rawAx - this.supportAcceleration.x) * accelAlpha;
+    let ay = this.supportAcceleration.y + (rawAy - this.supportAcceleration.y) * accelAlpha;
+    if (Math.abs(ax) < DRAG_SUPPORT_ACCEL_DEADBAND) ax = 0;
+    if (Math.abs(ay) < DRAG_SUPPORT_ACCEL_DEADBAND) ay = 0;
+    ax = Math.max(-DRAG_SUPPORT_ACCEL_MAX, Math.min(DRAG_SUPPORT_ACCEL_MAX, ax));
+    ay = Math.max(-DRAG_SUPPORT_ACCEL_MAX, Math.min(DRAG_SUPPORT_ACCEL_MAX, ay));
+
+    this.supportVelocity = { x: vx, y: vy };
+    this.supportAcceleration = { x: ax, y: ay };
+    this.supportSample = { x, y, at: now };
+
+    // 回弹期间记录向下峰值：落地缓冲的冲击强度（ADR 0035 D4）
+    if (this.hfsm.snapshot().physics === 'settling' && vy > this.settlePeakDownVelocity) {
+      this.settlePeakDownVelocity = vy;
+    }
   }
 
   getState(): RenderState {
@@ -1269,12 +1804,44 @@ class StageRender implements RenderModule {
         walkYaw: this.walkYaw,
         walkYawTarget: this.walkYawTarget,
       },
+      drag: {
+        phase: this.dragging
+          ? 'dragged'
+          : snapshot.physics === 'settling'
+            ? 'settling'
+            : 'idle',
+        band: this.dragPoseGain > 0.001 ? this.dragBand : null,
+        pivot: {
+          x: Number(this.dragPivotCss.x.toFixed(1)),
+          y: Number(this.dragPivotCss.y.toFixed(1)),
+        },
+        angle: Number(this.dragAngle.toFixed(4)),
+        omega: Number(this.dragPendulum.angularVelocity.toFixed(4)),
+        gain: Number(this.dragPoseGain.toFixed(3)),
+        supportAcceleration: {
+          x: Number(this.supportAcceleration.x.toFixed(1)),
+          y: Number(this.supportAcceleration.y.toFixed(1)),
+        },
+        landingImpact: this.landing?.impact ?? null,
+        landingSquash: Number(this.landingSquash.toFixed(4)),
+        startle: this.startle?.reason ?? null,
+      },
       sit: (() => {
         const held = this.animations?.hold() ?? null;
         const pose = this.sitting ? sitPose(now - this.sitStartedAt, this.sitProcedural) : null;
         const shift = this.sitting ? this.sitOffsetPx() : { x: 0, y: 0 };
         return {
           sitting: this.sitting,
+          arrived: this.sitArrived,
+          approach: this.sitApproach
+            ? {
+                mode: this.sitApproach.mode,
+                durationMs: this.sitApproach.durationMs,
+                progress: Number(
+                  Math.min(1, (now - this.sitApproach.startedAt) / this.sitApproach.durationMs).toFixed(3),
+                ),
+              }
+            : null,
           edge: this.sitEdge,
           procedural: this.sitProcedural,
           clip: held?.name ?? null,
@@ -1326,6 +1893,7 @@ class StageRender implements RenderModule {
         };
       })(),
       speech: { frame: this.lipSyncFrame, driven: this.lipSyncDriven },
+      skin: this.skinShading,
       probePoints: this.computeProbePoints(),
     };
   }
@@ -1369,6 +1937,7 @@ class StageRender implements RenderModule {
     this.maskCapture.stop();
     this.model?.dispose();
     this.placeholder?.dispose();
+    clearSkinShadingCache();
     this.renderer.dispose();
   }
 
@@ -1393,6 +1962,14 @@ class StageRender implements RenderModule {
   private updateFrame(now: number): void {
     const dt = Math.min(100, Math.max(0, now - this.lastFrameAt)) / 1000;
     this.lastFrameAt = now;
+    this.updateSupportMotion(now);
+
+    // 拖拽姿态增益：进入 180ms 淡入、松手 420ms 淡出（ADR 0035 D2）
+    const dragTarget = this.dragging ? 1 : 0;
+    const dragRamp = this.dragging ? DRAG_POSE_RAMP_MS : DRAG_RELEASE_POSE_FADE_MS;
+    const dragAlpha = 1 - Math.exp((-dt * 1000) / Math.max(1, dragRamp));
+    this.dragPoseGain += (dragTarget - this.dragPoseGain) * dragAlpha;
+    if (!this.dragging && this.dragPoseGain < 0.001) this.dragPoseGain = 0;
 
     // HFSM：一次性反应自愈 + Base 层行走调度（§4.1 / ADR 0024 D1）
     const hfsmTick = this.hfsm.tick(now);
@@ -1453,6 +2030,95 @@ class StageRender implements RenderModule {
     }
     this.syncPatMouth(pat);
 
+    // 4.2) 拖拽三态姿态（ADR 0035 D2）：骨骼偏移乘姿态增益
+    if (this.arbiter && this.dragPoseGain > 0.001) {
+      for (const offset of dragBoneOffsets(this.dragBand, now)) {
+        const bone = this.model?.bones[offset.bone] ?? null;
+        if (bone) {
+          this.arbiter.add(
+            bone,
+            offset.yaw * this.dragPoseGain,
+            offset.pitch * this.dragPoseGain,
+            offset.roll * this.dragPoseGain,
+          );
+        }
+      }
+    }
+
+    // 4.3) 落地冲击（ADR 0035 D4）：以 scale.y 为主，脊柱/膝盖只做小辅助
+    let landingSquash = 0;
+    this.landingSquash = 0;
+    if (this.landing) {
+      const elapsed = now - this.landing.startedAt;
+      if (elapsed >= LANDING_DURATION_MS) {
+        this.landing = null;
+      } else {
+        const pose = landingPose(elapsed, this.landing.impact);
+        landingSquash = pose.squash;
+        if (this.arbiter) {
+          const spine = this.model?.bones.spine ?? null;
+          const neck = this.model?.bones.neck ?? null;
+          if (spine) this.arbiter.add(spine, 0, pose.spinePitch);
+          if (neck) this.arbiter.add(neck, 0, pose.neckPitch);
+          // 标定：thigh 负 pitch = 腿往前抬（膝盖前屈）；calf 正 pitch = 小腿往后
+          for (const thigh of [this.model?.bones.thighL ?? null, this.model?.bones.thighR ?? null]) {
+            if (thigh) this.arbiter.add(thigh, 0, -pose.kneeBend);
+          }
+          for (const calf of [this.model?.bones.calfL ?? null, this.model?.bones.calfR ?? null]) {
+            if (calf) this.arbiter.add(calf, 0, pose.kneeBend * 0.8);
+          }
+          for (const arm of [this.model?.bones.upperArmL ?? null, this.model?.bones.upperArmR ?? null]) {
+            if (arm) this.arbiter.add(arm, 0, pose.armPitch);
+          }
+        }
+        this.landingSquash = landingSquash;
+      }
+    }
+
+    // 4.4) 惊跳起身（ADR 0034 D5）：根变换在 step 6，骨骼与表情在这里
+    let startleX = 0;
+    let startleY = 0;
+    let startleSquash = 0;
+    if (this.startle) {
+      const pose = startlePose(this.startle.reason, now - this.startle.startedAt);
+      if (!pose.active) {
+        this.startle = null;
+        if (this.startleSurprised) {
+          this.startleSurprised = false;
+          this.applyFacial(now);
+        }
+      } else {
+        startleX = pose.rootX;
+        startleY = pose.rootY;
+        startleSquash = pose.squash;
+        if (pose.surprised !== this.startleSurprised) {
+          this.startleSurprised = pose.surprised;
+          this.applyFacial(now, true);
+        }
+        if (this.arbiter) {
+          const spine = this.model?.bones.spine ?? null;
+          const neck = this.model?.bones.neck ?? null;
+          const head = this.model?.bones.head ?? null;
+          if (spine) this.arbiter.add(spine, 0, pose.spinePitch);
+          if (neck) this.arbiter.add(neck, 0, pose.neckPitch);
+          if (head) this.arbiter.add(head, pose.headYaw, 0);
+          const armL = this.model?.bones.upperArmL ?? null;
+          const armR = this.model?.bones.upperArmR ?? null;
+          // 标定：负 roll 把两侧手臂都抬起（不是镜像）
+          if (armL) this.arbiter.add(armL, 0, 0, -pose.armRoll);
+          if (armR) this.arbiter.add(armR, 0, 0, -pose.armRoll);
+        }
+      }
+    }
+
+    // 4.5) 标定偏移（ADR 0035 D5）：只用于确认骨骼轴向，生产姿态不依赖它
+    if (this.arbiter && this.debugBoneOffsets.size > 0) {
+      for (const [name, offset] of this.debugBoneOffsets) {
+        const bone = this.findBone(name);
+        if (bone) this.arbiter.add(bone, offset.yaw, offset.pitch, offset.roll);
+      }
+    }
+
     // 5) 写回最终四元数（每根受控骨骼只写一次）
     this.arbiter?.endFrame();
 
@@ -1480,24 +2146,51 @@ class StageRender implements RenderModule {
       }
     }
 
-    const draggingTarget = this.dragging ? 1 : 0;
-    const liftTarget = this.dragging ? DRAG_LIFT_PX : 0;
-    const smooth = 1 - Math.exp(-DRAG_LIFT_SMOOTHING * dt);
-    this.dragSwayGain += (draggingTarget - this.dragSwayGain) * smooth;
-    this.dragLiftPx += (liftTarget - this.dragLiftPx) * smooth;
+    // ADR 0035 D3：受迫单摆。拖拽中由支撑加速度驱动；松手后保留角速度自然衰减。
+    let dragAngle = 0;
+    if (this.dragging || this.dragPoseGain > 0.001) {
+      const forcing = this.dragging
+        ? {
+            accelerationX: this.supportAcceleration.x,
+            accelerationY: this.supportAcceleration.y,
+          }
+        : { accelerationX: 0, accelerationY: 0 };
+      this.dragPendulum = stepDragPendulum(this.dragPendulum, this.dragBand, {
+        dtSeconds: dt,
+        forcing,
+        nowMs: now,
+      });
+      dragAngle =
+        (this.dragPendulum.angle + struggleOffset(this.dragBand, now, this.dragPoseGain)) *
+        this.dragPoseGain;
+    }
+    this.dragAngle = dragAngle;
 
-    const sway = this.dragSway(now);
+    // ADR 0035 D2：绕抓取点旋转，保持支点不动（补偿二维旋转带来的位移）
+    const pivotShift = pivotCompensation(this.dragPivot, dragAngle);
+    const dragLift = pendulumConfigFor(this.dragBand).liftPx * this.dragPoseGain;
+
     // ADR 0028 D8：坐姿的下沉与呼吸浮动是**窗口内的表现**，不参与窗口位置（窗口由 shell 定）；
     // 坐姿片段自带的身体平移用 `sitOffsetPx()` 抵消，保证"身体中心 = 窗口中线、最低点 = 窗口底边"。
     const sitShift = this.sitting ? this.sitOffsetPx() : { x: 0, y: 0 };
-    this.animationRoot.position.x = sitShift.x;
+    this.animationRoot.position.x = sitShift.x + pivotShift.x + startleX;
     this.animationRoot.position.y =
-      -this.height / 2 + hop - this.dragLiftPx - (sit?.dropPx ?? 0) + (sit?.bobPx ?? 0) + sitShift.y;
+      -this.height / 2 +
+      hop -
+      dragLift -
+      (sit?.dropPx ?? 0) +
+      (sit?.bobPx ?? 0) +
+      sitShift.y +
+      pivotShift.y +
+      startleY;
     this.animationRoot.rotation.z =
-      tilt + sway + (this.officialPat ? 0 : (pat?.pose.bodyLean ?? 0)) + (sit?.lean ?? 0);
+      tilt +
+      dragAngle +
+      (this.officialPat ? 0 : (pat?.pose.bodyLean ?? 0)) +
+      (sit?.lean ?? 0);
     // 转身与 `look` 反应共用同一个 Y 轴通道：叠加而不是互相覆盖
     this.animationRoot.rotation.y = look + this.walkYaw;
-    this.animationRoot.scale.set(1, 1 - squash, 1);
+    this.animationRoot.scale.set(1, 1 - squash - landingSquash - startleSquash, 1);
   }
 }
 

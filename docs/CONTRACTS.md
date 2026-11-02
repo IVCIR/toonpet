@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 契约版本 | 1.12.0 |
-| 生效日期 | 2026-11-01 |
+| 契约版本 | 1.13.0 |
+| 生效日期 | 2026-11-02 |
 | 适用平台 | Windows 11 x64（唯一目标平台） |
 | 权威性 | 本文件是唯一事实来源；与代码、口头约定冲突时以本文件为准 |
 | 修改方式 | 先写 ADR → 再改本文件 → 版本号按 §15 递增 |
@@ -185,7 +185,7 @@
 | `reacting` | Overlay | 状态 | 一次性反应动作（摸头、惊讶等）正在播放 | 收到 `head_patted` 或 `intent ∈ {pat_react, happy_hop, nod, shake_head, tilt_head}` | 动作自然播完 / 被同类型新反应替换 | `render` 内部 |
 | `dragged` | Physics | 状态 | 窗口被指针拖动，角色失去地面约束，身体随位移摆动 | 收到 `drag_started` | 收到 `drag_released`（转入 `settling`） | `shell` 的事件（`render` 只跟随） |
 | `settling` | Physics | 状态 | 松手后的回弹：窗口带末速度落回工作区地面线；期间**不接受**新的动作意图与摸头 | 收到 `drag_released` | 收到 `motion_ended{kind:'settle'}`，或被重新 `drag_started` 打断 | `render`（跟随 `motion_ended`；ADR 0024 D3） |
-| `sitting` | Physics | 状态 | 吸附：窗口贴在另一个应用窗口（或工作区）的**上/下边缘**且水平居中，角色播放坐姿；期间**不做 `walking` 调度**，Base 层只有 `idle` | 收到 `snap_applied` | 收到 `snap_released`（拖拽 / 点击 / 命令 / 目标消失 / 目标全屏），或 `drag_started` 直接接管 | `shell` 的事件（`render` 只跟随；ADR 0028 D5） |
+| `sitting` | Physics | 状态 | 吸附生命周期：从**接近**目标窗口（或工作区）的**上/下边缘**开始，到窗口贴边、水平居中并播放坐姿；接近阶段角色播走路/跳跃，落座阶段播坐姿；期间**不做 `walking` 调度**，Base 层只有 `idle` | 收到 `snap_approach_started`（接近）或 `snap_applied`（直接落座） | 收到 `snap_released`（拖拽 / 点击 / 命令 / 目标消失 / 目标全屏），或 `drag_started` 直接接管 | `shell` 的事件（`render` 只跟随；ADR 0028 D5、ADR 0034 D2） |
 | `thinking` | 编排 | 状态 | 已收到用户话语、尚未产出回复 | `orchestrator.respond()` 开始 | 产出 `Reply` 或走到兜底 | `orchestrator` |
 | `idle` | 编排 | 状态 | 编排层没有在途话语（**与 Base 层的 `idle` 同名不同层，不是同一个状态**） | 启动完成 / 产出 `Reply` 或走到兜底 / `cancel()` | 收到 `user_utterance` 而进入 `thinking` | `orchestrator` |
 
@@ -271,7 +271,7 @@
 |---|---|---|---|---|
 | Base | 永远运行 | `idle`、`walking` | 优先级最低 | 呼吸、眨眼、视线跟随属于层内常驻通道，不是状态 |
 | Overlay | 按事件叠加 | `speaking`、`reacting` | 高于 Base，低于 Physics；**同类型互斥** | `speaking` 与 `reacting` 可同时存在（见 §5.2 通道） |
-| Physics | 按拖拽/吸附接管 | `dragged`、`settling`、`sitting` | 最高 | 接管身体位移与朝向；回弹（`settling`）结束后整层退出交还 Base；`sitting` 由 `snap_*` 事件进出（ADR 0028） |
+| Physics | 按拖拽/吸附接管 | `dragged`、`settling`、`sitting` | 最高 | 接管身体位移与朝向；回弹（`settling`）结束后整层退出交还 Base；`sitting` 由 `snap_*` 事件进出（含接近阶段，ADR 0028 / ADR 0034） |
 
 ### 5.2 混合通道（冲突裁决的唯一依据）
 
@@ -297,6 +297,7 @@
 | 吸附时说话 | 保持 `speaking` | `sitting` 姿势不变（口型照常驱动） | 按 `emotion` | 坐在窗口边缘说话合法（ADR 0028） |
 | 吸附时被摸头 | 无 | `reacting` 以 ≤ 0.4 权重叠加，坐姿不变 | 临时 `shy` | 坐着也能被摸头 |
 | 吸附时被拖拽 | 保持 | `drag_started` 立即把 `sitting` 改成 `dragged` | 保持 | `snap_released{reason:'dragged'}` 不得把 `dragged` 打回 `idle` |
+| 吸附接近中被拖拽 | 保持 | 接近立即取消，`drag_started` 接管为 `dragged` | 保持 | 用户手已接管，不允许接近继续（ADR 0034 D4） |
 
 ### 5.4 禁止
 
@@ -341,7 +342,8 @@
 | `llm_failed` | `orchestrator` | `{ replyId, reason: 'unavailable'\|'timeout'\|'invalid_output'\|'aborted', detail? }` | `render`、`shell` | LLM 路径失败、即将走兜底 |
 | `model_ready` | `render` | `{ modelId, loadMs }` | `shell` | VRM 加载完成且首帧可渲染 |
 | `motion_ended` | `shell` | `{ kind: 'walk'\|'settle', reason: 'arrived'\|'edge'\|'interrupted'\|'rest' }` | `render` | 窗口位移结束：行走到达/撞边/被打断，或回弹收敛到地面线（ADR 0024 D5） |
-| `snap_applied` | `shell` | `{ edge: 'top'\|'bottom', source: 'foreground'\|'workarea' }` | `render` | 窗口已经贴到目标窗口（或工作区）的边缘并水平居中**之后**（ADR 0028 D5） |
+| `snap_approach_started` | `shell` | `{ edge: 'top'\|'bottom', source: 'foreground'\|'workarea', mode: 'walk'\|'leap', distancePx, durationMs }` | `render` | 已算出吸附目标、决定不瞬移之后，窗口开始移动之前/同一 tick（ADR 0034 D1） |
+| `snap_applied` | `shell` | `{ edge: 'top'\|'bottom', source: 'foreground'\|'workarea' }` | `render` | 窗口已经贴到目标窗口（或工作区）的边缘并水平居中**之后**（ADR 0028 D5；接近模式下 = 到达并落座，ADR 0034 D2） |
 | `snap_released` | `shell` | `{ reason: 'dragged'\|'clicked'\|'command'\|'window-gone'\|'fullscreen' }` | `render` | 吸附解除**之后**（拖拽 / 点她 / 托盘命令 / 目标句柄失效 / 目标变全屏） |
 
 ### 6.4 发布 / 订阅规则
@@ -415,7 +417,7 @@ export interface RenderState {
 规则：
 - `shell` 是 `drag_*` / `head_patted` / `user_utterance` / `snap_*` 的唯一生产者；命中与穿透判定不对外暴露方法，只体现为事件与窗口行为。
 - 主进程持有唯一的指针轮询器与穿透状态机；它是全进程**唯一**可以调用 `setIgnoreMouseEvents` 的地方（§3.3 R-6、D-8）。
-- **前台窗口吸附（ADR 0028）**：入口是全局热键 `Ctrl+Shift+S` 与托盘两项（`吸附到前台窗口` / `离开窗口边缘`），**不新增接口方法、不新增 IPC 通道**；目标窗口来自 Win32（`GetForegroundWindow` + `DWMWA_EXTENDED_FRAME_BOUNDS`），物理像素经 Electron `screen` 换算成 DIP；结果只以 `snap_applied` / `snap_released` 广播。跟随目标窗口的轮询复用既有 16ms 轮询器（§12），节流 ~120ms。
+- **前台窗口吸附（ADR 0028、ADR 0034）**：入口是全局热键 `Ctrl+Shift+S` 与托盘两项（`吸附到前台窗口` / `离开窗口边缘`），**不新增接口方法、不新增 IPC 通道**；目标窗口来自 Win32（`GetForegroundWindow` + `DWMWA_EXTENDED_FRAME_BOUNDS`），物理像素经 Electron `screen` 换算成 DIP；结果只以 `snap_approach_started` / `snap_applied` / `snap_released` 广播。距离超过阈值时先发 `snap_approach_started`，在既有 16ms 轮询器里倒计时移动窗口，到达后再发 `snap_applied`；跟随目标窗口的轮询复用既有 16ms 轮询器（§12），节流 ~120ms。
 - **字幕显示时机（ADR 0021）**：渲染侧的字幕气泡收到 `intent_resolved` 只登记待显示文本、**不显示**；收到 `speech_started` 才显示完整字幕；收到 `speech_ended{reason:'failed'}` 立即显示作为兜底。字幕在语音播放期间不自动隐藏，`speech_ended` 后留 1.2s 尾巴淡出；15s 内未等到 `speech_started` 则由 failsafe 提前显示。**不得**为此新增事件或 IPC 通道，也**不得**回到"收到 `intent_resolved` 就显示"。
 
 ### 7.3 `render`
@@ -425,14 +427,14 @@ export interface RenderState {
 | `handleIntent` | `handleIntent(intent: Intent): void` | 立即执行动作意图；未知值降级 `none`；重复 `intent` 在 200ms 内去重 |
 | `getState` | `getState(): RenderState` | 同步返回，供 `shell` 轮询；不得触发渲染或 IO |
 
-订阅：`speech_started`、`speech_ended`（口型通道）、`drag_started`、`drag_released`（Physics 层）、`head_patted`（低权重 `pat_react`）、`intent_resolved`（**只取 `emotion`**，不触发动作——动作只由 `handleIntent` 触发）、`snap_applied` / `snap_released`（Physics=`sitting`，ADR 0028）。
+订阅：`speech_started`、`speech_ended`（口型通道）、`drag_started`、`drag_released`（Physics 层）、`head_patted`（低权重 `pat_react`）、`intent_resolved`（**只取 `emotion`**，不触发动作——动作只由 `handleIntent` 触发）、`snap_approach_started` / `snap_applied` / `snap_released`（Physics=`sitting` 的接近/落座/退出，ADR 0028 / ADR 0034）。
 
 规则：
 - `handleIntent` 与 `intent_resolved` 是双轨：前者是命令，后者是事实。同一次回复只执行一次动作，不得因两条路径而播两遍。
 - `render` 不产生任何除 `model_ready` 以外的事件。
 - 模型缺失或骨骼缺失时，`getState().modelReady = false`，并渲染一个占位胶囊体，不得白屏。
 - `render` 内部负责掩膜采集与 `cmd:probe` 应答（§3.3 R-2/R-4），但掩膜不是公共接口。
-- **坐姿（ADR 0028 D8）**：`snap_applied` → Physics=`sitting`，播官方片段 `CH0335_my_event088_pastmemory_01` 的 11.2–13.5s 窗口并**停在最后一帧**（不是循环、也不自动回 `idle`），同时抵消片段自带的身体平移（身体中心 = 窗口中线、最低点 = 窗口底边）；片段缺失时降级为"悬空姿态下沉 + 大腿弯曲"。`sitting` 期间不做 `walking` 调度，`drag_started` 直接接管。
+- **坐姿（ADR 0028 D8、ADR 0034 D5）**：`snap_approach_started` → Physics=`sitting`（接近阶段，播走路/跳跃并停止行走调度）；`snap_applied` → 仍为 `sitting`（落座阶段），播官方片段 `CH0335_my_event088_pastmemory_01` 的 11.2–13.5s 窗口并**停在最后一帧**（不是循环、也不自动回 `idle`），同时抵消片段自带的身体平移（身体中心 = 窗口中线、最低点 = 窗口底边）；片段缺失时降级为"悬空姿态下沉 + 大腿弯曲"。`sitting` 期间不做 `walking` 调度，`drag_started` 直接接管。
 
 **表情表现（ADR 0026）**：
 
@@ -744,6 +746,9 @@ flowchart TD
 | **前台窗口吸附不可用**（`koffi` 未安装/加载失败/架构不符） | 启动期 `require('koffi')` 失败 | 热键与托盘项仍然工作，只是吸到**工作区边缘**而不是应用窗口 | 记一条 WARN，`snap` 有效模式退回 `workarea`（ADR 0028 D7）；不阻断启动 | 无 |
 | **前台窗口全屏 / 坐标异常 / 太小** | DIP 矩形覆盖整块显示器 bounds；或宽高 < 80×40 / 非有限数 | 托盘气泡提示"已取消"（无托盘时只写 WARN） | 不移动窗口、不发 `snap_applied`；`busy`（行走/回弹中）只记日志不打扰用户 | 无 |
 | **吸附目标消失/最小化/变全屏** | 跟随轮询按句柄重读失败 | 角色留在原地并回到站立 | 发 `snap_released{window-gone\|fullscreen}`，不再跟随 | 无 |
+| **吸附接近中目标消失/最小化/变全屏** | 接近期间锁定目标，不跟随重读 | 先把接近走完并落座，随后立即起身 | 到达后由跟随轮询在 ≤120ms 内解除并发 `snap_released{window-gone\|fullscreen}`；不中断接近（ADR 0034 D4） | 无 |
+| **吸附接近中被拖拽** | `drag_started` 优先 | 立即转为被拎起姿态 | 取消接近、停窗；`drag_started` 接管为 `dragged`（ADR 0034 D4） | 无 |
+| **吸附接近中点击/命令解除** | 指针按下或托盘/热键 | 她继续接近，到达后起身 | 延迟到到达后发 `snap_released{clicked\|command}`，避免半空冻结（ADR 0034 D4） | 无 |
 | **吸附目标窗口移动/缩放** | 跟随轮询（复用 16ms 定时器，节流 120ms） | 角色随边缘平移/升降 | 用同一 edge 重算位置并 `setPosition`；重算被 D-7 大幅夹取时解除吸附 | 无 |
 | 第二实例启动 | 单实例锁 | 前一个窗口获得焦点 | 新实例直接退出 | 无 |
 | **`presence` 不可用**（`koffi` 未装 / 绑定失败 / `GetLastInputInfo` 返回 0） | 启动期 `require('koffi')` 失败或调用返回 0 | 无感知 | `userIdleMs` 恒为 `null`：段 3.5 只剩时间戳；idle-drive 因 `no-presence` **永不触发**（宁可全程沉默，也不在用户打字时插嘴）。记一条 WARN | 无 |
@@ -767,6 +772,7 @@ flowchart TD
 | 指针轮询 | 单一定时器 ~16ms，同时服务穿透状态机与拖拽位移；不得再开第二个 |
 | 窗口位移 | `walking` / `settling` 复用**同一个** 16ms 轮询器（先推进位移、再读窗口矩形判定穿透）；不得新开定时器（ADR 0024 D6） |
 | 吸附跟随 | 也挂在同一个 16ms 轮询器的 `onTick` 上，内部节流 `PET_SNAP_FOLLOW_MS`（默认 120ms）；不得为跟随新开定时器（ADR 0028 D6） |
+| 吸附接近 | 也挂在同一个 16ms 轮询器的 `snap.tick(now)` 上：`t += dt / durationMs`，`t >= 1` 才 `commit()` 并发 `snap_applied`；不得为接近新开定时器（ADR 0034 D3） |
 | 托盘诊断刷新 | 也挂在同一个 16ms 轮询器的 `onTick` 上：读数变化时下一拍即刷新，无变化时每 `TRAY_STATS_REFRESH_MS`（5s）复查一次；**不得**为此新开定时器（ADR 0032 D4.3） |
 | 主动性节拍 | `orchestrator` 内部 15s 一个定时器（`PROACTIVE_TICK_MS`），只做 idle-drive 评估；**不参与**穿透、掩膜、窗口位移，与上面的"唯一 16ms 轮询器"不冲突（ADR 0031 D1）。未装配 `proactive` 时**不建任何定时器** |
 | 生命周期心跳 | `heartbeat` 独立一个 15s 定时器（`HEARTBEAT_TICK_MS`），只做生命周期任务（当前 = 预热）；与 idle-drive 那条互不引用，任一关闭都不影响另一条（ADR 0033 D1）。`PET_SELFTEST=1` 或 `PET_WARMUP_DISABLE=1` 时**整个不建**（零后台推理）。`model_ready` 到达时立即触发一次预热，不等节拍（ADR 0033 D2） |
@@ -791,6 +797,7 @@ flowchart TD
 | X-9 | 亚像素级精确命中 | `128 × 72` 掩膜 + 双线性插值即精度上限（ADR 0002） |
 | X-10 | 吸附后跟随"新的前台窗口" | 用户切窗口时把桌宠整体搬走像"绑架"；只跟随被吸附的那一扇窗（ADR 0028 D6） |
 | X-11 | 窗口内的逐点贴边（吸附到控件/子区域边缘） | 只认窗口的外边界（DWM 扩展边框），不做 UI 元素级定位 |
+| X-12 | 从窗沿再次跳向另一扇窗 | 已在 `sitting` 时再次吸附保持直接重定位（ADR 0028 D4），不做"从窗沿再接近一次"；避免两条接近路径与中途取消语义 |
 
 ## 14. 规划目录（尚未创建，仅作契约投影）
 
@@ -837,6 +844,7 @@ flowchart TD
 | 1.10.0 | 2026-11-01 | **时间感与主动性**：① §2 明确 `presence` 不是第六个模块而是只读工具端口，§2.1 增"orchestrator → presence（只读端口，runtime 注入）"，§3.1 登记 presence 与 idle-drive 节拍；② §9.3 新增**可选段 3.5「环境事实」**（时间/输入状态/前台应用/上次会话，单行 ≤160 字，缺项整项省略，固定降级顺序）；③ §7.5 段 ③ 格式改为**相对时间**（`今日`/`昨日`/`N日前`/`Nヶ月前`/`N年前`）+ 去冗余（同 tags 且三字组 Jaccard ≥0.8）+ 合计 360 字预算；④ §7.6 明确 `Reply` 的三个合法来源，新增主动话语（idle-drive）规则 PR-1…PR-7：预算 12 次/会话（深夜 6）、先规则后 LLM（3s 超时）、失败即沉默、进历史但**不写** `memory.db`、自检默认硬关；⑤ §11 新增四行降级（presence 不可用 / 主动失败 / 主动期间用户开口 / 预算耗尽）；⑥ §12 补"主动性节拍 15s 不参与穿透与位移"与"presence 2s 懒采样不是定时器"。**未新增/删除事件、状态、`intent`、`emotion`、模块接口方法与 `RenderState` 字段**；`lines.json` 的 `match.on` 新增本地取值 `'idle'`（不是事件，不跨进程） | ADR 0030、ADR 0031 |
 | 1.11.0 | 2026-11-01 | **应用类别 + 冷启动预热 + 托盘诊断**：① §4.6 新增术语「应用类别」「预热」；② §9.3 段 3.5 的**前台应用分项改为归一化类别** `前面のアプリ: coding`（`coding`/`browser`/`game`/`meeting`/`video`/`other: <类名>`），**原始标题不得进提示词**；类别为 `coding` 时追加 `先生は今、プログラミングに集中している`；降级顺序插入"先丢编程提示"；③ §7.6 新增 PR-8（预热：只挂 15s 节拍、空闲+presence 正常才发、1 token、不改熔断/不发事件/不占预算、最多 3 次）与 PR-9（托盘两行只读诊断只读 `proactive-stats` 单例，不新增事件/IPC/setter，口径为"本进程启动以来"）；④ §3.1 更新 orchestrator 与 presence 行；⑤ §11 新增两行降级（预热失败 / 类别未命中）；⑥ §12 补"托盘诊断刷新复用 16ms 轮询器"。**未新增/删除事件、状态、`intent`、`emotion`、模块接口方法与 `RenderState` 字段**；`WorldFacts` 删除 `foregroundTitle`/`foregroundClass`、新增 `foregroundCategory`（内部类型，不跨进程） | ADR 0032 |
 | 1.12.0 | 2026-11-01 | **预热与主动性解耦 + 预热前置对齐（封版 1.0.0）**：① §2 / §2.1 声明 `heartbeat` 不是第六个模块，而是 `runtime` 装配的生命周期节拍器，并登记其允许读取的只读事实；② §3.1 把预热从 `orchestrator` 行迁到新增的 `heartbeat` 行；③ §4.6「预热」补调度方与"不受主动性开关影响"；④ **§7.6 PR-8 重写**：预热改挂生命周期心跳（独立 15s 定时器），`model_ready` 到达立即触发一次，`PET_PROACTIVE_DISABLE=1` 不再影响预热，`PET_SELFTEST=1` 时心跳整个不启动（零后台推理、无 opt-in），新增 `PET_WARMUP_DISABLE=1` 逃生口；`model_ready` 触发不受 presence 门槛约束（唯一一处旧规则放宽）；⑤ §11 更新预热失败行；⑥ §12 新增"生命周期心跳"一行。**未新增/删除事件、状态、`intent`、`emotion`、模块接口方法与 `RenderState` 字段**；`orchestrator.snapshot()` 移除 `llmWarmedUp`/`warmupAttempts`（内部诊断，迁至 `RuntimeSnapshot.warmup`） | ADR 0033 |
+| 1.13.0 | 2026-11-02 | **吸附接近 + 拖拽悬挂**：① §4.1 `sitting` 扩展为"吸附生命周期（接近 + 落座）"，进入条件增加 `snap_approach_started`；② §5.1/§5.3 补接近说明与"接近中被拖拽"；③ §6.3 新增 `snap_approach_started`（`shell` 唯一生产者，`render` 消费）；④ §7.2/§7.3 补接近入口与订阅；⑤ §11 补接近中目标消失/拖拽/点击命令四条降级；⑥ §12 补接近倒计时复用 16ms 轮询器；⑦ §13 补 X-12。**未新增/删除状态名、`intent`、`emotion`、IPC 通道、模块接口方法或 `RenderState` 字段**；拖拽侧只改 render 内部数学与骨骼姿态（ADR 0035），`cmd:drag` 载荷不变 | ADR 0034、ADR 0035 |
 
 ## 16. 如何在新对话中接续
 

@@ -96,6 +96,11 @@ export interface Hfsm {
   dragStarted(now: number): void;
   dragReleased(now: number): void;
   /**
+   * `snap_approach_started` 事实 → Physics=`sitting` 的**接近阶段**（ADR 0034 D2）。
+   * 不新增状态：`sitting` 从"已经坐下"扩展为"吸附生命周期"。
+   */
+  snapApproaching(now: number): void;
+  /**
    * `snap_applied` 事实 → Physics=`sitting`（ADR 0028 D5）。
    * 进入即打断 `walking` 并清空排期：坐着的时候不该再迈步。
    */
@@ -186,6 +191,13 @@ export function createHfsm(options: HfsmOptions): Hfsm {
     dragReleased(_now: number): void {
       // D-6：松手先进入回弹（settling），回弹结束才整层退出（§5.1）
       physics = 'settling';
+    },
+
+    snapApproaching(_now: number): void {
+      // ADR 0034 D2：接近阶段就进入 sitting（生命周期），落座由 snapApplied 标记
+      physics = 'sitting';
+      if (base === 'walking') base = 'idle';
+      nextWalkAt = null;
     },
 
     snapApplied(_now: number): void {

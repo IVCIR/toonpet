@@ -21,6 +21,7 @@ export type ClipRole =
   | 'idle'
   | 'idle.alt1'
   | 'held'
+  | 'held.limp'
   | 'walk'
   | 'walk.carried'
   | 'sit'
@@ -75,6 +76,13 @@ export const CLIP_RULES: Record<ClipRole, ClipRule> = {
     // 注意 `Carrier_Idle` 其实是普通站姿，不是悬空姿态，只作降级候选。
     exact: 'CH0335_Formation_Pickup',
     patterns: [/formation[_\s-]?pickup/i, /carrier[_\s-]?idle/i, /pickup/i],
+    loop: true,
+  },
+  'held.limp': {
+    // 抓头时用普通站姿做底：手臂自然下垂、腿直立，再由 drag-motion 的骨骼偏移
+    // 做"头被拎住、身体下垂"的微调。`Formation_Pickup` 的蜷缩姿态不适合抓头。
+    exact: 'CH0335_Carrier_Idle',
+    patterns: [/carrier[_\s-]?idle/i],
     loop: true,
   },
   walk: {
