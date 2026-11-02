@@ -74,17 +74,10 @@ import type { MaskCapture } from './mask-capture';
 import {
   inspectMeshMaterials,
   replaceMaterialByName,
-  resetDiagnosticMaterials,
-  setDiagnosticShading,
-  shadeSkinVertices,
+  restoreVertexColorDiagnostics,
   tintSkinVertices,
 } from './material-diagnostics';
-import type {
-  DiagnosticShading,
-  MeshMaterialFacts,
-  ShadingResult,
-  SkinShadingOptions,
-} from './material-diagnostics';
+import type { MeshMaterialFacts } from './material-diagnostics';
 import { loadModel, measureAnimatedMinY, measureAnimatedBounds, placeModel } from './model-loader';
 import type { LoadedModel, ModelBones } from './model-loader';
 import { PAT_DURATION_MS, PAT_MOUTH_FRAME, patPose } from './pat-react';
@@ -92,10 +85,10 @@ import type { PatPose } from './pat-react';
 import { createCapsulePlaceholder, PLACEHOLDER_BOTTOM_MARGIN_PX } from './placeholder';
 import type { PlaceholderModel } from './placeholder';
 import { sitPose } from './sit-pose';
-import { bakeSkinShading, clearSkinShadingCache, restoreSkinShading } from './skin-shading';
-import type { SkinShadingStats } from './skin-shading';
 import { startleDurationMs, startlePose } from './startle';
 import type { StartleReason } from './startle';
+import { ToonShading } from './toon-shading';
+import type { ToonShadingDiagnostics } from './toon-shading';
 
 /** 契约 §7.3 / §12：同一 intent 200ms 内只执行一次。 */
 export const INTENT_DEDUPE_MS = 200;
@@ -304,8 +297,8 @@ export interface RenderDiagnostics {
   };
   pat: PatDiagnostics;
   speech: { frame: number; driven: boolean };
-  /** ADR 0036：手/小臂顶点烘焙光照（内部诊断，不进 `RenderState`） */
-  skin: SkinShadingStats | null;
+  /** ADR 0037：全局光照 + Toon 材质（内部诊断，不进 `RenderState`） */
+  toon: ToonShadingDiagnostics;
   probePoints: { head: { x: number; y: number } | null; body: { x: number; y: number } | null };
 }
 
@@ -352,16 +345,13 @@ export interface RenderModule {
     scope: 'none' | 'hand' | 'both',
     color?: [number, number, number],
   ): { meshes: number; handVertices: number; forearmVertices: number };
-  /** 内部（诊断）：把法线明暗写进手/小臂顶点色（验证"不换材质也能有阴影"）。 */
-  shadeSkinVertices(
-    options: SkinShadingOptions,
-  ): { meshes: number; vertices: number; minShade: number; maxShade: number };
   /** 内部（诊断）：把 Body 材质整体换成纯色，确认"手是不是在这块网格上"。 */
   testHandMaterial(color?: number): { materialName: string; meshes: string[] } | null;
-  /** 内部（诊断）：无光照 ↔ Toon（环境光 + 方向光）切换，验证"加光照手会不会有阴影"。 */
-  setDiagnosticShading(mode: DiagnosticShading): ShadingResult;
-  /** 内部（诊断）：开/关手部肤色烘焙（A/B 对照；关 = 还原到模型原始白色顶点色）。 */
-  setSkinBake(enabled: boolean): SkinShadingStats | null;
+  /**
+   * 内部（诊断/截图对照，ADR 0037）：开/关全局光照 + Toon。
+   * 关闭 = 摘灯 + 还原原始无光照 `MeshBasicMaterial`（= 本轮修改前的样子）。
+   */
+  setToonShading(enabled: boolean): ToonShadingDiagnostics;
   /** 内部（诊断）：恢复材质与顶点色。 */
   resetMaterialDiagnostics(): void;
   /** 内部（诊断）：双手骨骼在内容区 CSS 坐标里的位置（用于截图取样）。 */
@@ -495,15 +485,10 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
 
   /** 标定用：单根骨骼的持久偏移（ADR 0035 D5，不是生产姿态入口） */
   private readonly debugBoneOffsets = new Map<string, { yaw: number; pitch: number; roll: number }>();
-  /** 诊断用：Toon 模式的光照（阶段 14 手部发白排查） */
-  private diagnosticLights: {
-    ambient: THREE.AmbientLight;
-    directional: THREE.DirectionalLight;
-  } | null = null;
+  /** ADR 0037：全局光照 + Toon（身体/头发）；灯在构造时挂上，材质在模型加载后替换 */
+  private readonly toon: ToonShading;
   /** 诊断用：Body 材质替换的恢复句柄 */
   private diagnosticMaterialRestore: (() => void) | null = null;
-  /** ADR 0036：手/小臂肤色烘焙结果（内部诊断） */
-  private skinShading: SkinShadingStats | null = null;
   private patMouthActive = false;
   /** 摸头是否由官方整身片段承担（true 时不再叠加程序化头部偏移，ADR 0023 D4） */
   private officialPat = false;
@@ -556,6 +541,10 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
 
     this.scene.add(this.animationRoot);
 
+    // ADR 0037：全局光照（主方向光 + 极低环境光）+ 3 阶 Toon 色阶。
+    // 这里只建灯与渐变贴图；材质替换发生在模型加载完成之后（`attachToon`）。
+    this.toon = new ToonShading(this.scene);
+
     this.placeholder = createCapsulePlaceholder();
     this.animationRoot.add(this.placeholder.group);
 
@@ -589,16 +578,15 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
 
       this.model = loaded;
 
-      // ADR 0036：手/小臂顶点烘焙暖肤色 + 法线明暗。
-      // 本资产的身体贴图是平涂色块、手部 UV 只覆盖 1–2 texel，而无光照材质
-      // 不做明暗计算 → 手会是一块纯白发光板。这里把明暗写进 COLOR_0，
-      // 不换材质、不加灯、不影响其它部位。
-      this.skinShading = bakeSkinShading(loaded.root);
+      // ADR 0037：身体/衣服 + 头发换成 MeshToonMaterial（3 阶硬边色阶），面部保持无光照。
+      // ADR 0036 的"手/小臂顶点色烘焙"在此废止：手现在像其它部位一样接受真光照。
+      const toonCount = this.toon.attach(loaded.root);
+      const toonDiagnostics = this.toon.diagnostics();
       console.log(
-        `[render] 手/小臂肤色已烘焙（ADR 0036） meshes=${this.skinShading.meshes} ` +
-          `vertices=${this.skinShading.vertices} ` +
-          `shade=${this.skinShading.minShade.toFixed(2)}–${this.skinShading.maxShade.toFixed(2)} ` +
-          `mean=(${this.skinShading.meanColor.map((c) => c.toFixed(3)).join(',')})`,
+        `[render] Toon 光照已启用（ADR 0037） materials=${toonCount} ` +
+          `meshes=${toonDiagnostics.litMeshes.join('|') || '(none)'} ` +
+          `steps=[${toonDiagnostics.gradientSteps.join(',')}] ` +
+          `ambient=${toonDiagnostics.ambient} directional=${toonDiagnostics.directional}`,
       );
 
       if (this.placeholder) {
@@ -1508,22 +1496,6 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     return result;
   }
 
-  /** 诊断：把法线明暗写进手/小臂顶点色（不换材质、不加灯）。 */
-  shadeSkinVertices(options: SkinShadingOptions): {
-    meshes: number;
-    vertices: number;
-    minShade: number;
-    maxShade: number;
-  } {
-    const root = this.model ? this.model.root : this.scene;
-    const result = shadeSkinVertices(root, options);
-    console.log(
-      `[render] 诊断：手部顶点烘焙明暗 meshes=${result.meshes} vertices=${result.vertices} ` +
-        `shade=${result.minShade.toFixed(2)}–${result.maxShade.toFixed(2)}`,
-    );
-    return result;
-  }
-
   /** 诊断：把 Body 材质整体换成纯红（证明手与衣服/腿共用同一块网格与材质）。 */
   testHandMaterial(color = 0xff0000): { materialName: string; meshes: string[] } | null {
     if (!this.model) return null;
@@ -1539,46 +1511,27 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     return { materialName: name, meshes: replacement.meshes };
   }
 
-  /** 诊断：无光照（生产）↔ Toon + 光照（验证阴影）。 */
-  setDiagnosticShading(mode: DiagnosticShading): ShadingResult {
-    const root = this.model ? this.model.root : this.scene;
-    const { result, lights } = setDiagnosticShading(this.scene, root, mode, this.diagnosticLights);
-    this.diagnosticLights = lights;
+  /**
+   * 诊断（ADR 0037）：开/关全局光照 + Toon。
+   * 关闭 = 摘掉两盏灯并把身体/头发还原成原始 `MeshBasicMaterial` —— 这就是
+   * "引入光照之前"的样子，可直接用于 before/after 截图对照。
+   */
+  setToonShading(enabled: boolean): ToonShadingDiagnostics {
+    this.toon.setEnabled(enabled);
+    const diagnostics = this.toon.diagnostics();
     console.log(
-      `[render] 诊断：着色模式=${result.mode} 材质数=${result.materials.length} ` +
-        `光照=${result.lights ? `ambient ${result.lights.ambient} + directional ${result.lights.directional}` : '无'}`,
+      `[render] 诊断：Toon ${enabled ? '开' : '关'} materials=${diagnostics.materials.length} ` +
+        `steps=[${diagnostics.gradientSteps.join(',')}]`,
     );
-    return result;
-  }
-
-  /** 诊断：开/关手部肤色烘焙（A/B 对照；关 = 还原模型原始白色顶点色）。 */
-  setSkinBake(enabled: boolean): SkinShadingStats | null {
-    if (!this.model) return null;
-    if (enabled) {
-      this.skinShading = bakeSkinShading(this.model.root);
-      console.log(
-        `[render] 诊断：手部肤色烘焙已开启 vertices=${this.skinShading.vertices}`,
-      );
-      return this.skinShading;
-    }
-    const restored = restoreSkinShading(this.model.root);
-    this.skinShading = null;
-    console.log(`[render] 诊断：手部肤色烘焙已关闭（还原 ${restored.meshes} 块网格）`);
-    return null;
+    return diagnostics;
   }
 
   /** 诊断：恢复生产材质与顶点色（必须在诊断结束后调用）。 */
   resetMaterialDiagnostics(): void {
     this.diagnosticMaterialRestore?.();
     this.diagnosticMaterialRestore = null;
-    resetDiagnosticMaterials(this.model ? this.model.root : this.scene);
-    if (this.diagnosticLights) {
-      this.scene.remove(this.diagnosticLights.ambient, this.diagnosticLights.directional);
-      this.diagnosticLights.ambient.dispose();
-      this.diagnosticLights.directional.dispose();
-      this.diagnosticLights = null;
-    }
-    console.log('[render] 诊断：材质与光照已恢复');
+    if (this.model) restoreVertexColorDiagnostics(this.model.root);
+    console.log('[render] 诊断：材质与顶点色已恢复');
   }
 
   /** 诊断：双手骨骼的内容区 CSS 坐标（截图取样用；窗口坐标原点在左上角）。 */
@@ -1893,7 +1846,7 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
         };
       })(),
       speech: { frame: this.lipSyncFrame, driven: this.lipSyncDriven },
-      skin: this.skinShading,
+      toon: this.toon.diagnostics(),
       probePoints: this.computeProbePoints(),
     };
   }
@@ -1937,7 +1890,7 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     this.maskCapture.stop();
     this.model?.dispose();
     this.placeholder?.dispose();
-    clearSkinShadingCache();
+    this.toon.dispose();
     this.renderer.dispose();
   }
 

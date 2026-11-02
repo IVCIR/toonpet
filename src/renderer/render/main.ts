@@ -67,10 +67,9 @@ window.diagnostics = {
   // 阶段 14：手部发白诊断（只读 + 临时换材质；不改变生产默认路径）
   inspectMaterials: () => module.inspectMaterials(),
   tintSkin: (scope) => module.tintSkinVertices(scope),
-  shadeSkin: (options) => module.shadeSkinVertices(options),
   testHandMaterial: (color) => module.testHandMaterial(color),
-  setShading: (mode) => module.setDiagnosticShading(mode),
-  setSkinBake: (enabled) => module.setSkinBake(enabled),
+  // ADR 0037：全局光照 + Toon 的 A/B 开关（关 = 修改前的无光照样子）
+  setToon: (enabled) => module.setToonShading(enabled),
   resetMaterials: () => module.resetMaterialDiagnostics(),
   handScreenPoints: () => module.handScreenPoints(),
 };

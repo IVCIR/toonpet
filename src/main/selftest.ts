@@ -51,6 +51,7 @@ interface ModelDiagnostics {
   bones: { head: string | null; eyeL: string | null; eyeR: string | null; pelvis: string | null };
   hasMorphTargets: boolean;
   meshNames: string[];
+  materialNames?: string[];
   hiddenMeshes: string[];
   mouth: { materialName: string | null; atlasLoaded: boolean; calibrated: boolean };
   gaze: { yaw: number; pitch: number; targetYaw: number; targetPitch: number; idle: boolean };
@@ -149,8 +150,17 @@ interface ModelDiagnostics {
   };
   pat: { active: boolean; weight: number; allowMouthChange: boolean; mouthFrame: number | null };
   speech: { frame: number; driven: boolean };
-  /** ADR 0036：手/小臂顶点烘焙光照（内部诊断） */
-  skin: { meshes: number; vertices: number; minShade: number; maxShade: number; meanColor: [number, number, number] } | null;
+  /** ADR 0037：全局光照 + Toon（内部诊断） */
+  toon: {
+    enabled: boolean;
+    ambient: number;
+    directional: number;
+    direction: [number, number, number];
+    gradientSteps: number[];
+    gradientWidth: number;
+    materials: Array<{ mesh: string; material: string; from: string; to: string }>;
+    litMeshes: string[];
+  } | null;
   probePoints: { head: ProbePoint | null; body: ProbePoint | null };
 }
 
@@ -1591,6 +1601,15 @@ interface RegionColorStats {
   /** 近白像素占比（三通道都 > 235）：验证"手看起来像白板" */
   whiteRatio: number;
   pixels: number;
+  /** 亮度均值（Rec.601） */
+  luma: number;
+  /** 亮度标准差：平涂 ≈ 0–5，有明暗 ≈ 10+（ADR 0037 的量化判据） */
+  lumaStdDev: number;
+  /** 亮度 5% / 95% 分位（看"最暗面 vs 最亮面"的跨度） */
+  lumaP05: number;
+  lumaP95: number;
+  /** 亮度 < 60% 满量程的像素占比（阴影面） */
+  darkRatio: number;
 }
 
 /** 从一个 NativeImage 的 CSS 矩形区域取像素统计（capturePage 是物理像素，先按 DPR 缩放）。 */
@@ -1614,6 +1633,9 @@ function regionColorStats(
     let red = 0;
     let white = 0;
     let count = 0;
+    let sumLuma = 0;
+    let sumLumaSq = 0;
+    const histogram = new Array<number>(256).fill(0);
     for (let i = 0; i + 3 < bitmap.length; i += 4) {
       const alpha = bitmap[i + 3]!;
       if (alpha < 128) continue;
@@ -1625,48 +1647,112 @@ function regionColorStats(
       b += blue;
       if (redValue > 140 && green < 90 && blue < 90) red += 1;
       if (redValue > 235 && green > 235 && blue > 235) white += 1;
+      const luma = 0.299 * redValue + 0.587 * green + 0.114 * blue;
+      sumLuma += luma;
+      sumLumaSq += luma * luma;
+      histogram[Math.max(0, Math.min(255, Math.round(luma)))]! += 1;
       count += 1;
     }
     if (count === 0) return null;
+    const luma = sumLuma / count;
+    const variance = Math.max(0, sumLumaSq / count - luma * luma);
+    const percentile = (fraction: number): number => {
+      const target = count * fraction;
+      let seen = 0;
+      for (let value = 0; value < 256; value += 1) {
+        seen += histogram[value]!;
+        if (seen >= target) return value;
+      }
+      return 255;
+    };
+    let dark = 0;
+    for (let value = 0; value < 153; value += 1) dark += histogram[value]!;
     return {
       mean: [Math.round(r / count), Math.round(g / count), Math.round(b / count)],
       redRatio: red / count,
       whiteRatio: white / count,
       pixels: count,
+      luma: Math.round(luma * 10) / 10,
+      lumaStdDev: Math.round(Math.sqrt(variance) * 10) / 10,
+      lumaP05: percentile(0.05),
+      lumaP95: percentile(0.95),
+      darkRatio: Math.round((dark / count) * 1000) / 1000,
     };
   } catch {
     return null;
   }
 }
 
-/** 手部诊断截图（不额外 sleep：手在 Idle 里会轻微移动，取样点必须和这一帧对齐）。 */
-async function captureHandEvidence(window: BrowserWindow, fileName: string): Promise<CapturedImage> {
-  const image = await window.webContents.capturePage();
-  const outputDir = path.join(app.getAppPath(), 'dist', 'selftest');
-  await mkdir(outputDir, { recursive: true });
-  const pngPath = path.join(outputDir, fileName);
-  await writeFile(pngPath, await image.toPNG());
-  return { image, pngPath };
+/** 诊断截图：只在内存里拿 NativeImage，落盘由调用方决定（A/B 要从多帧里挑一对）。 */
+async function captureEvidence(window: BrowserWindow): Promise<NativeImage> {
+  return window.webContents.capturePage();
 }
 
 /**
- * 阶段 14 专用诊断：`PET_HAND_DIAG=1` 时只跑这一套。
+ * 把某个 CSS 矩形裁成独立 PNG。
  *
- * 目的不是"断言通过"，而是**把现象量化**：
- *  1. 枚举 SkinnedMesh / 材质 / map / colorSpace / 手部顶点数；
- *  2. 手部 UV 采到的贴图颜色；
- *  3. 只把手部顶点染红 → 证明手在哪块网格上；
- *  4. 整块 Body 材质染红 → 证明手与衣服/腿共用材质；
- *  5. 无光照 vs Toon+光照 → 证明"白"是不是缺阴影。
+ * 为什么要裁：整窗 422×720 缩到对话里看时，衣服上的二分阴影只剩 2–3 个像素，
+ * 根本分不出"有没有明暗"；裁 90–180px 的局部才能真正看清楚。
  */
-async function runHandDiagnostics(window: BrowserWindow): Promise<void> {
+async function saveCrop(
+  image: NativeImage,
+  rect: Rect,
+  contentWidth: number,
+  folder: string,
+  fileName: string,
+): Promise<string | null> {
+  const size = image.getSize();
+  if (size.width <= 0 || contentWidth <= 0) return null;
+  const scale = size.width / contentWidth;
+  const x = Math.max(0, Math.min(size.width - 1, Math.round(rect.x * scale)));
+  const y = Math.max(0, Math.min(size.height - 1, Math.round(rect.y * scale)));
+  const width = Math.max(1, Math.min(size.width - x, Math.round(rect.width * scale)));
+  const height = Math.max(1, Math.min(size.height - y, Math.round(rect.height * scale)));
+  try {
+    const cropped = image.crop({ x, y, width, height });
+    const outputDir = path.join(app.getAppPath(), 'dist', folder);
+    await mkdir(outputDir, { recursive: true });
+    const pngPath = path.join(outputDir, fileName);
+    await writeFile(pngPath, cropped.toPNG());
+    return path.relative(app.getAppPath(), pngPath);
+  } catch (error) {
+    logWarn('selftest', 'Toon 诊断：裁剪失败', { fileName, error: String(error) });
+    return null;
+  }
+}
+
+interface ToonRegionSample {
+  key: string;
+  rect: Rect;
+  stats: RegionColorStats | null;
+  crop: string | null;
+}
+
+interface ToonCapture {
+  image: NativeImage;
+  regions: Array<{ key: string; rect: Rect; stats: RegionColorStats | null }>;
+}
+
+/**
+ * 阶段 15 专用诊断：`PET_TOON_DIAG=1` 时只跑这一套（ADR 0037）。
+ *
+ * 同一姿态、同一相机，唯一变量是"全局光照 + Toon 材质"开/关：
+ *   1. `setToon(false)` → 抓"修改前"（原无光照 MeshBasicMaterial = 平涂）；
+ *   2. `setToon(true)`  → 抓"修改后"（3 阶 Toon + 主方向光 + 极低环境光）；
+ *   3. 对每个区域算亮度均值 / 标准差 / 5%–95% 分位 / 暗部占比，并裁局部 PNG。
+ *
+ * 难点是**动画在跑**（眨眼、呼吸、手指微动）：直接隔 300ms 拍两张，可能一张闭眼一张睁眼，
+ * 那就不叫 A/B 了。这里改成"反复拍 before/after 对，挑脸部统计最接近的一对"——
+ * 眨眼会同时改变脸部亮度均值与标准差，所以脸部差值最小的一对就是眼睛状态一致的一对。
+ */
+async function runToonDiagnostics(window: BrowserWindow): Promise<void> {
   const diagnostics = await waitFor(
     window,
     MODEL_LOAD_TIMEOUT_MS,
     (d) => d !== null && (d.ready || (!d.loading && d.error !== null)),
   );
   if (!diagnostics?.ready) {
-    logWarn('selftest', '手部诊断：模型未就绪', { error: diagnostics?.error ?? null });
+    logWarn('selftest', 'Toon 诊断：模型未就绪', { error: diagnostics?.error ?? null });
     app.exit(1);
     return;
   }
@@ -1674,6 +1760,8 @@ async function runHandDiagnostics(window: BrowserWindow): Promise<void> {
 
   const outputDir = path.join(app.getAppPath(), 'dist', 'diagnostics');
   await mkdir(outputDir, { recursive: true });
+  const selftestDir = path.join(app.getAppPath(), 'dist', 'selftest');
+  await mkdir(selftestDir, { recursive: true });
   const content = window.getContentBounds();
   const width = content.width;
   const height = content.height;
@@ -1684,155 +1772,216 @@ async function runHandDiagnostics(window: BrowserWindow): Promise<void> {
       true,
     )) as string,
   ) as Array<Record<string, unknown>>;
-  logInfo('selftest', '手部诊断：网格与材质', materials);
-
-  interface Point {
-    x: number;
-    y: number;
-  }
-  const points = JSON.parse(
+  const toonAtBoot = JSON.parse(
     (await window.webContents.executeJavaScript(
-      'JSON.stringify(window.diagnostics.handScreenPoints())',
+      'JSON.stringify(window.petModel.getDiagnostics().toon)',
       true,
     )) as string,
-  ) as { left: Point | null; right: Point | null };
+  ) as Record<string, unknown>;
 
-  const box = (p: Point): Rect => ({
-    x: Math.max(0, p.x - 45),
-    y: Math.max(0, p.y - 45),
-    width: Math.min(90, width - Math.max(0, p.x - 45)),
-    height: Math.min(90, height - Math.max(0, p.y - 45)),
-  });
+  const bones = (await window.webContents.executeJavaScript(
+    'window.diagnostics.listBones()',
+    true,
+  )) as string[];
+  const pick = (target: string): string | null =>
+    bones.find((name) => name.toLowerCase() === target) ??
+    bones.find((name) => name.toLowerCase().includes(target)) ??
+    null;
+  const boneCss = async (name: string | null): Promise<{ x: number; y: number } | null> => {
+    if (!name) return null;
+    const world = (await window.webContents.executeJavaScript(
+      `window.diagnostics.boneWorld(${JSON.stringify(name)})`,
+      true,
+    )) as { x: number; y: number; z: number } | null;
+    if (!world) return null;
+    return { x: width / 2 + world.x, y: height / 2 - world.y };
+  };
 
-  const shots: Array<{
-    step: string;
-    file: string;
-    left: RegionColorStats | null;
-    right: RegionColorStats | null;
-  }> = [];
+  const handL = await boneCss(pick('bip001_l_hand'));
+  const handR = await boneCss(pick('bip001_r_hand'));
+  const head = await boneCss(pick('bip001_head'));
+  const probe = diagnostics.probePoints;
 
-  async function captureStep(step: string, file: string): Promise<void> {
-    const captured = await captureHandEvidence(window, file);
-    const currentPoints = JSON.parse(
-      (await window.webContents.executeJavaScript(
-        'JSON.stringify(window.diagnostics.handScreenPoints())',
-        true,
-      )) as string,
-    ) as { left: Point | null; right: Point | null };
-    shots.push({
-      step,
-      file: path.relative(app.getAppPath(), captured.pngPath),
-      left: currentPoints.left ? regionColorStats(captured.image, box(currentPoints.left), width) : null,
-      right: currentPoints.right ? regionColorStats(captured.image, box(currentPoints.right), width) : null,
-    });
-    logInfo('selftest', '手部诊断：截图', shots[shots.length - 1]);
+  const boxAround = (point: { x: number; y: number } | null, size: number): Rect | null => {
+    if (!point) return null;
+    const x = Math.max(0, Math.min(width - 1, Math.round(point.x - size / 2)));
+    const y = Math.max(0, Math.min(height - 1, Math.round(point.y - size / 2)));
+    return {
+      x,
+      y,
+      width: Math.max(1, Math.min(width - x, size)),
+      height: Math.max(1, Math.min(height - y, size)),
+    };
+  };
+
+  /** 躯干中心（探针的 pelvis 位置）往上 12% 窗高 = 外套胸口，二分阴影最明显的地方 */
+  const coatCenter = probe.body
+    ? { x: probe.body.x, y: probe.body.y - height * 0.12 }
+    : null;
+
+  const regions: Array<{ key: string; rect: Rect }> = [
+    { key: 'all', rect: { x: 0, y: 0, width, height } },
+  ];
+  for (const [key, rect] of [
+    ['coat', boxAround(coatCenter, 180)],
+    ['torso', boxAround(probe.body, 160)],
+    ['face', boxAround(head ?? probe.head, 72)],
+    ['handL', boxAround(handL, 90)],
+    ['handR', boxAround(handR, 90)],
+  ] as Array<[string, Rect | null]>) {
+    if (rect) regions.push({ key, rect });
   }
 
-  // A/B 对照：同一姿态、同一帧光源下，先关掉烘焙（还原模型原始白色顶点色），再打开。
-  await window.webContents.executeJavaScript('window.diagnostics.setSkinBake(false)', true);
-  await sleep(120);
-  await captureStep('before-bake-white', 'hand-00-before-bake.png');
-  await window.webContents.executeJavaScript('window.diagnostics.setSkinBake(true)', true);
-  await sleep(120);
-  await captureStep('baseline-basic', 'hand-00-baseline.png');
+  const capture = async (): Promise<ToonCapture> => {
+    const image = await captureEvidence(window);
+    return {
+      image,
+      regions: regions.map((region) => ({
+        key: region.key,
+        rect: region.rect,
+        stats: regionColorStats(image, region.rect, width),
+      })),
+    };
+  };
 
-  const tintHand = await window.webContents.executeJavaScript(
-    "JSON.stringify(window.diagnostics.tintSkin('hand'))",
-    true,
-  );
-  await sleep(120);
-  await captureStep('tint-hand-red', 'hand-01-tint-hand.png');
+  const faceOf = (captureValue: ToonCapture): RegionColorStats | null =>
+    captureValue.regions.find((region) => region.key === 'face')?.stats ?? null;
 
-  const tintBoth = await window.webContents.executeJavaScript(
-    "JSON.stringify(window.diagnostics.tintSkin('both'))",
-    true,
-  );
-  await sleep(120);
-  await captureStep('tint-hand-forearm-red', 'hand-02-tint-both.png');
+  // 多拍几对，挑"眼睛状态一致"的一对（脸部亮度均值 + 标准差最接近）
+  let best: { before: ToonCapture; after: ToonCapture; faceDelta: number; attempt: number } | null =
+    null;
+  const attempts: Array<{ attempt: number; faceDelta: number }> = [];
+  const MAX_ATTEMPTS = 5;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    await window.webContents.executeJavaScript('window.diagnostics.setToon(false)', true);
+    await sleep(140);
+    const before = await capture();
+    await window.webContents.executeJavaScript('window.diagnostics.setToon(true)', true);
+    await sleep(140);
+    const after = await capture();
 
-  await window.webContents.executeJavaScript("window.diagnostics.tintSkin('none')", true);
+    const beforeFace = faceOf(before);
+    const afterFace = faceOf(after);
+    const faceDelta =
+      beforeFace && afterFace
+        ? Math.abs(beforeFace.luma - afterFace.luma) + Math.abs(beforeFace.lumaStdDev - afterFace.lumaStdDev)
+        : Number.POSITIVE_INFINITY;
+    attempts.push({ attempt, faceDelta: Math.round(faceDelta * 10) / 10 });
+    if (!best || faceDelta < best.faceDelta) best = { before, after, faceDelta, attempt };
+    // 脸部统计几乎一致 → 眼睛/嘴的状态相同，可以停
+    if (faceDelta < 1.5) break;
+  }
 
-  const shadeSoft = await window.webContents.executeJavaScript(
-    'JSON.stringify(window.diagnostics.shadeSkin({ambient:0.80,diffuse:0.20,light:[-0.35,0.65,0.68],tint:[1,0.95,0.91]}))',
-    true,
-  );
-  await sleep(120);
-  await captureStep('shade-soft', 'hand-03-shade-soft.png');
+  // 静态场景兜底：理论上循环至少跑一次
+  const chosen = best!;
+  const beforePng = path.join(selftestDir, 'toon-00-before.png');
+  const afterPng = path.join(selftestDir, 'toon-01-after.png');
+  await writeFile(beforePng, await chosen.before.image.toPNG());
+  await writeFile(afterPng, await chosen.after.image.toPNG());
 
-  const shadeStrong = await window.webContents.executeJavaScript(
-    'JSON.stringify(window.diagnostics.shadeSkin({ambient:0.68,diffuse:0.32,light:[-0.35,0.65,0.68],tint:[1,0.92,0.86]}))',
-    true,
-  );
-  await sleep(120);
-  await captureStep('shade-strong', 'hand-04-shade-strong.png');
+  const samplesFor = async (
+    captureValue: ToonCapture,
+    phase: 'before' | 'after',
+  ): Promise<ToonRegionSample[]> => {
+    const samples: ToonRegionSample[] = [];
+    for (const region of captureValue.regions) {
+      samples.push({
+        key: region.key,
+        rect: region.rect,
+        stats: region.stats,
+        crop: await saveCrop(
+          captureValue.image,
+          region.rect,
+          width,
+          'selftest',
+          `toon-${phase}-${region.key}.png`,
+        ),
+      });
+    }
+    return samples;
+  };
 
-  const shadeWarm = await window.webContents.executeJavaScript(
-    'JSON.stringify(window.diagnostics.shadeSkin({ambient:0.78,diffuse:0.22,light:[-0.35,0.65,0.68],tint:[1,0.90,0.85]}))',
-    true,
-  );
-  await sleep(120);
-  await captureStep('shade-warm', 'hand-05-shade-warm.png');
+  const beforeSamples = await samplesFor(chosen.before, 'before');
+  const afterSamples = await samplesFor(chosen.after, 'after');
 
-  await window.webContents.executeJavaScript("window.diagnostics.tintSkin('none')", true);
-  const bodyRed = await window.webContents.executeJavaScript(
-    'JSON.stringify(window.diagnostics.testHandMaterial(0xff0000))',
-    true,
-  );
-  await sleep(120);
-  await captureStep('body-material-red', 'hand-06-body-red.png');
-  await window.webContents.executeJavaScript('window.diagnostics.resetMaterials()', true);
+  const toonAfter = JSON.parse(
+    (await window.webContents.executeJavaScript(
+      'JSON.stringify(window.petModel.getDiagnostics().toon)',
+      true,
+    )) as string,
+  ) as Record<string, unknown>;
 
-  const toonBody = await window.webContents.executeJavaScript(
-    "JSON.stringify(window.diagnostics.setShading('toon-body'))",
-    true,
-  );
-  await sleep(250);
-  await captureStep('toon-body-only', 'hand-07-toon-body.png');
+  const delta = (key: string): Record<string, unknown> | null => {
+    const left = beforeSamples.find((sample) => sample.key === key)?.stats ?? null;
+    const right = afterSamples.find((sample) => sample.key === key)?.stats ?? null;
+    if (!left || !right) return null;
+    return {
+      lumaBefore: left.luma,
+      lumaAfter: right.luma,
+      lumaDelta: Math.round((right.luma - left.luma) * 10) / 10,
+      stdDevBefore: left.lumaStdDev,
+      stdDevAfter: right.lumaStdDev,
+      rangeBefore: left.lumaP95 - left.lumaP05,
+      rangeAfter: right.lumaP95 - right.lumaP05,
+      darkRatioBefore: left.darkRatio,
+      darkRatioAfter: right.darkRatio,
+      whiteRatioBefore: left.whiteRatio,
+      whiteRatioAfter: right.whiteRatio,
+      pixels: left.pixels,
+    };
+  };
 
-  const toonAll = await window.webContents.executeJavaScript(
-    "JSON.stringify(window.diagnostics.setShading('toon-all'))",
-    true,
-  );
-  await sleep(250);
-  await captureStep('toon-all-materials', 'hand-08-toon-all.png');
-
-  await window.webContents.executeJavaScript("window.diagnostics.setShading('basic')", true);
-  await sleep(200);
-  await captureStep('restored-basic', 'hand-09-restored.png');
-  await window.webContents.executeJavaScript('window.diagnostics.resetMaterials()', true);
+  logInfo('selftest', 'Toon 诊断：before', {
+    png: path.relative(app.getAppPath(), beforePng),
+    regions: beforeSamples.map((sample) => ({
+      key: sample.key,
+      luma: sample.stats?.luma ?? null,
+      stdDev: sample.stats?.lumaStdDev ?? null,
+      mean: sample.stats?.mean ?? null,
+    })),
+  });
+  logInfo('selftest', 'Toon 诊断：after', {
+    png: path.relative(app.getAppPath(), afterPng),
+    regions: afterSamples.map((sample) => ({
+      key: sample.key,
+      luma: sample.stats?.luma ?? null,
+      stdDev: sample.stats?.lumaStdDev ?? null,
+      mean: sample.stats?.mean ?? null,
+    })),
+  });
 
   const summary = {
     at: new Date().toISOString(),
     content,
-    diagnostics: {
+    model: {
       modelId: diagnostics.modelId,
       meshNames: diagnostics.meshNames,
-      hiddenMeshes: diagnostics.hiddenMeshes,
+      materialNames: diagnostics.materialNames,
+      contentMode: '无光照（修改前：平涂 + 无灯）↔ 3 阶 Toon + 主方向光（修改后）',
     },
+    pairSelection: {
+      maxAttempts: MAX_ATTEMPTS,
+      attempts,
+      pickedAttempt: chosen.attempt,
+      faceDelta: Math.round(chosen.faceDelta * 10) / 10,
+    },
+    toon: toonAfter,
+    toonAtBoot,
     materials,
-    handScreenPoints: points,
-    tintHand: JSON.parse(tintHand as string),
-    tintBoth: JSON.parse(tintBoth as string),
-    shadeSoft: JSON.parse(shadeSoft as string),
-    shadeStrong: JSON.parse(shadeStrong as string),
-    shadeWarm: JSON.parse(shadeWarm as string),
-    bodyMaterialReplacement: JSON.parse(bodyRed as string),
-    toonBody: JSON.parse(toonBody as string),
-    toonAll: JSON.parse(toonAll as string),
-    shots,
+    bones: { handL, handR, head },
+    before: { png: path.relative(app.getAppPath(), beforePng), regions: beforeSamples },
+    after: { png: path.relative(app.getAppPath(), afterPng), regions: afterSamples },
+    deltas: Object.fromEntries(regions.map((region) => [region.key, delta(region.key)])),
   };
   await writeFile(
-    path.join(outputDir, 'hand-diagnosis.json'),
+    path.join(outputDir, 'toon-comparison.json'),
     `${JSON.stringify(summary, null, 2)}\n`,
     'utf8',
   );
-  logInfo('selftest', '手部诊断：汇总', {
-    json: 'dist/diagnostics/hand-diagnosis.json',
-    shots: shots.map((shot) => ({
-      step: shot.step,
-      left: shot.left,
-      right: shot.right,
-    })),
+  logInfo('selftest', 'Toon 诊断：汇总', {
+    json: 'dist/diagnostics/toon-comparison.json',
+    pair: summary.pairSelection,
+    deltas: summary.deltas,
   });
 }
 
@@ -1880,9 +2029,9 @@ export async function runSelfTestIfRequested(): Promise<void> {
     return;
   }
 
-  // 手部发白诊断（阶段 14）：`PET_HAND_DIAG=1` 时只跑这一套，落截图 + JSON 后退出。
-  if (process.env.PET_HAND_DIAG === '1') {
-    await runHandDiagnostics(window);
+  // 全局光照 / Toon 对照诊断（ADR 0037）：`PET_TOON_DIAG=1` 时只跑这一套，落 before/after 截图 + JSON 后退出。
+  if (process.env.PET_TOON_DIAG === '1') {
+    await runToonDiagnostics(window);
     app.exit(0);
     return;
   }
@@ -1956,19 +2105,41 @@ export async function runSelfTestIfRequested(): Promise<void> {
       diagnostics?.mouth.calibrated === true,
     diagnostics?.mouth,
   );
-  // ADR 0036：手部发白修复的回归断言（几何级，不依赖截图里的姿势/背景）
-  const skin = diagnostics?.skin ?? null;
+  // ADR 0037：全局光照 + Toon 的回归断言（几何/材质级，不依赖截图里的姿势/背景）
+  const toon = diagnostics?.toon ?? null;
+  const toonMaterialNames = (toon?.materials ?? []).map((swap) => swap.material).sort();
   check(
-    '肤色：手/小臂已烘焙暖色明暗（不再是纯白板，ADR 0036）',
-    skin !== null &&
-      skin.meshes === 1 &&
-      skin.vertices >= 200 &&
-      skin.minShade >= 0.7 &&
-      skin.maxShade <= 1.0001 &&
-      skin.meanColor[0] < 0.95 &&
-      skin.meanColor[0] > skin.meanColor[1] &&
-      skin.meanColor[1] > skin.meanColor[2],
-    skin,
+    '着色：身体/头发已换成 MeshToonMaterial，其余材质不动（ADR 0037）',
+    toon !== null &&
+      toon.enabled === true &&
+      toonMaterialNames.length === 2 &&
+      toonMaterialNames.includes('CH0335_Body') &&
+      toonMaterialNames.includes('CH0335_Hair') &&
+      toon.materials.every((swap) => swap.to === 'MeshToonMaterial'),
+    { materials: toonMaterialNames, swaps: toon?.materials ?? null },
+  );
+  check(
+    '着色：3 阶硬边渐变贴图（暗/中/亮，NearestFilter）',
+    toon !== null &&
+      toon.gradientSteps.length === 3 &&
+      toon.gradientSteps[0]! < toon.gradientSteps[1]! &&
+      toon.gradientSteps[1]! < toon.gradientSteps[2]! &&
+      toon.gradientSteps[2] === 1,
+    toon ? { steps: toon.gradientSteps, width: toon.gradientWidth } : null,
+  );
+  check(
+    '着色：面部（Face/EyeMouth/眉毛）保持无光照（§7.3 面部死守）',
+    toon !== null &&
+      toon.materials.every((swap) => !/face|eyemouth|eyebrow/i.test(swap.material)),
+    toon?.materials ?? null,
+  );
+  check(
+    '着色：主方向光 + 极低环境光（受光 ≈ 贴图原色，不整体压灰）',
+    toon !== null &&
+      toon.directional > toon.ambient &&
+      toon.ambient + toon.directional > Math.PI * 0.98 &&
+      toon.ambient + toon.directional < Math.PI * 1.02,
+    toon ? { ambient: toon.ambient, directional: toon.directional } : null,
   );
 
   // ------------------------------------------------------------------

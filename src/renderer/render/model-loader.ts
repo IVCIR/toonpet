@@ -5,7 +5,8 @@
  *   渲染进程不碰文件系统；
  * - 取景包围盒与主进程用**同一份**排除规则（query 传入的 frameExclude）与同一份定标公式；
  * - 配件隐藏（ADR 0014 D5）：只 `visible = false`，不删除节点、不改材质；隐藏集合不参与取景；
- * - 材质统一转无光照 `MeshBasicMaterial`：场景没有灯光，PBR 会发黑，二次元贴图已烘焙明暗；
+ * - 材质统一转无光照 `MeshBasicMaterial`：GLTFLoader 出来的 PBR 在无灯场景里会发黑。
+ *   身体/头发随后由 `toon-shading.ts` 换成 `MeshToonMaterial`（ADR 0037），面部保持无光照；
  * - 骨骼按精确名字匹配，缺失只降级不抛错。
  */
 import * as THREE from 'three';

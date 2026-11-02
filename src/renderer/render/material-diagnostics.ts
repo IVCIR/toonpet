@@ -1,18 +1,15 @@
 /**
- * 材质/网格只读诊断（阶段 14 视觉问题：手部发白）。
+ * 材质/网格只读诊断（阶段 14 视觉问题的取证工具，阶段 15 起只保留"读事实"部分）。
  *
  * 这些函数**不属于**契约 §7.3：只在 `window.diagnostics`（同页脚本 / 自检）里调用，
  * 不跨进程暴露、不进入 `RenderState`、不影响生产路径。
  *
- * 为什么单独一个文件：诊断要读 three 的几何/蒙皮/贴图内部结构，而这些细节
- * 不应该长在 `render-module.ts` 里（它已经 2000 行）。这里只做"读事实"和
- * "临时换材质"，不持有状态；恢复由调用方负责。
+ * 生产着色已由 `toon-shading.ts` 接管（ADR 0037）；这里只保留三类取证能力：
+ *   - `inspectMeshMaterials()`：每块网格用的什么材质 / 贴图多大 / 手在哪儿；
+ *   - `tintSkinVertices()`：把"手/小臂主导"的顶点染红（证明手在哪块网格上）；
+ *   - `replaceMaterialByName()`：把某个材质整体换纯色（证明手与衣服共用材质）。
  */
 import * as THREE from 'three';
-import { computeSkinShade, dominantBoneNames, matchesSkinBone } from './skin-shading';
-import type { SkinShadingOptions } from './skin-shading';
-
-export type { SkinShadingOptions } from './skin-shading';
 
 export interface TextureFacts {
   present: boolean;
@@ -113,6 +110,37 @@ function handUvBox(
   return [u0, v0, u1, v1];
 }
 
+/** 顶点主导骨名（按最大权重的 JOINTS_0 分量）。非蒙皮网格返回 null。 */
+export function dominantBoneNames(mesh: THREE.Mesh): string[] | null {
+  const skinned = mesh as THREE.SkinnedMesh;
+  if (!skinned.isSkinnedMesh || !skinned.skeleton) return null;
+  const geometry = mesh.geometry;
+  const skinIndex = geometry.getAttribute('skinIndex');
+  const skinWeight = geometry.getAttribute('skinWeight');
+  if (!skinIndex || !skinWeight) return null;
+  const bones = skinned.skeleton.bones;
+  const names: string[] = [];
+  for (let i = 0; i < skinIndex.count; i += 1) {
+    let best = 0;
+    let bestWeight = -1;
+    for (let k = 0; k < 4; k += 1) {
+      const weight = skinWeight.getComponent(i, k);
+      if (weight > bestWeight) {
+        bestWeight = weight;
+        best = k;
+      }
+    }
+    names.push(bones[skinIndex.getComponent(i, best)]?.name ?? '');
+  }
+  return names;
+}
+
+/** three 里的骨名形如 `Bip001_L_Hand`（GLTFLoader 清洗过空格）。 */
+export function matchesSkinBone(name: string, kind: 'hand' | 'forearm'): boolean {
+  if (!name) return false;
+  return new RegExp(`(?:^|_)${kind}(?:_|$)`, 'i').test(name);
+}
+
 /**
  * 遍历场景里所有 Mesh / SkinnedMesh，输出"这块网格用的什么材质、贴图在不在、
  * 色彩空间是什么、手上多少顶点"。
@@ -137,8 +165,9 @@ export function inspectMeshMaterials(root: THREE.Object3D): MeshMaterialFacts[] 
     const triangles = Math.floor((index ? index.count : position?.count ?? 0) / 3);
     for (const material of materials) {
       if (!material) continue;
-      const basic = material as THREE.MeshBasicMaterial;
-      const map = basic.map ?? null;
+      // Toon 与 Basic 都有 map / color（`MeshToonMaterial` 继承自它需要的公共字段）
+      const withMap = material as THREE.MeshBasicMaterial;
+      const map = withMap.map ?? null;
       const box = handUvBox(mesh, handVertices);
       output.push({
         mesh: mesh.name || '(unnamed)',
@@ -148,10 +177,10 @@ export function inspectMeshMaterials(root: THREE.Object3D): MeshMaterialFacts[] 
         triangles,
         materialName: material.name || '(unnamed)',
         materialType: material.type,
-        color: `#${basic.color?.getHexString?.() ?? 'ffffff'}`,
-        vertexColors: basic.vertexColors === true,
+        color: `#${withMap.color?.getHexString?.() ?? 'ffffff'}`,
+        vertexColors: withMap.vertexColors === true,
         hasColorAttribute: mesh.geometry.hasAttribute('color'),
-        alphaTest: basic.alphaTest ?? 0,
+        alphaTest: withMap.alphaTest ?? 0,
         side: sideName(material.side),
         map: textureFacts(map),
         handVertices: handVertices.length,
@@ -168,7 +197,7 @@ export function inspectMeshMaterials(root: THREE.Object3D): MeshMaterialFacts[] 
 interface VertexColorSnapshot {
   /** 原始 COLOR_0（可能是 InterleavedBufferAttribute：glTF-Transform 会交错存放） */
   original: THREE.BufferAttribute | THREE.InterleavedBufferAttribute;
-  /** 原始逐分量值（白 = 1；生产路径已烘焙后 = 烘焙结果） */
+  /** 原始逐分量值（诊断前的值） */
   values: Float32Array;
   itemSize: number;
   /** 诊断期间替换成的独立 BufferAttribute（可安全写） */
@@ -226,7 +255,7 @@ export function tintSkinVertices(
     if (!snapshot) return;
     const names = dominantBoneNames(mesh) ?? [];
     const attribute = snapshot.replacement;
-    // 先还原为诊断前的值（生产路径下是已烘焙的肤色，未烘焙时是白）
+    // 先还原为诊断前的值
     (attribute.array as Float32Array).set(snapshot.values);
     let touched = 0;
     for (let i = 0; i < names.length; i += 1) {
@@ -248,64 +277,8 @@ export function tintSkinVertices(
   return { meshes, handVertices, forearmVertices };
 }
 
-/**
- * 把"手/小臂"顶点的 **COLOR_0** 当作烘焙光照写进去（仍保持无光照材质）。
- *
- * 诊断用：会把结果写进可恢复的快照；生产路径的同类实现是 `skin-shading.ts`
- * 的 `bakeSkinShading`（不可恢复，加载期只跑一次）。
- */
-export function shadeSkinVertices(
-  root: THREE.Object3D,
-  options: SkinShadingOptions,
-): { meshes: number; vertices: number; minShade: number; maxShade: number } {
-  let meshes = 0;
-  let vertices = 0;
-  let minShade = Number.POSITIVE_INFINITY;
-  let maxShade = Number.NEGATIVE_INFINITY;
-
-  root.traverse((object) => {
-    const mesh = object as THREE.Mesh;
-    if (!mesh.isMesh || !mesh.geometry) return;
-    const snapshot = ensureColorSnapshot(mesh);
-    if (!snapshot) return;
-    const names = dominantBoneNames(mesh) ?? [];
-    const normals = mesh.geometry.getAttribute('normal');
-    const attribute = snapshot.replacement;
-    (attribute.array as Float32Array).set(snapshot.values);
-    let touched = 0;
-    for (let i = 0; i < names.length; i += 1) {
-      const hand = matchesSkinBone(names[i]!, 'hand');
-      const forearm = matchesSkinBone(names[i]!, 'forearm');
-      if (!hand && !forearm) continue;
-      const nx = normals ? normals.getX(i) : 0;
-      const ny = normals ? normals.getY(i) : 1;
-      const nz = normals ? normals.getZ(i) : 0;
-      const shade = computeSkinShade(nx, ny, nz, options);
-      attribute.setXYZ(
-        i,
-        options.tint[0] * shade,
-        options.tint[1] * shade,
-        options.tint[2] * shade,
-      );
-      if (shade < minShade) minShade = shade;
-      if (shade > maxShade) maxShade = shade;
-      touched += 1;
-      vertices += 1;
-    }
-    if (touched > 0) {
-      attribute.needsUpdate = true;
-      meshes += 1;
-    }
-  });
-
-  if (!Number.isFinite(minShade)) {
-    minShade = 1;
-    maxShade = 1;
-  }
-  return { meshes, vertices, minShade, maxShade };
-}
-
-function restoreColorSnapshots(root: THREE.Object3D): void {
+/** 还原诊断期间换掉的顶点色（回到模型原始 COLOR_0）。 */
+export function restoreVertexColorDiagnostics(root: THREE.Object3D): void {
   root.traverse((object) => {
     const mesh = object as THREE.Mesh;
     if (!mesh.isMesh || !mesh.geometry) return;
@@ -345,113 +318,4 @@ export function replaceMaterialByName(
       replacement.dispose();
     },
   };
-}
-
-export type DiagnosticShading = 'basic' | 'toon-body' | 'toon-all';
-
-export interface ShadingResult {
-  mode: DiagnosticShading;
-  materials: Array<{ mesh: string; from: string; to: string }>;
-  lights: { ambient: number; directional: number } | null;
-}
-
-const originalMaterials = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>();
-
-/**
- * 诊断用着色模式切换：
- * - `basic`（生产路径）：无光照 `MeshBasicMaterial`，与 `model-loader` 的转换一致；
- * - `toon-body`：只把 `CH0335_Body` 材质换成 `MeshToonMaterial` + 光照；
- * - `toon-all`：全部材质换 Toon（含脸/眼嘴/头发），验证"连嘴部底板一起吃光"是否自洽。
- */
-export function setDiagnosticShading(
-  scene: THREE.Scene,
-  root: THREE.Object3D,
-  mode: DiagnosticShading,
-  lights: { ambient: THREE.AmbientLight; directional: THREE.DirectionalLight } | null,
-): {
-  result: ShadingResult;
-  lights: { ambient: THREE.AmbientLight; directional: THREE.DirectionalLight } | null;
-} {
-  const converted: Array<{ mesh: string; from: string; to: string }> = [];
-
-  root.traverse((object) => {
-    const mesh = object as THREE.Mesh;
-    if (!mesh.isMesh) return;
-    if (!originalMaterials.has(mesh)) {
-      originalMaterials.set(mesh, Array.isArray(mesh.material) ? [...mesh.material] : mesh.material);
-    }
-    const source = originalMaterials.get(mesh)!;
-    if (mode === 'basic') {
-      mesh.material = Array.isArray(source) ? [...source] : source;
-      return;
-    }
-    const build = (material: THREE.Material): THREE.Material => {
-      const basic = material as THREE.MeshBasicMaterial;
-      if (mode === 'toon-body' && !/^CH0335_Body$/i.test(material.name)) return material;
-      const toon = new THREE.MeshToonMaterial({
-        name: material.name,
-        map: basic.map ?? null,
-        color: basic.color?.clone() ?? new THREE.Color(0xffffff),
-        vertexColors: basic.vertexColors === true,
-        transparent: basic.transparent,
-        alphaTest: basic.alphaTest ?? 0,
-        side: material.side,
-        depthWrite: basic.depthWrite,
-        toneMapped: false,
-      });
-      return toon;
-    };
-    const next = Array.isArray(source) ? source.map(build) : build(source);
-    mesh.material = next;
-    const list = Array.isArray(next) ? next : [next];
-    const sourceList = Array.isArray(source) ? source : [source];
-    for (let i = 0; i < list.length; i += 1) {
-      const material = list[i]!;
-      if (material === sourceList[i]) continue;
-      converted.push({
-        mesh: mesh.name || '(unnamed)',
-        from: sourceList[i]?.name ?? '',
-        to: material.type,
-      });
-    }
-  });
-
-  let currentLights = lights;
-  if (mode !== 'basic' && !currentLights) {
-    const ambient = new THREE.AmbientLight(0xffffff, 0.62);
-    ambient.name = 'diagnostic-ambient';
-    const directional = new THREE.DirectionalLight(0xffffff, 0.72);
-    directional.name = 'diagnostic-directional';
-    directional.position.set(0.35, 0.8, 1);
-    scene.add(ambient, directional);
-    currentLights = { ambient, directional };
-  }
-  if (mode === 'basic' && currentLights) {
-    scene.remove(currentLights.ambient, currentLights.directional);
-    currentLights.ambient.dispose();
-    currentLights.directional.dispose();
-    currentLights = null;
-  }
-
-  return {
-    result: {
-      mode,
-      materials: converted,
-      lights: currentLights
-        ? { ambient: currentLights.ambient.intensity, directional: currentLights.directional.intensity }
-        : null,
-    },
-    lights: currentLights,
-  };
-}
-
-export function resetDiagnosticMaterials(root: THREE.Object3D): void {
-  root.traverse((object) => {
-    const mesh = object as THREE.Mesh;
-    if (!mesh.isMesh) return;
-    const original = originalMaterials.get(mesh);
-    if (original) mesh.material = Array.isArray(original) ? [...original] : original;
-  });
-  originalMaterials.clear();
-  restoreColorSnapshots(root);
 }

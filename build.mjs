@@ -352,9 +352,9 @@ const bundles = [
     target: 'node20',
   },
   {
-    // ADR 0036：手/小臂肤色烘焙（顶点色 + 法线明暗）
-    entry: 'src/renderer/render/skin-shading.test.ts',
-    outfile: 'dist/tests/skin-shading.test.mjs',
+    // ADR 0037：全局光照 + Toon（3 阶渐变贴图 / 只换 Body+Hair / 面部保持无光照）
+    entry: 'src/renderer/render/toon-shading.test.ts',
+    outfile: 'dist/tests/toon-shading.test.mjs',
     platform: 'node',
     format: 'esm',
     target: 'node20',

@@ -1,13 +1,8 @@
 import type { PetShellApi } from '../../preload/main';
 import type { RenderModule } from './render-module';
 import type { MaskCapture } from './mask-capture';
-import type {
-  DiagnosticShading,
-  MeshMaterialFacts,
-  ShadingResult,
-  SkinShadingOptions,
-} from './material-diagnostics';
-import type { SkinShadingStats } from './skin-shading';
+import type { MeshMaterialFacts } from './material-diagnostics';
+import type { ToonShadingDiagnostics } from './toon-shading';
 import type { SpeechPlayerDiagnostics } from '../voice/speech-player';
 import type { SubtitleCueSnapshot } from '../shell/subtitle-cue';
 
@@ -48,20 +43,11 @@ declare global {
         handVertices: number;
         forearmVertices: number;
       };
-      /** 阶段 14：把手部法线明暗写进顶点色（不换材质、不加灯） */
-      shadeSkin(options: SkinShadingOptions): {
-        meshes: number;
-        vertices: number;
-        minShade: number;
-        maxShade: number;
-      };
       /** 阶段 14：整块 Body 材质换纯色（对照实验） */
       testHandMaterial(color?: number): { materialName: string; meshes: string[] } | null;
-      /** 阶段 14：无光照 ↔ Toon + 光照（验证阴影） */
-      setShading(mode: DiagnosticShading): ShadingResult;
-      /** 阶段 14：开/关手部肤色烘焙（A/B 对照） */
-      setSkinBake(enabled: boolean): SkinShadingStats | null;
-      /** 阶段 14：恢复材质/顶点色/光照 */
+      /** ADR 0037：开/关全局光照 + Toon（关 = 修改前的无光照样子，截图 A/B 用） */
+      setToon(enabled: boolean): ToonShadingDiagnostics;
+      /** 阶段 14：恢复材质/顶点色 */
       resetMaterials(): void;
       /** 阶段 14：双手骨骼在内容区 CSS 坐标里的位置（截图取样） */
       handScreenPoints(): {
