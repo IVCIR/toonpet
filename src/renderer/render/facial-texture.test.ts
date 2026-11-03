@@ -285,12 +285,10 @@ test('淡入：0 起点、250ms 满、越界钳制', () => {
   assertClose(fadeProgress(-5), 0);
 });
 
-test('嘴层仲裁：口型永远最高，其次摸头，再表情，最后静态闭嘴', () => {
-  const base = { speaking: false, lipSyncDriven: false, patActive: false, emotionMouth: 'smile' as const, alpha: 1 };
+test('嘴层仲裁：口型永远最高，其次表情，最后静态闭嘴（ADR 0039 D3 删除 pat 归属）', () => {
+  const base = { speaking: false, lipSyncDriven: false, emotionMouth: 'smile' as const, alpha: 1 };
   assert.equal(resolveMouthOwner({ ...base, speaking: true }), 'lip-sync');
-  assert.equal(resolveMouthOwner({ ...base, speaking: true, patActive: true }), 'lip-sync');
   assert.equal(resolveMouthOwner({ ...base, lipSyncDriven: true }), 'lip-sync');
-  assert.equal(resolveMouthOwner({ ...base, patActive: true }), 'pat');
   assert.equal(resolveMouthOwner(base), 'emotion');
   assert.equal(resolveMouthOwner({ ...base, emotionMouth: 'none' }), 'static');
   assert.equal(resolveMouthOwner({ ...base, alpha: 0 }), 'static');

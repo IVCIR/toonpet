@@ -46,6 +46,8 @@ window.petMask = mask;
 // 内部诊断（不属于 §7.3）：包围盒/负载耗时/骨骼/视线/呼吸/口型预留状态，供自检读取
 window.petModel = {
   getDiagnostics: () => module.getDiagnostics(),
+  // ADR 0039 排查：头部带几何（掩膜包围盒 / 22% 下边界 / 头骨位置）
+  headBandDiagnostics: () => module.headBandDiagnostics(),
 };
 
 /**
@@ -138,14 +140,32 @@ window.addEventListener('resize', () => {
 
 // cmd:probe → 掩膜判定 → cmd:interactive（渲染侧只回答事实，不改穿透：D-8）
 // 同时把探针坐标交给视线跟随：穿透后收不到 mousemove（§3.6 P-1），探针是唯一可靠的光标信号。
+let lastProbeLogAt = 0;
 window.petShell.onProbe((request) => {
   module.setCursor(request.x, request.y);
   const sample = mask.probe(request.x, request.y);
+  // ADR 0040：头部区不再用掩膜 bbox 22%，而是"以头骨为圆心、0.125 × 内容高为半径"。
+  // 掩膜那一层只提供 hit 与降级用的 head；骨骼缺失/掩膜 cold 时才退回旧口径。
+  const head = module.headSampleAt(sample.x, sample.y, sample.head, sample.hit);
+  // ADR 0039/0040 排查打点（只读，≤4Hz）：这一点到底算不算"头部"，用的是哪条口径。
+  const now = performance.now();
+  if (now - lastProbeLogAt >= 250) {
+    lastProbeLogAt = now;
+    const band = module.headBandDiagnostics();
+    const headY = band.headBoneCss ? band.headBoneCss.y : null;
+    const dist = headY === null ? null : Math.round(Math.hypot(sample.x - band.headBoneCss!.x, sample.y - headY));
+    console.log(
+      `[render] probe css=(${Math.round(request.x)},${Math.round(request.y)}) ` +
+        `hit=${String(sample.hit)} head=${String(head.head)} src=${head.source} ` +
+        `boneY=${headY === null ? '-' : Math.round(headY)} radius=${band.headRadiusPx ?? '-'} dist=${dist ?? '-'} ` +
+        `bandBottomY=${band.bandBottomCssY ?? '-'} bbox=${band.bbox ? `${band.bbox.minX},${band.bbox.minY}..${band.bbox.maxX},${band.bbox.maxY}` : '-'}`,
+    );
+  }
   window.petShell.reportProbe({
     hit: sample.hit,
     x: sample.x,
     y: sample.y,
-    head: sample.head,
+    head: head.head,
   });
 });
 

@@ -255,22 +255,25 @@ export function fadeProgress(elapsedMs: number, durationMs: number = EMOTION_FAD
   return Math.min(1, elapsedMs / durationMs);
 }
 
-/** 嘴层的实际归属（§5.2 口型通道最高优先级的可观测形式）。 */
-export type MouthOwner = 'lip-sync' | 'pat' | 'emotion' | 'static';
+/**
+ * 嘴层的实际归属（§5.2 口型通道最高优先级的可观测形式）。
+ *
+ * ADR 0039 D3：`'pat'` 归属已删除——摸头不再单独切"shy 帧"，它只是把 `effective emotion`
+ * 投影成 `shy`，嘴型由 `'emotion'` 用官方差分承担。
+ */
+export type MouthOwner = 'lip-sync' | 'emotion' | 'static';
 
 /**
- * 嘴层仲裁（§5.2 / §5.3 / ADR 0026 D3）：
- * 口型 > 摸头 > 表情 > 静态闭嘴。纯函数，可单测；渲染侧照它的结论画。
+ * 嘴层仲裁（§5.2 / ADR 0026 D3 / ADR 0039 D3）：
+ * 口型 > 表情 > 静态闭嘴。纯函数，可单测；渲染侧照它的结论画。
  */
 export function resolveMouthOwner(input: {
   speaking: boolean;
   lipSyncDriven: boolean;
-  patActive: boolean;
   emotionMouth: MouthShape;
   alpha: number;
 }): MouthOwner {
   if (input.speaking || input.lipSyncDriven) return 'lip-sync';
-  if (input.patActive) return 'pat';
   if (input.emotionMouth !== 'none' && input.alpha > 0.001) return 'emotion';
   return 'static';
 }

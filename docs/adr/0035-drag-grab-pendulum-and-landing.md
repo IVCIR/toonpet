@@ -6,6 +6,7 @@
 | 日期 | 2026-11-02 |
 | 决策者 | 项目所有者 |
 | 关联 | 契约 §3.4（D-2/D-5/D-6/D-7）、§3.5（`cmd:drag` 不扩字段）、§4.1（`dragged` / `settling`）、§5.2（身体/视线通道）、§7.1（`RenderState` 不增字段）、§7.3；ADR 0014（骨骼仲裁）、ADR 0024（回弹）、ADR 0034（吸附接近） |
+| 修订 | **D4 的落地口径已由 ADR 0040 D3 修订**：冲击速度改取 `drag_released.vy`（不再用 settling 期间窗口向下峰值，后者必然饱和），`LANDING_MAX_SQUASH 0.08 → 0.03`、`LANDING_DURATION_MS 300 → 220`、`LANDING_IMPACT_MIN 150 → 700px/s`。原因：8% 全身竖压 + 窗口反跳被误读成"摸头" |
 
 ## 背景
 

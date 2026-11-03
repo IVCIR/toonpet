@@ -106,6 +106,8 @@
       let current = null;
       let playing = false;
       let clock = new THREE.Clock();
+      /** 根节点（普查/胶片条要遍历骨骼） */
+      let gltfRoot = null;
 
       function resize() {
         const w = stage.clientWidth;
@@ -151,6 +153,7 @@
         action.clampWhenFinished = !loopEl.checked;
         current = action;
         playing = true;
+        window.__censusLastClip = name;
         for (const el of listEl.children) el.classList.toggle('active', el.dataset.name === name);
         const clip = action.getClip();
         statusEl.textContent = `${name}  ${clip.duration.toFixed(2)}s  ${clip.tracks.length} tracks`;
@@ -192,6 +195,7 @@
         '/CH0335.glb',
         (gltf) => {
           scene.add(gltf.scene);
+          gltfRoot = gltf.scene;
           gltf.scene.updateMatrixWorld(true);
 
           // 这段 GLB 的世界尺度只有 ~1.4cm（根节点带 0.01 缩放），而且部分网格的
@@ -281,6 +285,86 @@
         sceneChildren: scene.children.length,
         clipCount: clips.length,
       });
+
+      // 全量普查（本轮新增）：对每段片段按固定步长采样骨骼事实，
+      // 用来在 44 段里**先算出**"哪几段像缩身/抬手/低头"，再决定看哪几张胶片条。
+      // 只看骨骼（头 / 骨盆 / 双手 / 双脚），不做像素级分析；纯本地。
+      window.__census = (options = {}) => {
+        if (!mixer) return null;
+        const step = options.step > 0 ? options.step : 0.25;
+        const only = Array.isArray(options.clips) && options.clips.length ? new Set(options.clips) : null;
+        const boneKeys = {
+          head: 'head', pelvis: 'pelvis', neck: 'neck', spine: 'spine',
+          handL: 'lhand', handR: 'rhand', footL: 'lfoot', footR: 'rfoot',
+        };
+        const bones = {};
+        const seen = [];
+        gltfRoot.traverse((object) => {
+          if (!object.isBone) return;
+          seen.push(object.name);
+          const flat = object.name.toLowerCase().replace(/[\s_]/g, '');
+          for (const [key, token] of Object.entries(boneKeys)) {
+            if (bones[key]) continue;
+            if (flat.endsWith(token)) bones[key] = object;
+          }
+        });
+        const out = [];
+        const tmp = new THREE.Vector3();
+        const quat = new THREE.Quaternion();
+        const euler = new THREE.Euler();
+        const read = (bone) => {
+          if (!bone) return null;
+          bone.getWorldPosition(tmp);
+          return { x: tmp.x, y: tmp.y, z: tmp.z };
+        };
+        for (const clip of clips) {
+          if (only && !only.has(clip.name)) continue;
+          const action = actions.get(clip.name);
+          if (!action) continue;
+          mixer.stopAllAction();
+          action.reset();
+          action.setLoop(THREE.LoopOnce, 1);
+          action.clampWhenFinished = true;
+          action.enabled = true;
+          action.setEffectiveWeight(1);
+          action.play();
+          action.paused = true;
+
+          const count = Math.min(96, Math.max(8, Math.round(clip.duration / step) + 1));
+          const times = [];
+          for (let i = 0; i < count; i += 1) times.push(Math.min(clip.duration, (i * clip.duration) / (count - 1)));
+
+          const samples = times.map((time) => {
+            action.time = time;
+            mixer.update(0);
+            gltfRoot.updateMatrixWorld(true);
+            const head = read(bones.head);
+            const pelvis = read(bones.pelvis);
+            const handL = read(bones.handL);
+            const handR = read(bones.handR);
+            const footL = read(bones.footL);
+            const footR = read(bones.footR);
+            let pitch = null; let yaw = null; let roll = null;
+            if (bones.head) {
+              bones.head.getWorldQuaternion(quat);
+              euler.setFromQuaternion(quat, 'YXZ');
+              pitch = euler.x; yaw = euler.y; roll = euler.z;
+            }
+            const distToHead = (p) => (p && head ? Math.hypot(p.x - head.x, p.y - head.y, p.z - head.z) : null);
+            const footY = footL && footR ? Math.min(footL.y, footR.y) : null;
+            return {
+              t: Number(time.toFixed(3)),
+              head, pelvis, handL, handR, footY,
+              headPitch: pitch, headYaw: yaw, headRoll: roll,
+              handDistL: distToHead(handL), handDistR: distToHead(handR),
+            };
+          });
+          out.push({ name: clip.name, duration: clip.duration, samples });
+        }
+        mixer.stopAllAction();
+        if (window.__censusLastClip && actions.has(window.__censusLastClip)) play(window.__censusLastClip);
+        return { bones: Object.fromEntries(Object.entries(bones).map(([k, v]) => [k, v ? v.name : null])), boneCount: seen.length, clips: out };
+      };
 
       // 胶片条：同一片段的多个时间点拼成一张图，用来决定"裁到第几秒"。
       // 返回 PNG dataURL；纯本地渲染，不发网络请求。

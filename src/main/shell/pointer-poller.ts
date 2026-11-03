@@ -170,6 +170,30 @@ export function createPointerPoller(deps: PointerPollerDeps): PointerPoller {
         probe: probeCache,
       });
 
+      // ADR 0039 排查打点（只读）：这一次按下到底看到的是什么。
+      deps.logInfo(
+        `[drag-gesture] pointerdown: hitHead=${String(down.headAccepted)}` +
+          `, x=${Math.round(fact.x)}, y=${Math.round(fact.y)}`,
+        {
+          probeHead: down.head,
+          headAccepted: down.headAccepted,
+          headRejectedBecause: down.headRejectedBecause,
+          probeAgeMs: down.probeAgeMs,
+          probeDistancePx: down.probeDistancePx,
+          probe: probeCache
+            ? {
+                x: Math.round(probeCache.x),
+                y: Math.round(probeCache.y),
+                head: probeCache.head,
+                hit: probeCache.hit,
+              }
+            : null,
+          accepted: down.accepted,
+          why: down.reason,
+          passthroughTarget: fsm.current,
+        },
+      );
+
       if (!down.accepted) {
         deps.logInfo('按下被忽略（D-2 门槛未满足）', {
           reason: down.reason,
@@ -210,6 +234,31 @@ export function createPointerPoller(deps: PointerPollerDeps): PointerPoller {
   function applyGestureStep(step: GestureStep, bounds: Rect, now: number): void {
     if (step.note) deps.logInfo(step.note.message, step.note.data);
 
+    // ADR 0039 排查打点（只读）：抬手判定的全事实 + 摸头到底发没发。
+    if (step.debug) {
+      deps.logInfo(
+        `[drag-gesture] pointerup: isDragging=${String(step.debug.isDragging)}` +
+          `, dx=${step.debug.dx}, dy=${step.debug.dy}, dt=${step.debug.dtMs}`,
+        {
+          dist: step.debug.dist,
+          windowMoved: { x: step.debug.windowMovedX, y: step.debug.windowMovedY },
+          headAccepted: step.debug.headAccepted,
+          headRejectedBecause: step.debug.headRejectedBecause,
+        },
+      );
+      deps.logInfo(`[drag-gesture] emit head_patted? ${String(step.debug.shouldEmitPat)}`, {
+        blockedBy: step.debug.blockedBy,
+        dx: step.debug.dx,
+        dy: step.debug.dy,
+        dtMs: step.debug.dtMs,
+        dist: step.debug.dist,
+        windowMoved: { x: step.debug.windowMovedX, y: step.debug.windowMovedY },
+        headAccepted: step.debug.headAccepted,
+        headRejectedBecause: step.debug.headRejectedBecause,
+        isDragging: step.debug.isDragging,
+      });
+    }
+
     if (step.moveTo && (step.moveTo.x !== bounds.x || step.moveTo.y !== bounds.y)) {
       deps.setWindowPosition(step.moveTo.x, step.moveTo.y);
     }
@@ -244,7 +293,18 @@ export function createPointerPoller(deps: PointerPollerDeps): PointerPoller {
           deps.logInfo('进入沉降窗口（ADR 0004 D3）', { settleMs: REBOUND_SETTLE_MS });
           break;
 
-        case 'head-patted':
+        case 'head-patted': {
+          // ADR 0039 D5：松手后的 500ms 沉降窗口与真实回弹期间**一律丢弃**摸头。
+          // 手势层已经在 `drag-gesture` 里做了同样的判断；这里是发事件前的最后一道闸，
+          // 保证"拖完不会冒出一个摸头"不依赖单点实现。
+          if (settling || (deps.isSettling?.() ?? false)) {
+            deps.logWarn('head_patted 被丢弃：拖拽/回弹期间严格互斥（ADR 0039 D5）', {
+              patCount: effect.patCount,
+              settling,
+              rebound: deps.isSettling?.() ?? false,
+            });
+            break;
+          }
           deps.emit('head_patted', { patCount: effect.patCount });
           deps.logInfo('head_patted 发出（D-3/D-4）', {
             patCount: effect.patCount,
@@ -253,6 +313,7 @@ export function createPointerPoller(deps: PointerPollerDeps): PointerPoller {
             maskAvailable: lastMaskAvailable === true,
           });
           break;
+        }
       }
     }
   }

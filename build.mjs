@@ -195,13 +195,6 @@ const bundles = [
     target: 'node20',
   },
   {
-    entry: 'src/renderer/render/pat-react.test.ts',
-    outfile: 'dist/tests/pat-react.test.mjs',
-    platform: 'node',
-    format: 'esm',
-    target: 'node20',
-  },
-  {
     entry: 'src/renderer/render/facial-texture.test.ts',
     outfile: 'dist/tests/facial-texture.test.mjs',
     platform: 'node',

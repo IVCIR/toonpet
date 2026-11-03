@@ -201,6 +201,35 @@ test('D-3：head 快照被丢弃时不发事件，但留一条可诊断的日志
   assert.equal(result.note?.data['because'], 'mask-unavailable');
 });
 
+test('ADR 0039 D5：按下期间窗口被移动过 → 不判摸头，也不伪造拖拽', () => {
+  const gesture = new DragGesture();
+  // 头部区按下，光标一动不动、时长也很短——只看 4px / 250ms 会判成短按
+  down(gesture, 240, 400, 0, { probe: probeAt(240, 400, 0, true) });
+  // 但窗口在按下期间被外部移动过（回弹弹簧 / 吸附跟随 / 行走都在搬窗口）
+  const movedContent: Rect = { ...CONTENT, x: CONTENT.x + 30, y: CONTENT.y - 12 };
+  const released = up(gesture, 240, 400, 60, { content: movedContent });
+
+  assert.equal(released.effects.length, 0, '不得发出 head_patted，也不得伪造 drag_*');
+  assert.match(released.note?.message ?? '', /按下期间窗口被移动过/);
+  assert.equal(gesture.headPatCount, 0, '不得发出 head_patted');
+});
+
+test('ADR 0039 D5：一次拖拽解除本次按下的摸头资格，直到下一次全新 pointerdown', () => {
+  const gesture = new DragGesture();
+  down(gesture, 240, 400, 0, { probe: probeAt(240, 400, 0, true) });
+  assert.equal(tick(gesture, screenAt(280, 400), 16).effects[0]?.kind, 'drag-started');
+  assert.deepEqual(
+    up(gesture, 280, 400, 100).effects.map((effect) => effect.kind),
+    ['drag-released'],
+  );
+  assert.equal(gesture.headPatCount, 0);
+
+  // 全新的 pointerdown 重新武装：冷却期外的一次头部短按可以正常触发
+  const again = pat(gesture, 2000, 60);
+  assert.equal(again.effects[0]?.kind, 'head-patted');
+  assert.equal(gesture.headPatCount, 1);
+});
+
 test('D-5：拖拽位移 = 按下点起的累计位移（不是增量），窗口不漂移', () => {
   const gesture = new DragGesture();
   down(gesture, 240, 570, 0);

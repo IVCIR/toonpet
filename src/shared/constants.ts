@@ -4,7 +4,23 @@
 export const MASK_WIDTH = 128;
 export const MASK_HEIGHT = 72;
 export const HIT_ALPHA_THRESHOLD = 0.5; // R-4
-export const HEAD_BAND_RATIO = 0.22; // R-10
+/**
+ * 头部区（R-10）的**降级**口径：掩膜 alpha 包围盒顶部 22%。
+ *
+ * ADR 0040 起这只是兜底：首选口径是"以头骨为圆心、`HEAD_PAT_RADIUS_RATIO × 内容区高度`为半径"。
+ * 废弃原因见 ADR 0039 的排查日志：本资产的光环在掩膜里不透明，会把包围盒顶部顶到光环上沿，
+ * 22% 的下边界落在**发顶之上**（实测 y≈228–275），她的脸（y≈340–420）整块在带外，
+ * 于是"点她的脸"永远判 `head=false`、`head_patted` 永不触发。
+ */
+export const HEAD_BAND_RATIO = 0.22;
+/**
+ * 头部区首选口径的半径比例（ADR 0040）：`R = 0.125 × 内容区高度`。
+ *
+ * 422×720 窗口下 R = 90px。实测头骨 y≈343、发顶 y≈260、脸 y≈350–420、光环 y≈120–205：
+ * 半径 90 的圆恰好覆盖"发顶 → 下巴"，同时**排除光环**——点光环不再算摸头
+ * （验收标准：y≈120–205 不触发）。
+ */
+export const HEAD_PAT_RADIUS_RATIO = 0.125; // R-10（ADR 0040）
 export const MASK_REFRESH_INTERVAL_MS = 50; // R-5：≥20Hz，与渲染帧率解耦
 export const MASK_STALE_MS = 100; // R-5
 /**
@@ -201,12 +217,18 @@ export const WALK_SPEED_PX_PER_SEC = 110;
 /** 起步/停步加速度：配合刹车曲线 v=√(2ad)，起步与停步都不生硬 */
 export const WALK_ACCEL_PX_PER_SEC2 = 520;
 
-// --- 回弹（契约 §5.3"拖拽松手"、D-6；ADR 0024 D2/D3） ---
+// --- 回弹（契约 §5.3"拖拽松手"、D-6；ADR 0024 D2/D3；参数改口径见 ADR 0040 D3） ---
 /** 刚度 k；与下面的阻尼一起决定"弹一下"的手感（ζ ≈ 0.5，欠阻尼） */
 export const SETTLE_STIFFNESS = 140;
 export const SETTLE_DAMPING = 12;
-/** 触地速度保留率：0.28 ≈ 落地后还能轻弹一次，不无限弹 */
-export const SETTLE_RESTITUTION = 0.28;
+/**
+ * 触地速度保留率（恢复系数）。
+ *
+ * ADR 0024 D2 原值 0.28 → 窗口会**整块反跳一次**（实测 vy 948 → −169、2137 → −491，
+ * 位移 15–40px），视觉上就是"拖完弹一下"，被误读成摸头（ADR 0039 排查）。
+ * ADR 0040 D3 调为 0.15：保留一点弹性，反跳幅度降到 ~1/2 以下，几乎看不出来。
+ */
+export const SETTLE_RESTITUTION = 0.15;
 export const SETTLE_MIN_BOUNCE_SPEED = 60;
 /** 水平惯性衰减（1/s）：甩出去的水平速度按 e^(-5t) 收敛 */
 export const SETTLE_FRICTION = 5;
@@ -321,15 +343,25 @@ export const DRAG_FOOT_KICK_MIN_INTERVAL_MS = 800;
 export const DRAG_FOOT_KICK_MAX_INTERVAL_MS = 1400;
 export const DRAG_FOOT_KICK_DURATION_MS = 180;
 
-// --- 落地冲击（契约 §5.3、D-6；ADR 0035 D4） ---
-/** 下蹲包络总时长/吸震段：0–50ms 压到最低，50–300ms 回正 */
-export const LANDING_DURATION_MS = 300;
+// --- 落地冲击（契约 §5.3、D-6；ADR 0035 D4；参数与口径改见 ADR 0040 D3） ---
+/**
+ * 下蹲包络总时长/吸震段（毫秒）。
+ * ADR 0035 D4 原值 300/50 → ADR 0040 D3 调为 220/50：更短、更像"落地"而不是"缩一下"。
+ */
+export const LANDING_DURATION_MS = 220;
 export const LANDING_ABSORB_MS = 50;
-/** 冲击速度归一化区间（px/s）：低于 min 视为轻放，高于 max 视为重摔 */
-export const LANDING_IMPACT_MIN_PX_PER_SEC = 150;
+/**
+ * 冲击速度归一化区间（px/s）：低于 min 视为轻放，高于 max 视为重摔。
+ *
+ * **口径变更（ADR 0040 D3）**：这里的 `v` 现在是 **`drag_released.vy`（松手瞬间的竖直速度）**，
+ * 不再是"settling 期间窗口向下峰值速度"。后者在弹簧自由落体时必然饱和（实测 1500–1716px/s），
+ * 于是每一次拖拽都被判成"重摔"、恒定压 8%。
+ * min 由 150 → 700：松手时向下速度小于 700px/s（正常轻放）不触发下蹲。
+ */
+export const LANDING_IMPACT_MIN_PX_PER_SEC = 700;
 export const LANDING_IMPACT_MAX_PX_PER_SEC = 1000;
-/** 最大压扁比例（只缩 Y，脚底不动） */
-export const LANDING_MAX_SQUASH = 0.08;
+/** 最大压扁比例（只缩 Y，脚底不动）。0.08 → 0.03（ADR 0040 D3） */
+export const LANDING_MAX_SQUASH = 0.03;
 /** 骨骼辅助：脊柱前倾/膝盖弯曲上限（膝盖再大就会让脚离地，实机标定后可能降为 0） */
 export const LANDING_SPINE_MAX_RAD = 0.16;
 export const LANDING_KNEE_MAX_RAD = 0.16;

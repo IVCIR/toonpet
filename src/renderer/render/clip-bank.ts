@@ -112,13 +112,22 @@ export const CLIP_RULES: Record<ClipRole, ClipRule> = {
 
   // ---- 一次性演出（正面）----
   pat: {
-    // 10.75s 整身反应里的 3.5–6.6s：缩起身子、手放胸前，读作"害羞"。
-    // 0–2.6s 是摊手手势（像"诶？"），不适合当摸头回应。
-    exact: 'CH0335_Cafe_Reaction',
-    patterns: [/cafe[_\s-]?reaction/i, /reaction/i],
+    // ADR 0039 D1：摸头反应的官方片段。
+    //
+    // `Victory_Start_Random` 是**唯一自带闭环**的"害羞缩一下"：
+    //   0–0.4s 站姿 → 0.4–0.8s 快速缩身、双手抱到胸前、低头（缩身 13–16%、头 pitch −0.13）
+    //   → 0.8–2.0s 保持害羞 → 2.0–2.2s 抬头回正。裁 0.3–2.4s 正好"从站姿开始、回站姿结束"。
+    //
+    // 为什么不继续用 `Cafe_Reaction`（3.5–6.6s）：那一段一直含胸抱手，**没有回正**，
+    // 无论剪到哪一秒，结束淡回 Idle 时手都会突然放下（ADR 0039 的实测结论）。
+    // `Cafe_Reaction` 只保留给 `greet`（0–2.2s 的摊手）。
+    //
+    // 武器/道具由 HIDE_ATTACHMENTS 隐藏；整段脚底高度只变化 0.01 单位（≈7px），无需补偿。
+    exact: 'CH0335_Victory_Start_Random',
+    patterns: [/victory[_\s-]?start[_\s-]?random/i],
     loop: false,
-    startSeconds: 3.5,
-    maxSeconds: 6.6,
+    startSeconds: 0.3,
+    maxSeconds: 2.4,
   },
   greet: {
     // 同一段反应的开头 0–2.2s：正面、双手摊开，当"打招呼"用

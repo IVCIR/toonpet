@@ -148,7 +148,13 @@ interface ModelDiagnostics {
       eyeImageLabel: string | null;
     };
   };
-  pat: { active: boolean; weight: number; allowMouthChange: boolean; mouthFrame: number | null };
+  /** ADR 0039：摸头反应（官方片段 + 表情投影，无程序化姿态） */
+  pat: {
+    active: boolean;
+    body: boolean;
+    clip: string | null;
+    blockedBy: 'dragged' | 'settling' | 'sitting' | 'walking' | 'speaking' | 'missing' | null;
+  };
   speech: { frame: number; driven: boolean };
   /** ADR 0037：全局光照 + Toon（内部诊断） */
   toon: {
@@ -617,7 +623,12 @@ async function resolvePoints(window: BrowserWindow): Promise<ResolvedPoints> {
       const d = window.petModel ? window.petModel.getDiagnostics() : null;
       const w = window.innerWidth;
       const h = window.innerHeight;
-      const probe = (x, y) => { const s = m.probe(x, y); return { x, y, hit: s.hit, head: s.head }; };
+      const probe = (x, y) => {
+        const s = m.probe(x, y);
+        // ADR 0040：head 的权威口径在渲染侧（头骨半径）；掩膜那一层只给 hit 与降级值
+        const h = window.petRender.headSampleAt(s.x, s.y, s.head, s.hit);
+        return { x, y, hit: s.hit, headMask: s.head, head: h.head, src: h.source };
+      };
       const out = { head: null, body: null, preferred: {}, bbox: m.snapshot().bbox };
       const preferred = d && d.probePoints ? d.probePoints : null;
       if (preferred) {
@@ -659,6 +670,23 @@ async function resolvePoints(window: BrowserWindow): Promise<ResolvedPoints> {
     true,
   )) as string;
   return JSON.parse(raw) as ResolvedPoints;
+}
+
+/**
+ * 取"能命中头带/身体"的探针点。
+ *
+ * 掩膜是离屏渲染 + 逐帧回读的：模型刚加载完的那一帧 `bbox` 可能还是 `null`
+ * （cold，R-9 的矩形退路），此时 `head` 也必然是 `null`。这会让"找到头部带命中点"
+ * 变成偶发失败（2026-11-03 复现一次）。这里只做**等掩膜就绪**的有界重试，
+ * 不改变任何断言口径：等不到就照实返回 null，断言仍会失败。
+ */
+async function resolveMaskPoints(window: BrowserWindow): Promise<ResolvedPoints> {
+  let points = await resolvePoints(window);
+  for (let attempt = 0; attempt < 8 && points.head === null && points.bbox === null; attempt += 1) {
+    await sleep(120);
+    points = await resolvePoints(window);
+  }
+  return points;
 }
 
 /**
@@ -2693,8 +2721,66 @@ export async function runSelfTestIfRequested(): Promise<void> {
   // ------------------------------------------------------------------
   // 2) 视线跟随 / Idle 动画 / 视线微动
   // ------------------------------------------------------------------
-  const points = await resolvePoints(window);
-  check('掩膜：找到头部带命中点', points.head !== null, {
+  /**
+   * ADR 0040 验收：头部区口径。
+   *
+   * 首选 = 以头骨为圆心、`0.125 × 内容区高度` 为半径（本资产 422×720 → 90px）；
+   * 降级 = 掩膜 bbox 顶部 22%（光环会把这条带顶到发顶之上，所以只作兜底）。
+   * 下面的竖扫同时打出"掩膜口径"与"头骨口径"，两者的差异就是本轮修的东西。
+   */
+  const headBand = (await window.webContents.executeJavaScript(
+    `(() => {
+      const band = window.petModel.headBandDiagnostics();
+      const x = Math.round(window.innerWidth / 2);
+      const probes = [];
+      for (let ratio = 0.10; ratio <= 0.50001; ratio += 0.04) {
+        const y = Math.round(window.innerHeight * ratio);
+        const s = window.petMask.probe(x, y);
+        const h = window.petRender.headSampleAt(s.x, s.y, s.head, s.hit);
+        probes.push({ ratio: Number(ratio.toFixed(2)), y, hit: s.hit, headMask: s.head, headNow: h.head, src: h.source });
+      }
+      return JSON.stringify({ band, probes, viewport: [window.innerWidth, window.innerHeight] });
+    })()`,
+    true,
+  )) as string;
+  const headBandInfo = JSON.parse(headBand) as {
+    band: {
+      source: string;
+      headBoneCss: { x: number; y: number } | null;
+      headRadiusPx: number | null;
+      bandBottomCssY: number | null;
+      contentHeight: number;
+    };
+    probes: Array<{ ratio: number; y: number; hit: boolean; headMask: boolean | null; headNow: boolean | null; src: string }>;
+  };
+  logInfo('selftest', '头部区几何', headBandInfo);
+
+  check(
+    '头部区：首选口径是头骨半径（src=bone，R=0.125×高度，ADR 0040）',
+    headBandInfo.band.source === 'bone' &&
+      headBandInfo.band.headBoneCss !== null &&
+      Math.abs((headBandInfo.band.headRadiusPx ?? 0) - 0.125 * headBandInfo.band.contentHeight) < 0.5,
+    headBandInfo.band,
+  );
+  // 光环区（y≈120–205）里有掩膜像素（hit=true）但不在头骨半径内 → 不得算头部
+  const haloProbe = headBandInfo.probes.find((item) => item.y >= 130 && item.y <= 200 && item.hit);
+  check(
+    '头部区：光环上的点 hit=true 但 head=false（ADR 0040 验收 2）',
+    haloProbe !== undefined && haloProbe.headMask === true && haloProbe.headNow === false,
+    haloProbe ?? headBandInfo.probes,
+  );
+  // 脸/头骨附近必须是 head=true（旧口径这里是 false，就是"点她没反应"的根因）
+  const faceProbe = headBandInfo.band.headBoneCss
+    ? headBandInfo.probes.find((item) => Math.abs(item.y - headBandInfo.band.headBoneCss!.y) <= 24)
+    : undefined;
+  check(
+    '头部区：头骨附近 head=true（旧口径为 false，ADR 0040 验收 1 的判据层）',
+    faceProbe !== undefined && faceProbe.headNow === true,
+    faceProbe ?? headBandInfo.band,
+  );
+
+  const points = await resolveMaskPoints(window);
+  check('掩膜：找到头部区命中点', points.head !== null, {
     bbox: points.bbox,
     preferred: points.preferred,
   });
@@ -2842,9 +2928,9 @@ export async function runSelfTestIfRequested(): Promise<void> {
   );
   check('摸头：冷却拦下留有日志（D-4）', (await countInLog('head_patted 被冷却拦下')) >= 1);
 
-  // ADR 0023 D4：摸头现在播官方整身片段（~3.1s，角色会缩起身子），
+  // ADR 0039 D1：摸头现在播官方整身片段（2.1s，缩身→保持→抬头回正），
   // 片段播放期间头部已经离开固定探针点，所以等它播完、姿态回到 Idle 再点第二次。
-  await sleep(3300);
+  await sleep(2400);
   await dispatchPointer('down', head.x, head.y);
   await sleep(50);
   await dispatchPointer('up', head.x, head.y);
@@ -2854,7 +2940,7 @@ export async function runSelfTestIfRequested(): Promise<void> {
     (await countInLog('head_patted 发出')) === patAfterFirst + 1,
   );
 
-  // 摸头反应（ADR 0014 D6）：HFSM overlay=reacting、pat 权重、嘴型帧、截图
+  // 摸头反应（ADR 0039）：HFSM overlay=reacting、官方片段接管身体、表情投影 shy、截图
   const patDiag = await readDiagnostics(window);
   check(
     '摸头：HFSM overlay=reacting（head_patted → reacting，§4.1）',
@@ -2862,12 +2948,16 @@ export async function runSelfTestIfRequested(): Promise<void> {
     patDiag?.hfsm ?? null,
   );
   check(
-    '摸头：非说话时满权重（0.4 上限只用于 speaking）且切到 shy 嘴型帧',
+    '摸头：官方片段接管身体（pat.body=true，clip 来自 Victory_Start_Random，ADR 0039 D1）',
     patDiag?.pat.active === true &&
-      patDiag?.pat.weight === 1 &&
-      patDiag?.pat.allowMouthChange === true &&
-      patDiag?.pat.mouthFrame === 4,
+      patDiag?.pat.body === true &&
+      (patDiag?.pat.clip ?? '').includes('Victory_Start_Random'),
     patDiag?.pat ?? null,
+  );
+  check(
+    '摸头：表情投影 emotion=shy（§4.5；不再有程序化骨骼/缩放，ADR 0039 D2/D3）',
+    patDiag?.facial?.effective === 'shy',
+    patDiag?.facial ?? null,
   );
   check(
     '摸头：状态投影 emotion=shy（§4.5，反应结束回到原 emotion）',
@@ -2875,7 +2965,77 @@ export async function runSelfTestIfRequested(): Promise<void> {
   );
   await captureScreenshot(window, 'window-pat.png', 'pat-react');
 
-  // §5.3 必测组合：说话时被摸头 —— pat 以 ≤0.4 权重叠加、不改嘴型、overlay 仍投影 speaking
+  /**
+   * ADR 0040 验收 1：静止点击**脸部**必须触发官方摸头片段。
+   *
+   * 旧口径（掩膜 bbox 顶部 22%）下这一点是 `head=false`——就是"点她没反应"的根因。
+   * 这里刻意先等过 800ms 冷却，避免被 D-4 拦下而误判成"通过"。
+   */
+  const faceInfo = JSON.parse(
+    (await window.webContents.executeJavaScript(
+      `JSON.stringify(window.petModel.headBandDiagnostics())`,
+      true,
+    )) as string,
+  ) as {
+    headBoneCss: { x: number; y: number } | null;
+    headRadiusPx: number | null;
+    bandBottomCssY: number | null;
+    source: string;
+  };
+  await sleep(950);
+  const facePatBefore = await countInLog('head_patted 发出');
+  let faceClick: { x: number; y: number } | null = null;
+  if (faceInfo.headBoneCss) {
+    // 点在骨骼下方 8% 窗口高处：落在"眼睛/鼻子"上，不是在颈根
+    const faceX = Math.round(faceInfo.headBoneCss.x);
+    const faceY = Math.round(faceInfo.headBoneCss.y + contentSize.height * 0.08);
+    faceClick = { x: faceX, y: faceY };
+    current = window.getContentBounds();
+    pushScriptedCursor(current.x + faceX, current.y + faceY);
+    await sleep(320);
+    await dispatchPointer('down', faceX, faceY);
+    await sleep(60);
+    await dispatchPointer('up', faceX, faceY);
+    await sleep(220);
+  }
+  const facePatAfter = await countInLog('head_patted 发出');
+  check(
+    '验收 1：静止点击脸部 → 触发 head_patted（ADR 0040）',
+    faceClick !== null && facePatAfter === facePatBefore + 1,
+    { click: faceClick, bandBottomY: faceInfo.bandBottomCssY, source: faceInfo.source, before: facePatBefore, after: facePatAfter },
+  );
+  const faceReaction = await readDiagnostics(window);
+  check(
+    '验收 1：脸部摸头播的是官方片段（pat.body=true，clip 含 Victory_Start_Random）',
+    faceReaction?.pat.active === true &&
+      faceReaction?.pat.body === true &&
+      (faceReaction?.pat.clip ?? '').includes('Victory_Start_Random'),
+    faceReaction?.pat ?? null,
+  );
+
+  /**
+   * ADR 0040 验收 2：点**光环或发顶上方**（y≈120–205）不得触发摸头。
+   * 那里在掩膜里是不透明的（hit=true），但离头骨超过半径 → head=false。
+   */
+  await sleep(950);
+  const haloPatBefore = await countInLog('head_patted 发出');
+  const haloX = Math.round(contentSize.width / 2);
+  const haloY = Math.round(contentSize.height * 0.22);
+  current = window.getContentBounds();
+  pushScriptedCursor(current.x + haloX, current.y + haloY);
+  await sleep(320);
+  await dispatchPointer('down', haloX, haloY);
+  await sleep(60);
+  await dispatchPointer('up', haloX, haloY);
+  await sleep(220);
+  const haloPatAfter = await countInLog('head_patted 发出');
+  check(
+    '验收 2：静止点击光环/发顶上方（y≈0.22H）→ 不触发 head_patted（ADR 0040）',
+    haloPatAfter === haloPatBefore,
+    { click: { x: haloX, y: haloY }, headBoneY: faceInfo.headBoneCss?.y, radius: faceInfo.headRadiusPx, before: haloPatBefore, after: haloPatAfter },
+  );
+
+  // §5.3 必测组合：说话时被摸头 —— 身体通道不动、只做表情、overlay 仍投影 speaking
   const speakingPat = JSON.parse(
     (await window.webContents.executeJavaScript(
       `(() => {
@@ -2889,7 +3049,12 @@ export async function runSelfTestIfRequested(): Promise<void> {
     )) as string,
   ) as {
     hfsm: { overlay: string | null };
-    pat: { active: boolean; weight: number; allowMouthChange: boolean; mouthFrame: number | null };
+    pat: {
+      active: boolean;
+      body: boolean;
+      clip: string | null;
+      blockedBy: string | null;
+    };
     state: { overlay: string | null; emotion: string };
   };
   check(
@@ -2898,11 +3063,10 @@ export async function runSelfTestIfRequested(): Promise<void> {
     speakingPat.hfsm,
   );
   check(
-    '说话时被摸头：pat 权重封顶 0.4 且不改嘴型（§5.3 口型通道最高优先级）',
+    '说话时被摸头：身体通道不动、只做表情（§5.3 / ADR 0039 D4）',
     speakingPat.pat.active === true &&
-      speakingPat.pat.weight === 0.4 &&
-      speakingPat.pat.allowMouthChange === false &&
-      speakingPat.pat.mouthFrame === 0,
+      speakingPat.pat.body === false &&
+      speakingPat.pat.blockedBy === 'speaking',
     speakingPat.pat,
   );
   check(
@@ -3008,14 +3172,25 @@ export async function runSelfTestIfRequested(): Promise<void> {
   );
   await captureScreenshot(window, 'window-drag.png', 'dragged');
 
-  // D-6 末速度只看抬手前 ~100ms 的光标采样；截图会停住光标，松手前补两次位移
-  pushScriptedCursor(current.x + body.x + 135, current.y + body.y - 28);
-  await sleep(30);
-  pushScriptedCursor(current.x + body.x + 150, current.y + body.y - 34);
-  await sleep(30);
+  // D-6 末速度只看抬手前 ~100ms 的光标采样；截图会停住光标，松手前补几次位移。
+  // ADR 0040 D3：落地冲击现在只看**松手瞬间的竖直速度**（门槛 700px/s），所以这里先抬高、
+  // 再向下**连续两次大位移**后松手：保证最后 100ms 的采样里有一段 ≥90px 的下移，
+  // 不会因为 tick 采样相位不同而落到门槛以下（实测过一次 647px/s，刚好差 53）。
+  pushScriptedCursor(current.x + body.x + 140, current.y + body.y - 235);
+  await sleep(40);
+  pushScriptedCursor(current.x + body.x + 145, current.y + body.y - 120);
+  await sleep(25);
+  pushScriptedCursor(current.x + body.x + 150, current.y + body.y - 30);
+  await sleep(25);
   const boundsBeforeRelease = shell.getBounds();
 
-  await dispatchPointer('up', body.x, body.y);
+  // 抬手的坐标必须是**当前窗口**里的坐标：窗口已经被拖到别处，
+  // 还用按下时的局部坐标会让窗口在松手瞬间跳一段（实测 23px），
+  // 那一下"瞬移"会被当成末速度，落地分级就不是真实物理了。
+  const releaseLocalX = current.x + body.x + 150 - boundsBeforeRelease.x;
+  const releaseLocalY = current.y + body.y - 30 - boundsBeforeRelease.y;
+
+  await dispatchPointer('up', releaseLocalX, releaseLocalY);
   await sleep(160);
   const releaseLog = lastJsonAfter(await runLogText(), '拖拽松手（D-6）');
   const speed = releaseLog ? Math.hypot(Number(releaseLog['vx']), Number(releaseLog['vy'])) : 0;
@@ -3035,6 +3210,33 @@ export async function runSelfTestIfRequested(): Promise<void> {
     '松手：Physics=settling（回弹开始，D-6 / ADR 0024 D3）',
     settlingDiag?.hfsm.physics === 'settling' && settlingDiag?.motion.physics === 'settling',
     { hfsm: settlingDiag?.hfsm ?? null, motion: settlingDiag?.motion ?? null },
+  );
+  check(
+    '松手：没有 reacting（拖拽 → settling → idle，永不经过 reacting，ADR 0039 D5）',
+    settlingDiag?.hfsm.reaction === null && settlingDiag?.hfsm.overlay === null,
+    { hfsm: settlingDiag?.hfsm ?? null },
+  );
+
+  // ADR 0039 D5：回弹期间**渲染侧**也拒绝 head_patted。
+  // 这里直接给渲染侧发一条事件（模拟主进程的迟到事件），不移动窗口、不依赖合成手势，
+  // 因此是确定性的：只要 physics=settling，reaction 必须保持 null、动作不得被切。
+  const rejectBaseline = await countInLog('忽略 head_patted');
+  await window.webContents.executeJavaScript(
+    `window.petRender.handleEvent({ name: 'head_patted', payload: { patCount: 99 } })`,
+    true,
+  );
+  await sleep(80);
+  const settleReject = await readDiagnostics(window);
+  check(
+    '回弹期间：head_patted 被 render 拒绝（无 reaction、无 pat，ADR 0039 D5 严格互斥）',
+    settleReject?.hfsm.physics === 'settling' &&
+      settleReject?.hfsm.reaction === null &&
+      settleReject?.pat?.active === false,
+    { hfsm: settleReject?.hfsm ?? null, pat: settleReject?.pat ?? null },
+  );
+  check(
+    '回弹期间：拒绝留有日志（严格互斥可诊断）',
+    (await countInLog('忽略 head_patted')) > rejectBaseline,
   );
 
   // 回弹期间不接受新的动作意图（用户要求；唯一例外是重新拖拽）
@@ -3075,9 +3277,32 @@ export async function runSelfTestIfRequested(): Promise<void> {
     { y: groundBounds.y, expectedGroundY },
   );
   check(
-    '落地：按向下峰值速度分级触发下蹲（impact > 0，ADR 0035 D4）',
-    typeof settledDiag?.drag?.landingImpact === 'number' && settledDiag.drag.landingImpact > 0,
+    '落地：向下快速松手 → 轻微下蹲（impact>0；squash ≤3%，ADR 0040 D3）',
+    typeof settledDiag?.drag?.landingImpact === 'number' &&
+      settledDiag.drag.landingImpact > 0 &&
+      (settledDiag.drag?.landingSquash ?? 1) <= 0.0301,
     settledDiag?.drag ?? null,
+  );
+
+  // ADR 0040 验收 3 的视觉证据：落地中（最多 3% 压扁）→ 400ms 后静止，两帧对比应只差一点点。
+  await captureScreenshot(window, 'window-landing.png', 'settle(landing)');
+  await sleep(400);
+  await captureScreenshot(window, 'window-landed.png', 'settle(rest)');
+
+  // ADR 0040 D3 的反向验收：**轻放不缩**。debugDropFromHeight 走真实 drag_released 链，
+  // 但 vy=0（松手时没有向下速度）→ impact 必须是 0、不能再有"弹一下"。
+  const lightDrop = shell.debugDropFromHeight(40);
+  const lightSettled = await waitFor(
+    window,
+    4000,
+    (diagnostics) => diagnostics?.hfsm.physics === null && diagnostics?.motion.base === 'idle',
+  );
+  check(
+    '落地：轻放（releaseVy=0）→ 完全不缩（impact=0、squash=0，ADR 0040 D3）',
+    lightDrop === true &&
+      lightSettled?.drag?.landingImpact === 0 &&
+      lightSettled?.drag?.landingSquash === 0,
+    { dropped: lightDrop, drag: lightSettled?.drag ?? null },
   );
 
   await sleep(300);

@@ -23,13 +23,16 @@ import {
   DRAG_SUPPORT_ACCEL_EMA_MS,
   DRAG_SUPPORT_ACCEL_MAX,
   DRAG_SUPPORT_VELOCITY_EMA_MS,
+  HEAD_PAT_RADIUS_RATIO,
   LANDING_DURATION_MS,
+  LANDING_MAX_SQUASH,
+  MASK_HEIGHT,
   MOUTH_FRAME_CLOSED,
   REBOUND_SETTLE_MS,
 } from '../../shared/constants';
 import type { BroadcastEvent } from '../../shared/events';
 import { isIntent } from '../../shared/intents';
-import { cssToMask, grabBandAt } from '../../shared/mask';
+import { cssToMask, grabBandAt, headBandBottomRow } from '../../shared/mask';
 import type { Bounds3 } from '../../shared/model-frame';
 import { DEFAULT_FRAME_EXCLUDE } from '../../shared/model-frame';
 import type { Emotion, Intent, RenderState } from '../../shared/types';
@@ -57,8 +60,7 @@ import {
   createBlushChannel,
   createFacialChannel,
   loadMouthAtlas,
-} from './facial-texture';
-import type {
+} from './facial-texture';import type {
   BlushChannel,
   FacialChannel,
   FacialChannelDiagnostics,
@@ -66,7 +68,7 @@ import type {
 } from './facial-texture';
 import { createGazeController } from './gaze';
 import type { GazeController, GazeState } from './gaze';
-import { createHfsm } from './hfsm';
+import { createHfsm, isPatReaction } from './hfsm';
 import type { Hfsm, HfsmSnapshot, WalkPlan } from './hfsm';
 import { impactFromDownVelocity, landingPose } from './landing';
 import { createMaskCapture } from './mask-capture';
@@ -80,8 +82,6 @@ import {
 import type { MeshMaterialFacts } from './material-diagnostics';
 import { loadModel, measureAnimatedMinY, measureAnimatedBounds, placeModel } from './model-loader';
 import type { LoadedModel, ModelBones } from './model-loader';
-import { PAT_DURATION_MS, PAT_MOUTH_FRAME, patPose } from './pat-react';
-import type { PatPose } from './pat-react';
 import { createCapsulePlaceholder, PLACEHOLDER_BOTTOM_MARGIN_PX } from './placeholder';
 import type { PlaceholderModel } from './placeholder';
 import { sitPose } from './sit-pose';
@@ -127,30 +127,42 @@ const INTENT_CLIP: Partial<Record<Intent, ClipRole>> = {
 interface ReactionSpec {
   durationMs: number;
   hopPx?: number;
-  squash?: number;
+  /** 整身绕 z 的倾角（rad）；`oscillate` 时是摆动幅度 */
   tilt?: number;
   /** 摆动型（摇头）而非保持型（歪头） */
   oscillate?: boolean;
   look?: number;
+  /** 低头角度（rad，走骨骼仲裁；`nod` 用它替代整身 `scale.y`） */
+  headPitch?: number;
 }
 
 /**
- * 非 pat_react 的程序化反应：只用位移/缩放/旋转表达，不引入新状态名或 intent。
- * pat_react 走 pat-react.ts 的三通道合成（头部后仰 + 嘴型）。
+ * 非摸头的程序化反应：只用位移/旋转/骨骼偏移表达，不引入新状态名或 intent。
+ *
+ * 摸头**不在**这里（ADR 0039 D2）：它只播官方片段 + `shy` 表情投影，
+ * 任何"为摸头服务的骨骼偏移 / `scale` / squash"都已删除。
+ * `nod` 也从"整身竖向压扁"改成"头骨低头"——压扁是 `animationRoot.scale.y`，
+ * 会连脚底一起缩，读起来就是"被按了一下"（同一个"生硬压缩"的毛病）。
  */
 const REACTIONS: Record<Exclude<Intent, 'none' | 'pat_react'>, ReactionSpec> = {
   greet: { durationMs: 700, hopPx: 18, look: 0.18 },
-  nod: { durationMs: 380, squash: 0.06 },
+  nod: { durationMs: 380, headPitch: 0.26 },
   shake_head: { durationMs: 460, tilt: 0.13, oscillate: true },
   tilt_head: { durationMs: 1400, tilt: 0.2 },
   look_at_user: { durationMs: 600, look: 0.22 },
   happy_hop: { durationMs: 720, hopPx: 34 },
 };
 
+/**
+ * 摸头反应在**没有可用官方片段**时的表情窗口（毫秒）。
+ * 它只决定 `reacting` 什么时候退出，不产生任何骨骼动作（ADR 0039 D4）。
+ */
+const PAT_FACIAL_FALLBACK_MS = 1100;
+
 /** 加载成功但缺少这些骨骼时，按 §7.3 视为"骨骼缺失"整体回退（ADR 0009 D6）。 */
 const REQUIRED_BONES = ['head', 'eyeL', 'eyeR'] as const;
 
-/** 嘴型图集帧数（8×8；PAT_MOUTH_FRAME 的 frameCount 参数）。 */
+/** 嘴型图集帧数（8×8；官方眼/嘴差分的 frameCount 参数）。 */
 const MOUTH_FRAME_COUNT = CH0335_MOUTH_LAYOUT.columns * CH0335_MOUTH_LAYOUT.rows;
 
 /**
@@ -180,10 +192,51 @@ export interface AnimationDiagnostics {
 }
 
 export interface PatDiagnostics {
+  /** 是否有摸头反应在播（HFSM 的 reaction 未到期） */
   active: boolean;
-  weight: number;
-  allowMouthChange: boolean;
-  mouthFrame: number | null;
+  /** 本帧身体通道是否由官方片段接管（§5.3 的表：只有站着的 idle 才接管） */
+  body: boolean;
+  /** 官方片段名（裁剪后带时间窗后缀）；没播为 null */
+  clip: string | null;
+  /** 身体没接管的原因；null = 接管了，或压根没有摸头反应（ADR 0039 D4） */
+  blockedBy: 'dragged' | 'settling' | 'sitting' | 'walking' | 'speaking' | 'missing' | null;
+}
+
+/**
+ * 头部区几何事实（内部诊断，**ADR 0039 排查用**）。
+ *
+ * 为什么需要它：`head_patted` 的入口是主进程的 `cmd:interactive.head`，而 `head` 由
+ * **掩膜 alpha 包围盒顶部 22%** 推出（R-10）。本资产的光环（`HaloRoot` 的粉色方块）
+ * 在掩膜里同样有不透明像素，会把包围盒顶部顶到光环上沿——头部带的实际下边界可能
+ * 落在"头发上方"，于是点在脸上也判 `head=false`。这组事实就是用来量这条边界的。
+ */
+export interface HeadBandDiagnostics {
+  maskState: string;
+  bbox: { minX: number; minY: number; maxX: number; maxY: number } | null;
+  /** 降级口径的头部带下边界（掩膜行坐标） */
+  bandBottomRow: number | null;
+  /** 降级口径的头部带下边界（内容区 CSS y） */
+  bandBottomCssY: number | null;
+  /** 首选口径：头骨半径判定的圆心（内容区 CSS） */
+  headBoneCss: { x: number; y: number } | null;
+  /** 首选口径：半径（px）= HEAD_PAT_RADIUS_RATIO × 内容区高度 */
+  headRadiusPx: number | null;
+  /** 当前生效口径 */
+  source: 'bone' | 'mask-bbox' | 'none';
+  contentHeight: number;
+  /** 当前停帧姿态的片段（sitting 会改变轮廓） */
+  holdClip: string | null;
+}
+
+/**
+ * 一次头部判定的结果（ADR 0040）。
+ *
+ * `source` 是诊断用的：`bone` = 头骨半径（首选），`mask-bbox` = R-10 的 22% 降级，
+ * `none` = 两者都不可用（`head = null`，主进程保守丢弃，不判摸头）。
+ */
+export interface HeadSample {
+  head: boolean | null;
+  source: 'bone' | 'mask-bbox' | 'none';
 }
 
 /** 面部贴图通道诊断（ADR 0026 D4；不进 RenderState） */
@@ -330,6 +383,19 @@ export interface RenderModule {
   handleEvent(event: BroadcastEvent): void;
   /** 内部：自检/诊断用（不属于 §7.3） */
   getDiagnostics(): RenderDiagnostics;
+  /**
+   * 内部（ADR 0039 排查）：头部区几何事实——掩膜包围盒、头部带下边界、头骨位置。
+   * 只读，不触发渲染；用来判断"点这里为什么不算摸头"。
+   */
+  headBandDiagnostics(): HeadBandDiagnostics;
+  /**
+   * 内部（契约 §3.3 R-10 / §3.5，ADR 0040）：判定某点是否落在头部区。
+   *
+   * 首选"以头骨为圆心、`HEAD_PAT_RADIUS_RATIO × 内容区高度`为半径"；
+   * 头骨缺失或掩膜不可用时退回"掩膜 bbox 顶部 22%"（`maskHead` 由调用方传入，
+   * 即 `cmd:probe` 的原始结果）。两者都不可用 → `head = null`。
+   */
+  headSampleAt(x: number, y: number, maskHead: boolean | null, hit: boolean): HeadSample;
   /** 内部：自检把 20–40s 的行走调度压到 1.5–2s */
   setWalkInterval(minIntervalMs: number, maxIntervalMs: number): void;
   /**
@@ -491,7 +557,11 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
   private supportVelocity = { x: 0, y: 0 };
   private supportAcceleration = { x: 0, y: 0 };
   /** settling 期间窗口向下的峰值速度（px/s），用于落地分级 */
-  private settlePeakDownVelocity = 0;
+  /**
+   * 松手瞬间的竖直速度（px/s，+y 向下）。落地冲击的唯一输入（ADR 0040 D3）。
+   * 原实现用 settling 期间窗口向下峰值速度，自由落体时必然饱和，已废弃。
+   */
+  private releaseDownVelocity = 0;
   /** 落地缓冲：motion_ended{settle} 之后的一段短姿态 */
   private landing: { startedAt: number; impact: number } | null = null;
   /** 本帧实际减掉的 scale.y（诊断用） */
@@ -511,10 +581,12 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
   private haloToonRestore: Map<THREE.Mesh, THREE.Material | THREE.Material[]> | null = null;
   /** 诊断用：Body 材质替换的恢复句柄 */
   private diagnosticMaterialRestore: (() => void) | null = null;
-  private patMouthActive = false;
-  /** 摸头是否由官方整身片段承担（true 时不再叠加程序化头部偏移，ADR 0023 D4） */
-  private officialPat = false;
-  /** 下一次待机姿态轮换的时刻（performance.now 基准） */
+  /** 上一次看到的摸头反应状态（只在它变化时重画表情；applyFacial 是事件驱动的） */
+  private lastPatActive = false;
+  /** ADR 0039 排查：摸头片段启动后 150ms 的一次权重回报（时间戳；null = 不查） */
+  private patWeightCheckAt: number | null = null;
+  /** 落地缓冲的峰值压扁（诊断"拖完弹一下"到底是不是它） */
+  private landingPeakSquash = 0;
   private idleVariantAt = 0;
   private idleVariantRole: ClipRole = 'idle';
   /** 语音口型（ADR 0015 D4）：帧号由播放器按包络推进 */
@@ -787,33 +859,119 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     this.playAnimation('idle', WALK_OUT_FADE_SECONDS, `stopWalk(${reason})`);
   }
 
-  /** 摸头姿态（ADR 0014 D6）：头部后仰/侧倾 + 身体前倾，按 `sin(πp)` 包络。 */
-  private patState(now: number): { pose: PatPose; progress: number } | null {
+  /**
+   * 摸头反应的当前状态（ADR 0039）。
+   *
+   * **没有任何姿态计算**：这里只回答三件事——反应在不在播、身体通道有没有被官方片段接管、
+   * 没接管时被哪条规则挡下。所有骨骼/根变换都来自 `clip-bank` 的 `pat` 片段本身。
+   */
+  private patState(now: number): PatDiagnostics {
     const snapshot = this.hfsm.snapshot();
     const reaction = snapshot.reaction;
-    if (!reaction) return null;
-    const isPat = reaction.kind === 'head_patted' || reaction.intent === 'pat_react';
-    if (!isPat) return null;
-    const progress = (now - reaction.startedAt) / reaction.durationMs;
-    if (progress >= 1) return null;
-    const speaking = snapshot.speakingUtteranceId !== null;
-    return { pose: patPose(progress, speaking), progress };
+    const active =
+      isPatReaction(reaction) &&
+      reaction !== null &&
+      now - reaction.startedAt < reaction.durationMs;
+    const one = this.animations?.oneShot() ?? null;
+    const clip = one && one.role === 'pat' ? one.name : null;
+    if (!active) return { active: false, body: false, clip, blockedBy: null };
+
+    let blockedBy: PatDiagnostics['blockedBy'] = null;
+    if (snapshot.physics === 'dragged' || snapshot.physics === 'settling') blockedBy = snapshot.physics;
+    else if (snapshot.physics === 'sitting') blockedBy = 'sitting';
+    else if (snapshot.speakingUtteranceId !== null) blockedBy = 'speaking';
+    else if (snapshot.base !== 'idle') blockedBy = 'walking';
+    else if (!clip) blockedBy = 'missing';
+    return { active: true, body: blockedBy === null, clip, blockedBy };
   }
 
-  /** 摸头的表情通道：非说话时切 shy 嘴型；说话时让位给口型（§5.2 / §5.3）。 */
-  private syncPatMouth(pat: { pose: PatPose } | null): void {
-    const shouldPaint = pat !== null && pat.pose.allowMouthChange;
-    if (shouldPaint && !this.patMouthActive) {
-      this.patMouthActive = true;
-      return;
+  /**
+   * 摸头能不能接管身体通道（§5.3 的表 / ADR 0039 D4）：
+   * 只有"站着待机、没有 Physics 接管、不在说话"时才播整身片段。
+   */
+  private patBodyAllowed(snapshot: HfsmSnapshot): boolean {
+    return (
+      snapshot.physics === null &&
+      snapshot.base === 'idle' &&
+      snapshot.speakingUtteranceId === null
+    );
+  }
+
+  /** 摸头不接管身体时的可读原因（日志/诊断用）。 */
+  private patBlockReason(snapshot: HfsmSnapshot, played: boolean): PatDiagnostics['blockedBy'] {
+    if (played) return null;
+    if (snapshot.physics === 'dragged' || snapshot.physics === 'settling') return snapshot.physics;
+    if (snapshot.physics === 'sitting') return 'sitting';
+    if (snapshot.speakingUtteranceId !== null) return 'speaking';
+    if (snapshot.base !== 'idle') return 'walking';
+    return 'missing';
+  }
+
+  /**
+   * 头部区几何事实（ADR 0039 排查）。
+   *
+   * 只回答"R-10 的头部带到底落在哪儿"：掩膜包围盒从哪一行开始、22% 的下边界换算成
+   * 内容区 CSS y 是多少、真正的头骨在哪个 y。点击点的 y 小于 `bandBottomCssY` 才算头部。
+   */
+  headBandDiagnostics(): HeadBandDiagnostics {
+    const snapshot = this.maskCapture.snapshot();
+    const bbox = snapshot.bbox;
+    const bandBottomRow = bbox ? headBandBottomRow(bbox) : null;
+    const hold = this.animations?.hold() ?? null;
+    const headBoneCss = this.headCssNow();
+    return {
+      maskState: snapshot.state,
+      bbox: bbox ? { ...bbox } : null,
+      bandBottomRow: bandBottomRow === null ? null : Number(bandBottomRow.toFixed(2)),
+      bandBottomCssY:
+        bandBottomRow === null ? null : Number(((bandBottomRow / MASK_HEIGHT) * this.height).toFixed(1)),
+      headBoneCss,
+      headRadiusPx: this.headRadiusPx(),
+      source: headBoneCss ? 'bone' : snapshot.state === 'ready' && bbox ? 'mask-bbox' : 'none',
+      contentHeight: this.height,
+      holdClip: hold?.name ?? null,
+    };
+  }
+
+  /** 首选口径的半径（CSS px）。 */
+  private headRadiusPx(): number {
+    return Number((HEAD_PAT_RADIUS_RATIO * Math.max(1, this.height)).toFixed(1));
+  }
+
+  /**
+   * 头骨在内容区 CSS 坐标里的位置（不额外 `scene.updateMatrixWorld`）。
+   *
+   * 为什么能不更新：`updateHalo()` 每帧已经 `root.updateMatrixWorld(true)`；
+   * `getWorldPosition` 自身也会沿父链 `updateWorldMatrix`，因此这里读到的是最新姿态。
+   */
+  private headCssNow(): { x: number; y: number } | null {
+    const head = this.model?.bones.head ?? null;
+    if (!head) return null;
+    const world = new THREE.Vector3();
+    head.getWorldPosition(world);
+    return {
+      x: Number((this.width / 2 + world.x).toFixed(1)),
+      y: Number((this.height / 2 - world.y).toFixed(1)),
+    };
+  }
+
+  /**
+   * 头部区判定（ADR 0040）：头骨半径优先，掩膜 bbox 22% 兜底。
+   *
+   * 为什么不再用 bbox：本资产的光环在掩膜里不透明，会把包围盒顶部顶到光环上沿，
+   * 22% 的下边界落在发顶之上（实测 y≈228–275），脸（y≈340–420）整块在外。
+   * 判据只在 `hit` 为真时有意义（R-10：`head` 只在命中时才有意义）。
+   */
+  headSampleAt(x: number, y: number, maskHead: boolean | null, hit: boolean): HeadSample {
+    const headCss = this.headCssNow();
+    if (headCss) {
+      if (!hit) return { head: false, source: 'bone' };
+      const radius = HEAD_PAT_RADIUS_RATIO * Math.max(1, this.height);
+      const distance = Math.hypot(x - headCss.x, y - headCss.y);
+      return { head: distance <= radius, source: 'bone' };
     }
-    if (!shouldPaint) this.restorePatMouth();
-  }
-
-  /** 交还嘴型通道（回到静态闭嘴底图）。幂等。 */
-  private restorePatMouth(): void {
-    if (!this.patMouthActive) return;
-    this.patMouthActive = false;
+    if (maskHead === null) return { head: null, source: 'none' };
+    return { head: hit && maskHead, source: 'mask-bbox' };
   }
 
   /**
@@ -881,8 +1039,8 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
 
     const snapshot = this.hfsm.snapshot();
     const speaking = snapshot.speakingUtteranceId !== null;
-    const pat = this.patState(now);
-    const patActive = pat !== null;
+    // ADR 0039 D3：摸头只把 emotion 投影成 shy（官方差分），不再单独切嘴型帧
+    const patActive = this.patState(now).active;
     // ADR 0034 D5：惊跳时临时投影 surprised（优先于摸头的 shy）
     const effective: Emotion = this.startleSurprised
       ? 'surprised'
@@ -903,7 +1061,6 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     const owner: MouthOwner = resolveMouthOwner({
       speaking,
       lipSyncDriven: this.lipSyncDriven,
-      patActive,
       emotionMouth: face.mouth,
       alpha,
     });
@@ -911,8 +1068,6 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     let layer: MouthLayer;
     if (owner === 'lip-sync') {
       layer = { kind: 'atlas', frame: this.lipSyncFrame, frameCount: MOUTH_FRAME_COUNT };
-    } else if (owner === 'pat') {
-      layer = { kind: 'atlas', frame: PAT_MOUTH_FRAME, frameCount: MOUTH_FRAME_COUNT };
     } else if (owner === 'emotion') {
       // 表情嘴型改用**官方高清图集帧**，不再用 Canvas 画的 `glyph`
       // （ADR 0026 D6.6：嘴型/眼型/腮红的每个像素都必须来自图片）
@@ -961,18 +1116,17 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     );
   }
 
-  private facialDiagnostics(now: number, pat: { pose: PatPose } | null): FacialDiagnostics | null {
+  private facialDiagnostics(now: number, patActive: boolean): FacialDiagnostics | null {
     const facial = this.facial;
     if (!facial) return null;
     const snapshot = this.hfsm.snapshot();
     const speaking = snapshot.speakingUtteranceId !== null;
-    const effective: Emotion = this.startleSurprised ? 'surprised' : pat ? 'shy' : this.emotion;
+    const effective: Emotion = this.startleSurprised ? 'surprised' : patActive ? 'shy' : this.emotion;
     const face: EmotionFace = EMOTION_FACE[effective] ?? EMOTION_FACE.neutral;
     const alpha = fadeProgress(now - this.emotionFadeStartedAt, EMOTION_FADE_MS);
     const owner = resolveMouthOwner({
       speaking,
       lipSyncDriven: this.lipSyncDriven,
-      patActive: pat !== null,
       emotionMouth: face.mouth,
       alpha,
     });
@@ -1163,16 +1317,32 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     if (now - last < INTENT_DEDUPE_MS) return;
     this.lastIntentAt.set(intent, now);
 
-    // ADR 0024 D3：回弹期间不接受新的动作意图（唯一例外是重新拖拽）
-    if (this.hfsm.snapshot().physics === 'settling') {
-      console.log(`[render] settling 期间忽略 intent=${intent}（ADR 0024 D3）`);
+    // ADR 0024 D3 / ADR 0039 D5：回弹与拖拽期间不接受新的动作意图（唯一例外是重新拖拽）
+    const physics = this.hfsm.snapshot().physics;
+    if (physics === 'settling' || physics === 'dragged') {
+      console.log(`[render] ${physics} 期间忽略 intent=${intent}（ADR 0024 D3 / ADR 0039 D5）`);
       return;
     }
 
     if (intent === 'pat_react') {
-      // 与 head_patted 同一条反应路径（§4.4：低权重混合，不得打断口型）
-      this.hfsm.intent(now, intent, PAT_DURATION_MS);
-      console.log('[render] pat_react（intent 命令）→ reacting');
+      // §4.4 / ADR 0039：摸头只走官方片段 + shy 表情，没有任何程序化姿态。
+      // 这里刻意做成"幂等"：伴台词的 `pat_react` 常常紧跟 `head_patted` 到达，
+      // 若已在播就不重启（否则 2.1s 的官方片段会被截成 1.1s 的表情窗口）。
+      const snapshot = this.hfsm.snapshot();
+      if (this.patState(now).active) {
+        console.log('[render] pat_react（intent 命令）：摸头反应已在播，不重启');
+        return;
+      }
+      const played = this.patBodyAllowed(snapshot)
+        ? this.playOfficial('pat', 'idle', 'intent pat_react')
+        : false;
+      const clipMs = played ? this.oneShotDurationMs() : 0;
+      const why = this.patBlockReason(snapshot, played);
+      this.hfsm.intent(now, intent, clipMs > 0 ? clipMs : PAT_FACIAL_FALLBACK_MS);
+      this.applyFacial(now, true);
+      console.log(
+        `[render] pat_react（intent 命令）→ reacting（${played ? `官方片段 ${String(this.animations?.oneShot()?.name)}` : `仅表情：${String(why)}`}）`,
+      );
       return;
     }
 
@@ -1196,7 +1366,8 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       case 'speech_started': {
         const payload = event.payload as { utteranceId: string };
         this.hfsm.speechStarted(now, payload.utteranceId);
-        this.restorePatMouth();
+        // 口型通道最高优先：说话开始时表情/嘴型让位（§5.2）
+        this.applyFacial(now, true);
         this.lipSyncDriven = true;
         console.log(`[render] speaking 开始 utteranceId=${payload.utteranceId}`);
         break;
@@ -1210,26 +1381,48 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       }
       case 'head_patted': {
         const payload = event.payload as { patCount: number };
-        // ADR 0024 D3：回弹期间不接受新的摸头（重新拖拽除外）
-        if (this.hfsm.snapshot().physics === 'settling') {
-          console.log('[render] settling 期间忽略 head_patted（ADR 0024 D3）');
+        const snapshot = this.hfsm.snapshot();
+        // ADR 0039 排查打点（只读）：事件到了以后，HFSM 此刻到底是什么状态。
+        console.log(
+          `[render] 收到 head_patted，当前 HFSM 状态=${JSON.stringify({
+            base: snapshot.base,
+            overlay: snapshot.overlay,
+            physics: snapshot.physics,
+            speaking: snapshot.speakingUtteranceId !== null,
+          })} patCount=${payload.patCount}`,
+        );
+        // ADR 0039 D5：拖拽与回弹期间一律拒绝（shell 侧也在沉降窗口内拦截，这里是第二道闸）
+        if (snapshot.physics === 'dragged' || snapshot.physics === 'settling') {
+          console.log(
+            `[render] 忽略 head_patted（physics=${snapshot.physics}，ADR 0039 D5 严格互斥）`,
+          );
           break;
         }
-        const speaking = this.hfsm.snapshot().speakingUtteranceId !== null;
-        // §5.3 / ADR 0023 D4：说话期间整身片段会让位给口型通道，退回程序化摸头
-        const played = !speaking && this.playOfficial('pat', 'idle', 'head_patted');
-        this.officialPat = played;
+        // §5.3 的表 / ADR 0039 D4：只有站着的 idle 才让官方片段接管身体，
+        // 说话 / 走路 / 坐着时身体通道一动不动，只有表情投影 shy。
+        const played = this.patBodyAllowed(snapshot)
+          ? this.playOfficial('pat', 'idle', 'head_patted')
+          : false;
+        // 没有可用片段时用表情窗口兜住 reacting 的生命周期（不产生任何骨骼动作）
         const clipMs = played ? this.oneShotDurationMs() : 0;
         this.hfsm.headPatted(now, clipMs > 0 ? clipMs : undefined);
+        this.applyFacial(now, true);
+        const why = this.patBlockReason(snapshot, played);
         console.log(
-          `[render] head_patted → reacting patCount=${payload.patCount}` +
-            `（${played ? '官方片段' : '程序化'}）`,
+          `[render] head_patted → reacting patCount=${payload.patCount}`
+            + `（${played ? `官方片段 ${String(this.animations?.oneShot()?.name)}` : `仅表情：${String(why)}`}）`,
         );
+        // 150ms 后回报一次"片段真的在跑、权重真的是 1"（排查被 hold/crossFade 盖住）
+        if (played) this.patWeightCheckAt = now + 150;
         break;
       }
       case 'drag_started': {
         // §4.1：`walking` 的退出条件之一是被拖拽打断
         this.stopWalk('drag_started');
+        // ADR 0039 D5：拖拽开始的那一刻，在播的摸头片段与 reaction 必须立刻消失。
+        // 顺序是先取消一次性演出、再进 Physics——否则 `playAnimation('held')` 之后
+        // 再淡出 one-shot 会留下两个整身 action 抢同一批骨骼。
+        this.animations?.cancelOneShot(DRAG_IN_CROSSFADE_SECONDS);
         // ADR 0028 D9：拖走她就离开窗口边缘（shell 也会发 snap_released，这里同时兜底）
         this.sitting = false;
         this.sitArrived = false;
@@ -1240,6 +1433,8 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
         this.dragStartedAt = now;
         this.dragging = true;
         this.beginDrag(now);
+        // ADR 0039 D5：摸头的表情投影也一并收走（回到 intent_resolved 给的 emotion）
+        this.applyFacial(now, true);
         // 抓头用普通站姿做底（手臂自然下垂），抓身/抓脚用 Formation_Pickup（蜷缩被拎起）
         if (this.dragBand === 'head') {
           const limp = this.animations?.playRole('held.limp', DRAG_IN_CROSSFADE_SECONDS, 'held') ?? false;
@@ -1252,11 +1447,20 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       }
       case 'drag_released': {
         // D-6 / ADR 0024 D3：松手先进入 settling，回弹过程中淡回 Idle
+        const payload = event.payload as { vx?: unknown; vy?: unknown };
+        // ADR 0040 D3：落地冲击改用**松手瞬间的竖直速度**（+y 向下），不再用弹簧自由落体的峰值。
+        // 后者在 settling 里必然饱和（实测 1500–1716px/s），于是每次都按"重摔"压满。
+        this.releaseDownVelocity = Math.max(
+          0,
+          typeof payload.vy === 'number' && Number.isFinite(payload.vy) ? payload.vy : 0,
+        );
         this.hfsm.dragReleased(now);
         this.dragging = false;
-        // settling 期间重新累积向下峰值，落地时按冲击分级（ADR 0035 D4）
-        this.settlePeakDownVelocity = 0;
         this.playAnimation('idle', SETTLE_FADE_SECONDS, 'drag_released → settling（回弹中）');
+        console.log(
+          `[render] 松手：竖直速度 vy=${Math.round(this.releaseDownVelocity)}px/s ` +
+            `（落地冲击只看它，ADR 0040 D3）`,
+        );
         break;
       }
       case 'motion_ended': {
@@ -1271,15 +1475,18 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
         }
         if (payload.kind === 'settle') {
           this.hfsm.settleEnded(now);
-          // 落地缓冲：按 settling 期间记录的向下峰值速度分级（ADR 0035 D4）
-          const impact = impactFromDownVelocity(this.settlePeakDownVelocity);
+          // 落地缓冲：冲击只看**松手瞬间的竖直速度**（ADR 0040 D3；原口径见 ADR 0035 D4）
+          const impact = impactFromDownVelocity(this.releaseDownVelocity);
           this.landing = { startedAt: now, impact };
+          this.landingPeakSquash = 0;
           this.dragPendulum = { angle: this.dragPendulum.angle, angularVelocity: 0 };
           console.log(
             `[render] 回弹结束（${reason}）→ 落地缓冲 impact=${impact.toFixed(2)} ` +
-              `vDown=${Math.round(this.settlePeakDownVelocity)}px/s`,
+              `releaseVy=${Math.round(this.releaseDownVelocity)}px/s ` +
+              `squashMax=${(LANDING_MAX_SQUASH * impact).toFixed(4)} durationMs=${LANDING_DURATION_MS} ` +
+              `（ADR 0040 D3；与摸头无关）`,
           );
-          this.settlePeakDownVelocity = 0;
+          this.releaseDownVelocity = 0;
         }
         break;
       }
@@ -1345,7 +1552,7 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     this.supportSample = null;
     this.supportVelocity = { x: 0, y: 0 };
     this.supportAcceleration = { x: 0, y: 0 };
-    this.settlePeakDownVelocity = 0;
+    this.releaseDownVelocity = 0;
     this.pendingGrab = null;
     console.log(
       `[render] 拖拽抓取 band=${this.dragBand} pivot=(${Math.round(pivot.css.x)},${Math.round(pivot.css.y)}) ` +
@@ -1747,11 +1954,6 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     this.supportVelocity = { x: vx, y: vy };
     this.supportAcceleration = { x: ax, y: ay };
     this.supportSample = { x, y, at: now };
-
-    // 回弹期间记录向下峰值：落地缓冲的冲击强度（ADR 0035 D4）
-    if (this.hfsm.snapshot().physics === 'settling' && vy > this.settlePeakDownVelocity) {
-      this.settlePeakDownVelocity = vy;
-    }
   }
 
   getState(): RenderState {
@@ -1773,6 +1975,7 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     const model = this.model;
     const now = performance.now();
     const snapshot = this.hfsm.snapshot();
+    const pat = this.patState(now);
 
     return {
       ready: this.ready,
@@ -1836,7 +2039,7 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
                 : null,
           }
         : null,
-      facial: this.facialDiagnostics(now, this.patState(now)),
+      facial: this.facialDiagnostics(now, pat.active),
       hfsm: snapshot,
       motion: {
         base: snapshot.base,
@@ -1926,15 +2129,7 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
           })(),
         };
       })(),
-      pat: (() => {
-        const pat = this.patState(now);
-        return {
-          active: pat !== null,
-          weight: pat?.pose.weight ?? 0,
-          allowMouthChange: pat?.pose.allowMouthChange ?? true,
-          mouthFrame: this.patMouthActive ? PAT_MOUTH_FRAME : 0,
-        };
-      })(),
+      pat,
       speech: { frame: this.lipSyncFrame, driven: this.lipSyncDriven },
       toon: this.toon.diagnostics(),
       outline: this.outline.diagnostics(),
@@ -1949,7 +2144,7 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
 
   /**
    * 自检用的探针点（不是生产路径）：
-   * - head：取景包围盒顶部往下 17%（落在 R-10 掩膜头部带内）；
+   * - head：**头骨位置 + 少量下偏**（ADR 0040 的圆心；占位/无骨骼时退回取景包围盒顶部 17%）；
    * - body：优先用 Pelvis 骨骼的世界位置，缺失时退回取景包围盒 45% 高度。
    */
   private computeProbePoints(): {
@@ -1962,9 +2157,17 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     const frame = model.frame;
     const frameHeight = Math.max(1e-9, frame.maxY - frame.minY);
     const pixelsPerUnit = model.pixelsPerUnit;
-    const headUnitY = frame.maxY - frameHeight * 0.17;
-    const headY = this.height - (headUnitY - frame.minY) * pixelsPerUnit;
     const centerX = this.width / 2;
+
+    // ADR 0040：摸头点位改成"头骨 + 下偏"，这样自检点与生产判据（头骨半径）同一基准。
+    // 下偏 1% 窗口高度（≈7px）只是为了让点位落在"脸"上而不是骨骼原点（颈根）。
+    const headCss = this.headCssNow();
+    const headPoint = headCss
+      ? { x: headCss.x, y: Number((headCss.y + this.height * 0.01).toFixed(1)) }
+      : {
+          x: centerX,
+          y: this.height - (frame.maxY - frameHeight * 0.17 - frame.minY) * pixelsPerUnit,
+        };
 
     let bodyY = this.height - (frame.minY + frameHeight * 0.45) * pixelsPerUnit;
     if (model.bones.pelvis) {
@@ -1975,7 +2178,7 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     }
 
     return {
-      head: { x: centerX, y: headY },
+      head: headPoint,
       body: { x: centerX, y: bodyY },
     };
   }
@@ -1995,6 +2198,25 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     const now = performance.now();
     this.updateFrame(now);
     this.renderer.render(this.scene, this.camera);
+
+    // ADR 0039 排查打点（只读）：摸头片段真的在跑吗？权重真的是 1 吗？
+    // 这一条专门用来排除"被 playHold / crossFade / 残留 settle 权重盖住"的说法。
+    if (this.patWeightCheckAt !== null && now >= this.patWeightCheckAt) {
+      this.patWeightCheckAt = null;
+      const one = this.animations?.oneShot() ?? null;
+      const running = (this.animations?.actions() ?? []).filter((action) =>
+        action.name.includes('Victory_Start_Random'),
+      );
+      console.log(
+        `[render] 摸头片段回报：oneShot=${String(one?.name ?? null)} ` +
+          `time=${one ? one.time.toFixed(2) : '-'}/${one ? one.duration.toFixed(2) : '-'} ` +
+          `weight=${one ? one.weight.toFixed(2) : '-'} paused=${String(one?.paused ?? null)} ` +
+          `enabled=${String(one?.enabled ?? null)} ` +
+          `（byName 里的同名 action 不计入：pat 用的是裁剪后的独立 action，running=${running.length}） ` +
+          `hold=${String(this.animations?.hold()?.name ?? null)} ` +
+          `physics=${String(this.hfsm.snapshot().physics)}`,
+      );
+    }
 
     // 首帧渲染完成后再发 model_ready（§6.3："加载完成且首帧可渲染"）
     if (this.readyPending && this.model) {
@@ -2031,7 +2253,6 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     this.walkYaw = approach(this.walkYaw, this.walkYawTarget, dt, 9);
 
     const oneShot = this.animations?.oneShot() ?? null;
-    this.officialPat = oneShot?.role === 'pat';
     const snapshot = this.hfsm.snapshot();
 
     // ADR 0023 D5：空闲时轮换待机姿态（拖拽、行走、吸附与一次性演出期间不换）
@@ -2066,12 +2287,14 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       this.gaze.update(now, this.width, this.height, this.arbiter);
     }
 
-    // 4) 反应通道叠加（pat_react 的头部后仰/侧倾）+ 坐姿的降级弯腿
+    // 4) 反应通道叠加：摸头**没有**任何程序化姿态（ADR 0039 D2），
+    //    这里只剩坐姿降级时的弯腿；官方片段自己会动身体。
     const pat = this.patState(now);
-    const head = this.model?.bones.head ?? null;
-    // 官方片段自己会动头/动身体，程序化后仰、侧倾只在降级路径叠加（ADR 0023 D4）
-    if (pat && head && this.arbiter && !this.officialPat) {
-      this.arbiter.add(head, 0, pat.pose.headPitch, pat.pose.headRoll);
+    // 摸头反应结束（官方片段播完 / 表情窗口到期）时把表情还原：
+    // `applyFacial` 是事件驱动的，不会每帧自己重画。
+    if (pat.active !== this.lastPatActive) {
+      this.lastPatActive = pat.active;
+      this.applyFacial(now, true);
     }
     // ADR 0028 D8：官方坐姿片段路径下 thighBend 恒为 0，这里只在降级时生效
     const sit = this.sitting ? sitPose(now - this.sitStartedAt, this.sitProcedural) : null;
@@ -2080,7 +2303,6 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
         if (thigh) this.arbiter.add(thigh, 0, -sit.thighBend);
       }
     }
-    this.syncPatMouth(pat);
 
     // 4.2) 拖拽三态姿态（ADR 0035 D2）：骨骼偏移乘姿态增益
     if (this.arbiter && this.dragPoseGain > 0.001) {
@@ -2103,6 +2325,10 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     if (this.landing) {
       const elapsed = now - this.landing.startedAt;
       if (elapsed >= LANDING_DURATION_MS) {
+        console.log(
+          `[render] 落地缓冲结束（${String(this.landing.impact.toFixed(2))}）` +
+            ` 峰值 scale.y 压扁=${this.landingPeakSquash.toFixed(4)}（ADR 0035 D4）`,
+        );
         this.landing = null;
       } else {
         const pose = landingPose(elapsed, this.landing.impact);
@@ -2124,6 +2350,7 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
           }
         }
         this.landingSquash = landingSquash;
+        if (landingSquash > this.landingPeakSquash) this.landingPeakSquash = landingSquash;
       }
     }
 
@@ -2163,6 +2390,21 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       }
     }
 
+    // 4.45) 程序化反应的骨骼通道：`nod` 只低头（头骨 + 一小份颈骨），
+    //       不再用 `animationRoot.scale.y` 压扁整身（ADR 0039 D2：反应通道没有 squash）。
+    if (this.reaction?.spec.headPitch && this.arbiter) {
+      const progress = (now - this.reaction.startedAt) / this.reaction.spec.durationMs;
+      if (progress < 1) {
+        const envelope = Math.sin(Math.PI * Math.max(0, progress));
+        const head = this.model?.bones.head ?? null;
+        const neck = this.model?.bones.neck ?? null;
+        const pitch = this.reaction.spec.headPitch * envelope;
+        // ADR 0035 D5 标定：pitch > 0 = 低头
+        if (head) this.arbiter.add(head, 0, pitch);
+        if (neck) this.arbiter.add(neck, 0, pitch * 0.35);
+      }
+    }
+
     // 4.5) 标定偏移（ADR 0035 D5）：只用于确认骨骼轴向，生产姿态不依赖它
     if (this.arbiter && this.debugBoneOffsets.size > 0) {
       for (const [name, offset] of this.debugBoneOffsets) {
@@ -2178,7 +2420,6 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     let hop = 0;
     let tilt = 0;
     let look = 0;
-    let squash = 0;
 
     if (this.reaction) {
       const { spec, startedAt } = this.reaction;
@@ -2188,7 +2429,6 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       } else {
         const envelope = Math.sin(Math.PI * progress);
         hop += (spec.hopPx ?? 0) * envelope;
-        squash += (spec.squash ?? 0) * envelope;
         if (spec.tilt) {
           tilt += spec.oscillate
             ? spec.tilt * Math.sin(progress * Math.PI * 6) * envelope
@@ -2238,11 +2478,12 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     this.animationRoot.rotation.z =
       tilt +
       dragAngle +
-      (this.officialPat ? 0 : (pat?.pose.bodyLean ?? 0)) +
       (sit?.lean ?? 0);
     // 转身与 `look` 反应共用同一个 Y 轴通道：叠加而不是互相覆盖
     this.animationRoot.rotation.y = look + this.walkYaw;
-    this.animationRoot.scale.set(1, 1 - squash - landingSquash - startleSquash, 1);
+    // 根节点的竖向缩放只剩"落地缓冲"与"惊跳"（ADR 0035 D4 / ADR 0034 D5）；
+    // 反应通道（含 `nod`）不再改 scale（ADR 0039 D2）。
+    this.animationRoot.scale.set(1, 1 - landingSquash - startleSquash, 1);
   }
 }
 

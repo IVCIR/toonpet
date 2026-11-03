@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 契约版本 | 1.15.0 |
-| 生效日期 | 2026-11-02 |
+| 契约版本 | 1.17.0 |
+| 生效日期 | 2026-11-03 |
 | 适用平台 | Windows 11 x64（唯一目标平台） |
 | 权威性 | 本文件是唯一事实来源；与代码、口头约定冲突时以本文件为准 |
 | 修改方式 | 先写 ADR → 再改本文件 → 版本号按 §15 递增 |
@@ -131,16 +131,16 @@
 | R-7 | 离开判定带迟滞：光标离开窗口矩形**外扩 8px** 才恢复穿透；穿透状态每次切换后 100ms 内不再切换 |
 | R-8 | 拖拽期间强制保持非穿透，直到 `drag_released` 且回弹结束；拖拽期间暂停掩膜采集以省 GPU |
 | R-9 | 掩膜采集或离屏渲染失败（上下文丢失、模型未就绪）→ 退回"窗口内容区矩形"判定，并记录一次降级日志 |
-| R-10 | 头部区域 = 掩膜 alpha 包围盒顶部 22%；掩膜不可用时退回窗口内容区顶部 22%（见 D-1） |
+| R-10 | 头部区域 = **以头骨（`Bip001 Head`）在内容区 CSS 坐标里的位置为圆心、半径 `HEAD_PAT_RADIUS_RATIO × 内容区高度`（0.125，默认 720 高即 90px）的圆**；头骨缺失或模型未就绪时退回"掩膜 alpha 包围盒顶部 22%"；掩膜也不可用时 `head = null`（不判摸头）。`head` 只在命中时才有意义（ADR 0040） |
 | R-11 | 禁止使用 CSS `-webkit-app-region: drag`；拖拽由主进程按 §3.4 实现 |
 
 ### 3.4 拖拽与摸头判定（规则 D）
 
 | 编号 | 规则 |
 |---|---|
-| D-1 | 头部区域 = 当前掩膜 alpha 包围盒顶部 22% 高度；掩膜不可用时退回窗口内容区顶部 22% |
-| D-2 | 必须先处于交互态（非穿透）才可能进入拖拽；指针在命中区按下后位移 > 4px → 发 `drag_started`，此后不再判摸头 |
-| D-3 | 指针在头部区按下并在 250ms 内抬起且位移 ≤ 4px → 发 `head_patted` |
+| D-1 | 头部区域定义见 R-10（头骨半径优先，掩膜 bbox 顶部 22% 兜底）；拖拽抓取带另见 ADR 0035 D1（骨骼最近点优先） |
+| D-2 | 必须先处于交互态（非穿透）才可能进入拖拽；指针在命中区按下后位移 > 4px → 发 `drag_started`，此后**本次按下直到下一次全新的 `pointerdown` 之前**都不再判摸头（一次拖拽永久解除本次按下的摸头资格，ADR 0039 D5） |
+| D-3 | 指针在头部区按下并在 250ms 内抬起且位移 ≤ 4px、**且按下之后窗口位置没有变过** → 发 `head_patted`；`dragged` 与 `settling`（回弹 + 500ms 沉降窗口）期间一律不判（ADR 0039 D5） |
 | D-4 | `head_patted` 冷却 800ms，冷却期内重复点击不重复发事件（防抖） |
 | D-5 | 拖拽位移由主进程以 `screen.getCursorScreenPoint()` 轮询（约 16ms）驱动窗口位置；**与 R-6 共用同一个轮询器，不允许出现两个定时器** |
 | D-6 | 松手发 `drag_released`，携带末速度；`render` 播回弹，回弹结束交还 Base 层并恢复 R-6 的正常判定 |
@@ -157,7 +157,7 @@
 | `cmd:voice` | main → renderer | 语音命令联合体：`{ kind:'speak', utteranceId, audio: ArrayBuffer, mime:'audio/wav' }`（WAV 容器字节，解码与 RMS 在渲染侧）或 `{ kind:'stop', utteranceId }`（打断时立刻停播） |
 | `cmd:speech` | renderer → main | 播放事实：`{ utteranceId, phase:'started' }` / `{ utteranceId, phase:'ended', reason:'completed'\|'failed', durationMs, detail? }`。`interrupted` 不由渲染侧上报（主进程决定） |
 | `cmd:probe` | main → renderer | `{ x, y }`：光标在窗口**内容区**的 CSS 坐标（原点为内容区左上角，由主进程 `getContentBounds()` 换算，页面缩放因子强制为 1），请求一次掩膜命中判定 |
-| `cmd:interactive` | renderer → main | `{ hit: boolean, x, y, head: boolean \| null }`：命中结果，以及该坐标是否落在头部区（R-10 掩膜 alpha 包围盒顶部 22%）；`head` 仅在掩膜可用时非 `null`。主进程据此开关穿透与触发 `head_patted`，**不得**据 `head` 反推手势（ADR 0004 D1） |
+| `cmd:interactive` | renderer → main | `{ hit: boolean, x, y, head: boolean \| null }`：命中结果，以及该坐标是否落在头部区（R-10：**头骨半径优先**，掩膜 bbox 顶部 22% 兜底；ADR 0040）；`head` 仅在头骨与掩膜都不可用时为 `null`。主进程据此开关穿透与触发 `head_patted`，**不得**据 `head` 反推手势（ADR 0004 D1） |
 | `cmd:drag` | renderer → main | `{ phase: 'down' \| 'up', x, y, t }`：原始指针事实（按下 / 抬起）。**不承载**位移、速度或任何判定结果——位移与末速度由主进程 16ms 轮询器计算，D-2 / D-3 / D-4 判定全部在主进程（ADR 0004 D2） |
 | `cmd:walk` | renderer → main | `{ phase:'start', direction:'left'\|'right', distancePx }` 或 `{ phase:'stop' }`：`render` 的内部调度器请求窗口行走（**命令**，不是事件）。不承载速度/加速度/弹簧参数——位移物理归 `shell`（ADR 0024 D1） |
 
@@ -226,7 +226,7 @@
 | `shake_head` | 摇头（否定） | 规则池 / LLM | 身体通道短动作，≤ 1.2s |
 | `tilt_head` | 歪头（疑惑） | 规则池 / LLM | 保持 1.5s 后回正 |
 | `look_at_user` | 视线锁定光标方向 | 规则池 / LLM | 只影响视线通道，不影响身体 |
-| `pat_react` | 被摸头的反应 | 规则 / `head_patted` | 低权重混合，**不得打断口型**（见 §5.3） |
+| `pat_react` | 被摸头的反应 | 规则 / `head_patted` | 低权重混合，**不得打断口型**（见 §5.3）；身体是否接管由 §5.3 的表格决定（ADR 0039 D4）；`dragged` / `settling` 期间拒绝，且不得重启或截短已在播的摸头反应 |
 | `happy_hop` | 小幅雀跃 | 规则池 / LLM | 有位移的小跳，需回位 |
 
 规则：
@@ -286,16 +286,16 @@
 
 | 场景 | 口型通道 | 身体通道 | 表情通道 | 结论 |
 |---|---|---|---|---|
-| 说话时被摸头 | 保持 `speaking`，权重 1.0 | `pat_react` 以 ≤ 0.4 权重叠加，**不整体切换到反应动画** | 临时 `shy` | 语音不中断，仅有轻微身体反应 |
+| 说话时被摸头 | 保持 `speaking`，权重 1.0 | **身体通道不动**（不上整身片段、不叠加骨骼偏移）；摸头反应只由 `emotion` 投影承担 | 临时 `shy` | 语音不中断，只有表情回应（ADR 0039 D4） |
 | 说话时被拖拽 | 保持 | Physics 独占，抖动导致的身体位移不改变口型 | 保持 | 语音不中断 |
 | 行走时说话 | 保持 | Base 继续 `walking` | 按 `emotion` | 边走边说合法 |
-| 行走时被摸头 | 无 | `reacting` 以 ≤ 0.4 权重叠加，`walking` 继续 | 临时 `shy` | 不强制停下 |
+| 行走时被摸头 | 无 | **身体通道不动**，`walking` 继续；反应只由 `emotion` 投影承担 | 临时 `shy` | 不强制停下（ADR 0039 D4） |
 | `thinking` 期间任意动作 | 不受影响 | 不受影响 | 不受影响 | `thinking` 只驱动轻量表现（视线/微动），不新增动画层 |
 | 拖拽松手 | 无 | 播回弹（`settling`），结束后回到 `idle` | 保持 | 松手不重置 `emotion` |
 | 回弹期间收到 `intent` | 无 | 被拒（不切动作、不进 `reacting`） | 保持 | 回弹只有"重新拖拽"能打断（ADR 0024 D3） |
 | 回弹期间被摸头 | 无 | 被拒（不切动作、不改嘴型） | 保持 | 同上 |
 | 吸附时说话 | 保持 `speaking` | `sitting` 姿势不变（口型照常驱动） | 按 `emotion` | 坐在窗口边缘说话合法（ADR 0028） |
-| 吸附时被摸头 | 无 | `reacting` 以 ≤ 0.4 权重叠加，坐姿不变 | 临时 `shy` | 坐着也能被摸头 |
+| 吸附时被摸头 | 无 | **身体通道不动**（坐姿停帧不变）；反应只由 `emotion` 投影承担 | 临时 `shy` | 坐着也能被摸头（ADR 0039 D4） |
 | 吸附时被拖拽 | 保持 | `drag_started` 立即把 `sitting` 改成 `dragged` | 保持 | `snap_released{reason:'dragged'}` 不得把 `dragged` 打回 `idle` |
 | 吸附接近中被拖拽 | 保持 | 接近立即取消，`drag_started` 接管为 `dragged` | 保持 | 用户手已接管，不允许接近继续（ADR 0034 D4） |
 
@@ -427,7 +427,7 @@ export interface RenderState {
 | `handleIntent` | `handleIntent(intent: Intent): void` | 立即执行动作意图；未知值降级 `none`；重复 `intent` 在 200ms 内去重 |
 | `getState` | `getState(): RenderState` | 同步返回，供 `shell` 轮询；不得触发渲染或 IO |
 
-订阅：`speech_started`、`speech_ended`（口型通道）、`drag_started`、`drag_released`（Physics 层）、`head_patted`（低权重 `pat_react`）、`intent_resolved`（**只取 `emotion`**，不触发动作——动作只由 `handleIntent` 触发）、`snap_approach_started` / `snap_applied` / `snap_released`（Physics=`sitting` 的接近/落座/退出，ADR 0028 / ADR 0034）。
+订阅：`speech_started`、`speech_ended`（口型通道）、`drag_started`、`drag_released`（Physics 层）、`head_patted`（官方片段 `pat` + 临时 `shy`；身体是否接管见 §5.3 表，ADR 0039 D4）、`intent_resolved`（**只取 `emotion`**，不触发动作——动作只由 `handleIntent` 触发）、`snap_approach_started` / `snap_applied` / `snap_released`（Physics=`sitting` 的接近/落座/退出，ADR 0028 / ADR 0034）。
 
 规则：
 - `handleIntent` 与 `intent_resolved` 是双轨：前者是命令，后者是事实。同一次回复只执行一次动作，不得因两条路径而播两遍。
@@ -435,6 +435,8 @@ export interface RenderState {
 - 模型缺失或骨骼缺失时，`getState().modelReady = false`，并渲染一个占位胶囊体，不得白屏。
 - `render` 内部负责掩膜采集与 `cmd:probe` 应答（§3.3 R-2/R-4），但掩膜不是公共接口。
 - **坐姿（ADR 0028 D8、ADR 0034 D5）**：`snap_approach_started` → Physics=`sitting`（接近阶段，播走路/跳跃并停止行走调度）；`snap_applied` → 仍为 `sitting`（落座阶段），播官方片段 `CH0335_my_event088_pastmemory_01` 的 11.2–13.5s 窗口并**停在最后一帧**（不是循环、也不自动回 `idle`），同时抵消片段自带的身体平移（身体中心 = 窗口中线、最低点 = 窗口底边）；片段缺失时降级为"悬空姿态下沉 + 大腿弯曲"。`sitting` 期间不做 `walking` 调度，`drag_started` 直接接管。
+- **摸头反应（ADR 0039）**：**只有官方片段，没有程序化姿态**。`head_patted` → `clip-bank` 的 `pat` 角色（`CH0335_Victory_Start_Random` 0.3–2.4s，自带"缩身 → 保持 → 抬头回正"闭环），表情临时投影 `shy`。**身体是否接管按 §5.3 的表**：只有 Base=`idle` 且无 Physics 且不在 `speaking` 时才播整身片段；`speaking` / `walking` / `sitting` 时身体通道一动不动，只有表情。**禁止**为摸头写任何骨骼偏移或 `scale`（含 squash）；`dragged` / `settling` 期间不得建 reaction，`drag_started` 必须清掉在播的摸头片段与 reaction。
+- **落地缓冲（ADR 0035 D4，口径与幅度见 ADR 0040 D3）**：`motion_ended{kind:'settle'}` 之后 220ms 的轻微下蹲，**冲击只看 `drag_released.vy`**（松手瞬间竖直速度），门槛 700px/s、上限 1000px/s；`scale.y` 压扁 ≤ **3%**，脊柱/膝/臂只作小辅助（≤0.16rad）。轻放不触发；不得调回 8%（8% 会被读成一个独立动作，与摸头的缩身混淆）。
 
 **表情表现（ADR 0026）**：
 
@@ -443,7 +445,7 @@ export interface RenderState {
 | 实现路线 | **只走贴图合成**（ADR 0026）：以模型自带面部贴图为底做 Canvas **局部**合成；**禁止**整体替换面部贴图；**禁止**屏幕空间叠加面片（会盖在刘海之上）；**禁止**依赖 blendshape |
 | 眼型与红晕 | **必须来自外部官方差分贴图**（`data/expressions/eyes_*.png`、`blush.png`，经只读 `pet-asset://asset/expr/<file>` 白名单路由）；**禁止**在运行期用 Canvas 程序化绘制眼型、瞳孔、眼睑、红晕（ADR 0026 D6，一次失败的尝试） |
 | 嘴型与口型 | 口型 = 图集帧；表情嘴型允许极简图元（一条弧线 / 一个小口），**不得**因此影响口型通道 |
-| 优先级 | 嘴部贴图唯一优先级是 §5.2 的口型通道（口型 > 摸头 > 表情 > 静态闭嘴），表情不得夺口型 |
+| 优先级 | 嘴部贴图唯一优先级是 §5.2 的口型通道（口型 > 表情 > 静态闭嘴，ADR 0039 D3 删除了独立的"摸头嘴型层"），表情不得夺口型 |
 | 降级 | 差分缺失 → 该层不生效（缺眼型保持默认眼、缺红晕不叠），**只变嘴型**，记一条 WARN；缺材质/缺几何 → 表情整体不生效，动作与说话照常（§11） |
 | 还原 | 情绪结束必须**完全还原**默认眼（用 `ImageData` 快照写回，不做插值拷贝） |
 | 字段 | `RenderState` **不因表情增删字段**；表情细节只进内部诊断 |
@@ -623,7 +625,7 @@ flowchart LR
   G -- "是" --> H["drag_started，Physics 接管"]
   H --> I["同一轮询器移动窗口"]
   I --> J["drag_released，回弹后交还 Base"]
-  G -- "否，头部区，250ms 内，位移 ≤ 4px" --> K["head_patted，低权重 pat_react"]
+  G -- "否，头部区，250ms 内，位移 ≤ 4px，且窗口没被移动过" --> K["head_patted → 官方 pat 片段（说话/行走/坐着时只有 shy 表情）"]
 ```
 
 ### 8.3 降级链路
@@ -764,6 +766,7 @@ flowchart TD
 | **官方表情差分缺失**（`data/expressions/` 为空或缺某张） | 加载期逐文件校验 | 对应 emotion 只变嘴型、保持默认睁眼；不叠红晕 | 每个缺失文件一条 WARN，`missing` 进诊断；不得报错、不得阻断启动（ADR 0026 D6.2/D6.4） | 无 |
 | **着色降级**（资产里没有 `*_Body` / `*_Hair` 材质，或渐变贴图创建失败） | 材质名匹配 / 构造期 try-catch | 角色照常显示，只是没有明暗（退回无光照平涂） | 不换材质、不加灯，记一条 WARN；不得报错、不得白屏、不得阻断动作与语音（ADR 0037） | 无 |
 | **描边降级**（资产里没有 `Body`/`Hair`/`Face` 材质，或描边装配失败） | 材质名匹配 / 装配期 try-catch | 角色照常显示，只是没有轮廓线 | 不加描边壳，记一条 WARN；不得报错、不得白屏、不得影响动作/语音/掩膜命中（ADR 0038） | 无 |
+| **摸头官方片段缺失**（`pat` 角色选不到 `CH0335_Victory_Start_Random`） | 片段选择结果 `reason='missing'` | 被摸头时身体不动，只有 `shy` 表情 | 记一条 WARN；**不得**退回程序化骨骼/缩放（ADR 0039 D2/D4）；`reacting` 仍按 1.1s 表情窗口自愈 | 无 |
 | 行走转身（ADR 0026 D1） | — | 走路时朝向移动方向、停下回正 | 指数插值 ≈0.3s；被拖拽/回弹时强制回正，不残留偏航 | 无 |
 | SQLite 打开失败（权限/目录/锁） | `init` 内部捕获 | 无感知 | 自动改用 `:memory:`（同 schema）：本次会话可写可检索，重启即丢 | 无 |
 | SQLite 原生模块缺失 / ABI 不匹配 | `init` 再次失败 | 无感知 | `memory` 置 `disabled`：`retrieve→[]`、`write` 空操作，段 ③ 恒为「（无）」 | 无 |
@@ -875,6 +878,8 @@ flowchart TD
 | 1.13.0 | 2026-11-02 | **吸附接近 + 拖拽悬挂**：① §4.1 `sitting` 扩展为"吸附生命周期（接近 + 落座）"，进入条件增加 `snap_approach_started`；② §5.1/§5.3 补接近说明与"接近中被拖拽"；③ §6.3 新增 `snap_approach_started`（`shell` 唯一生产者，`render` 消费）；④ §7.2/§7.3 补接近入口与订阅；⑤ §11 补接近中目标消失/拖拽/点击命令四条降级；⑥ §12 补接近倒计时复用 16ms 轮询器；⑦ §13 补 X-12。**未新增/删除状态名、`intent`、`emotion`、IPC 通道、模块接口方法或 `RenderState` 字段**；拖拽侧只改 render 内部数学与骨骼姿态（ADR 0035），`cmd:drag` 载荷不变 | ADR 0034、ADR 0035 |
 | 1.14.0 | 2026-11-02 | **全局光照与 Toon**：① §7.3 新增「着色表现（ADR 0037）」规则表——两盏灯（主方向光 + 极低环境光）、只有身体/头发换 `MeshToonMaterial` + 3 阶 `gradientMap`、**面部恒为无光照材质**、受光面必须 ≈ 贴图原色（`ambient+directional ≈ π`）、`COLOR_0.a` 不得用于透明度/阴影阈值、零成本与诊断口径；② §11 新增"着色降级"一行（材质匹配不到 / 渐变贴图失败 → 退回平涂，不报错不白屏）。**未新增/删除状态名、事件、`intent`、`emotion`、IPC 通道、模块接口方法或 `RenderState` 字段**；`RenderDiagnostics.skin` 被 `toon` 取代（内部诊断，不属契约字段）；ADR 0036 的手部顶点色烘焙随之废止 | ADR 0037 |
 | 1.15.0 | 2026-11-02 | **背面法描边与光环定论**：① §7.3 新增「描边表现（ADR 0038）」规则表——背面法（共享几何 + 共享骨骼 + 同父节点）、范围 Body/Hair/Face、宽度按**屏幕像素**（身体/脸 1.5、头发 0.8）、深褐 `0x2a1b1a`、深度偏移与 `polygonOffset`、**光环保持无光照且不描边**、每个描边网格 +1 draw call、诊断口径；② §11 新增「描边降级」一行（材质匹配不到 / 装配失败 → 无轮廓线，不报错不白屏）。**未新增/删除状态名、事件、`intent`、`emotion`、IPC 通道、模块接口方法或 `RenderState` 字段**；`RenderDiagnostics` 增 `outline` / `render` 两块（内部诊断，不属契约字段） | ADR 0038 |
+| 1.16.0 | 2026-11-03 | **摸头改为纯官方片段 + 拖拽/摸头严格互斥**：① §3.4 D-2 补"一次拖拽永久解除本次按下的摸头资格，直到下一次全新 `pointerdown`"，D-3 补"按下后窗口位置未变"与"`dragged`/`settling`（含 500ms 沉降窗口）一律不判"；② §4.4 `pat_react` 补"不重启/不截短已在播的反应、`dragged`/`settling` 拒绝"；③ §5.3 三行（说话/行走/吸附时被摸头）由"≤0.4 权重叠加"改为"**身体通道不动**，反应只由 `emotion` 投影承担"；④ §7.3 订阅补官方 `pat` 片段与 §5.3 表的接线，新增「摸头反应（ADR 0039）」规则（**禁止**程序化骨骼/squash）；⑤ §11 新增「摸头官方片段缺失」降级行。**未新增/删除状态名、事件、`intent`、`emotion`、IPC 通道、模块接口方法或 `RenderState` 字段**；`PatDiagnostics`（内部诊断）改为 `{active,official,clip,body,blockedBy}` | ADR 0039 |
+| 1.17.0 | 2026-11-03 | **头部区改由头骨半径判定 + 落地收平**：① §3.3 **R-10 重写**——头部区 = 以头骨为圆心、`0.125 × 内容区高度` 为半径的圆；头骨/模型缺失退回掩膜 bbox 顶部 22%；两者都不可用 → `head = null`；② §3.4 **D-1** 同步指向 R-10；③ §3.5 `cmd:interactive.head` 的语义同步（头骨优先、bbox 兜底）；④ §7.3 新增「落地缓冲」规则（冲击只看 `drag_released.vy`、门槛 700px/s、压扁 ≤3%、时长 220ms）。**未新增/删除状态名、事件、`intent`、`emotion`、IPC 通道、模块接口方法或 `RenderState` 字段**；`head` 仍为 `boolean \| null`，`HeadBandDiagnostics` / `HeadSample` 只进内部诊断。理由见 ADR 0039 的排查日志（光环顶高 bbox → 头部带覆盖不到脸）与 ADR 0040 | ADR 0040 |
 
 ## 16. 如何在新对话中接续
 

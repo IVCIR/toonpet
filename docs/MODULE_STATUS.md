@@ -2,9 +2,10 @@
 
 | 项 | 值 |
 |---|---|
-| 对应契约版本 | 1.15.0（ADR 0038：背面法描边 + 光环保持无光照；ADR 0037：全局光照 + 3 阶 Toon） |
-| 最后更新 | 2026-11-02 |
-| 当前里程碑 | **M15：视觉完全体（封版 `v1.1.0-visual-final`）** —— 全局光照（主方向光 + 极低环境光）+ 身体/头发 3 阶硬边 Toon + 背面法描边（身体/脸 1.5px、头发 0.8px，共享几何与骨骼）+ 面部与光环死守无光照。视觉侧不再有"未完成的大件"：宽度/颜色经项目所有者肉眼确认，合并材质外壳（消除头发叠线）明确不做（性价比低、易破坏模型），官方表情差分为可选后续。里程碑编号按所有者指令回到 **M15** |
+| 对应契约版本 | 1.17.0（ADR 0040：头部区改由头骨半径判定、落地收平；ADR 0039：摸头只播官方片段 + 拖拽/摸头严格互斥；ADR 0038/0037：描边与 Toon） |
+| 最后更新 | 2026-11-03 |
+| 当前里程碑 | **M15 后续修复 2：头部判定换基准 + 落地收平（ADR 0040）**，已封版 **`v1.1.1-interaction-fix`**（`package.json` 1.1.1）—— `head_patted` 的入口从"掩膜 bbox 顶部 22%"（被光环顶到发顶之上、覆盖不到脸）改为"以头骨为圆心、0.125×内容高=90px 为半径"；落地冲击改取 `drag_released.vy`、压扁 8%→3%、时长 300→220ms、门槛 150→700px/s、恢复系数 0.28→0.15 |
+| 封版验收（2026-11-03，当前工作区） | `npm test` **433 / 0 失败**（exit 0）；四套 selftest **主链路 147 / 输入条 29 / 语音 30 / 缺失模型 4** 全部 exit 0；`tsc --noEmit` 0 错。真机手感验收（点脸 / 拖拽落地）由项目所有者在 `v1.1.1-interaction-fix` 上执行 |
 | 维护规则 | 每个模块对话收尾时必须更新本文件；只写事实，不写计划性描述（计划进 TODO） |
 
 ## 填写口径
@@ -23,6 +24,8 @@
 ## 模块：shell
 
 ### 已完成
+- **回弹恢复系数与反跳可观测（2026-11-03，ADR 0040 D3）**：`SETTLE_RESTITUTION 0.28 → 0.15`（窗口整块反跳从 15–40px 降到 1/2 以下）；`motion.ts` 新增触地反跳打点（`回弹触地反跳 {bounce, vyBefore, vyAfter}`）与回弹结束的 `bounces` 计数，用来把"弹一下"与"摸头"区分开
+- **拖拽与摸头严格互斥（2026-11-03，ADR 0039 D5）**：`drag-gesture.ts` 新增两道闸——① `patArmed`：只有全新 `pointerdown` 才重新武装，任何一次进入拖拽立刻置 false（"直到下一次全 pointerdown"）；② `movedWindow`：按下期间窗口位置变过（拖拽位移 / 回弹弹簧 / 吸附跟随都会搬窗口）→ 不发 `head_patted`，且**不伪造** `drag_started`（否则回弹期轻点会把她重新拎起来），只留一条 `head_patted 未触发：按下期间窗口被移动过` 日志。`pointer-poller.ts` 在发出 `head_patted` 前再查一次 `settling`（500ms 沉降窗口）与 `isSettling()`，命中即丢弃并 WARN（`head_patted 被丢弃：拖拽/回弹期间严格互斥`）。单测 `drag-gesture` 新增 2 条（窗口被移动 / 拖拽后解除资格）；主链路自检新增"回弹期间 head_patted 被 render 拒绝"与"松手不经过 reacting"
 - **吸附接近（2026-11-02，ADR 0034）**：`src/main/shell/approach.ts` 纯函数（`planApproach` / `sampleApproach` / `approachDelta`）；`snap.ts` 的 `snapNow()` 在距离 >8px 时先发 `snap_approach_started`，在既有 16ms `snap.tick(now)` 里按 `t += dt/duration` 推进（**没有新定时器**），`t>=1` 才 `commit()` 并发 `snap_applied`；`mode='walk'` 用于同一地面线，`mode='leap'` 先水平走到目标 x 下方、再短弧跳上去。接近期间锁目标、暂停跟随；只有 `drag_started` 能立即中断，`clicked`/`command`/`window-gone`/`fullscreen` 延迟到到达后再释放。诊断 `SnapDiagnostics.approaching/approachProgress/approachMode`；单测新增 6 条（`approach.test.ts`）+ `snap.test.ts` 4 条接近用例
 - **落地分级标定钩子（2026-11-02，ADR 0035 D4）**：`shell.debugDropFromHeight(heightPx)`（非契约，内部标定用）把窗口抬到地面上方后走真实 `drag_released` 事件链；`PET_LANDING_CALIBRATE=1` 落 `dist/selftest/landing-10px.png` / `landing-300px.png`，实测 impact 0.00 / 1.00、`landingSquash` 0 / 0.078，脚底未穿出窗口
 - **`model_ready` 事实闩锁（本轮，ADR 0033 D2.2）**：`onRendererEvent` 收到 `model_ready` 时多调一行 `noteModelReady()`（`src/main/model-ready.ts` 的进程内单例，只记第一次；`runtime.stop()` 清零）。这一行不是为了 shell——`model_ready` **可能早于 `runtime.start()` 完成**（启动顺序是先 shell 后 runtime，而渲染进程加载 VRM 只要 1–2s），早到的那一次如果没人落闩锁，`runtime` 就没机会"在模型出现的那一刻预热"。**没有新增事件、IPC 通道、setter 或 `RenderState` 字段**（与 ADR 0032 的 `proactive-stats` 同一手法）
@@ -164,6 +167,7 @@
 | **`cmd:drag` 的 `t` 是渲染进程的 `performance.now()`**，主进程另有自己的时基 | 用主进程时钟去减渲染侧 `t` 会得到无意义的时长 | 250ms 用 `tUp − tDown`（同一时基，不含 IPC 抖动）；800ms 冷却与 4px 位移用主进程时钟。两者不跨时基相减 |
 | **指针抬起事件若丢失**（例如窗口被 D-7 钳制停住、指针离开窗口且系统捕获失效） | 按下状态会保持：窗口继续非穿透、探针照常发；直到下一次 `pointerdown`（按下即替换旧按下）才恢复 | 渲染侧 `pointerdown` 里 `setPointerCapture`；主进程不新增超时兜底（避免引入契约外机制）。已列为已知风险，未声称解决 |
 | 沉降窗口（500ms）内按下：新手势会重置沉降窗口（ADR 0004 D3.2），但此时 `cmd:interactive` 快照可能已 >100ms 陈旧 | 该次点击**不会**触发 `head_patted`（即使点在头部区） | 按 ADR 0004 D1.6 保守丢弃并记日志；拖完立即摸头需要等一次新的探针回包 |
+| **ADR 0039 起"拖完还能误摸头"的路已全部封死**：`dragged`/`settling` 期间的三道闸（手势 `patArmed`、窗口位移判据、轮询器沉降窗口）任一生效都不发事件 | 拖拽结束后 0.5–1s 内点她，可能"没反应"（不是坏了，是被互斥挡下） | 想立刻摸头请等回弹停下（`physics=idle`）；日志 `head_patted 未触发：按下期间窗口被移动过` / `head_patted 被丢弃` 可确认是被拦而不是没点中 |
 | 拖到屏幕外被钳制后，窗口不再跟随光标（D-7 命中上限） | 真实鼠标下 `pointerup` 依赖 Windows 的鼠标捕获；合成事件下无此问题 | 只做 `setPointerCapture` 缓解；D-7 的 80×120 可见性是硬约束，不为了跟随而放宽 |
 | `pressed` 是**内部 FSM 输入位**，不是 §4.1 的状态名 | 读日志/代码时容易误以为新增了状态 | `pressed` 只表达"已按下、未过 4px"；`dragging` / `settling` 优先级更高，未被绕过。§4.1 状态集合未变 |
 | **窗口尺寸不再是固定 480×720**：由模型取景包围盒决定（本次 422×720） | 任何假设"内容区 480 宽 / 角色在 x=240"的代码与脚本都会失效（自检已改为从掩膜/诊断取点位）；§3.2 的"默认 480×720"只在模型缺失时作为回退 | 窗口尺寸只有一处计算（`src/shared/model-frame.ts`）；输入条定位等第 6 步按实际宽度算 |
@@ -193,6 +197,7 @@
 | `npm run doctor` 的绿灯不等于链路可用 | 例如 Ollama 有模型但显存不足、TTS 端口通但权重配错 | doctor 只覆盖"可观测前提"（文件、端口、模型名、参考音频时长）；真实链路以 `npm run selftest*` 与 `logs/pet.log` 为准 |
 | **自检的日志切片曾按"当前行数"**：`model_ready` 可能在 `runtime.start()` 完成前落盘，而自检入口在那之后才执行 | 主链路自检偶发 `事件：model_ready 已发出并被主进程收到` 失败（2026-10-30 复现一次，exit 1） | 改为按本进程启动时间戳切片（`baselineLineCount`）；只影响自检，不影响生产代码。修后主链路连续两次 61/61 |
 | 非 UTF-8 控制台（`chcp 936`）里 `npm run doctor` 的中文会乱码 | 清单读不清，容易误判 | 用 `run-doctor.cmd`（内部 `chcp 65001`）或 Windows Terminal |
+| **`.cmd` 里不能出现中文（UTF-8）**：cmd.exe 按 ANSI 代码页**逐行**解析批处理，`chcp 65001` 救不回来；多字节序列被误读时甚至**吞掉换行**，表现为 `'竴娈佃窛…' 不是内部或外部命令` 之类的连串报错（`run-capture.cmd` 第一版踩到，2026-11-03） | 脚本完全跑不起来，看起来像"文件坏了" | **所有 `.cmd` 只写 ASCII**（本轮已把 `run-capture.cmd` / `run-doctor.cmd` 全量英文化）；要匹配中文日志就用**ASCII 锚点**（`ADR 0024 D`、`ADR 0040 D3`、`squashMax`、`headBoneCss`）；两个脚本都带 `--check` 只做解析自检（`run-capture.cmd --check` / `run-doctor.cmd --check`，exit 0 = 语法 OK） |
 | **字幕在合成期间是空白的（4–6s）**：ADR 0021 把"显示"推迟到 `speech_started` | 用户会以为"没反应"，尤其是 TTS 冷启动（本机首句 6.2s） | 这是与语音对齐的必然代价；`logs/pet.log` 的 `已下发音频，等待渲染侧首帧` 可确认链路在动。不要把显示时机改回 `intent_resolved` |
 | **`speech_ended` 永不到达时字幕会一直停留**（渲染进程崩溃、voice 会话挂住） | 屏幕上有一行旧文本，直到下一次回复 | 字幕 `pointer-events:none` 不挡点击；下一次 `intent_resolved` 会先收起旧字幕。不为此加看门狗（与 ADR 0015 D3 同一取舍） |
 | **failsafe 15s 是固定常量**（`SUBTITLE_PENDING_FAILSAFE_MS`） | 换更慢的 TTS（如整段 30s+）时会在语音开始前提前亮字 | 该值必须大于实测合成耗时；改 TTS 部署后重估。日志 `等待 speech_started 超时，提前显示字幕` 是它触发的唯一证据 |
@@ -260,16 +265,18 @@
 - **HFSM 三层壳（本轮，ADR 0014 D3）**：`hfsm.ts` 纯逻辑（不引用 three / 不读时钟）；Base=`idle`（`walking` 未实现，枚举保留）、Overlay=`speaking`/`reacting`、Physics=`dragged`；`overlay` 是 §7.1 单字段的投影 `speaking > reacting > null`；`reacting` 由 `head_patted` 或 §4.1 列出的 5 个 intent 进入，1.1s 自愈；`dragged`/`speaking` 只由事件进出（H-4）。
 - **骨骼仲裁（ADR 0014 D1/D2；基底判定于 ADR 0029 修正）**：`bone-arbiter.ts` 固定每帧顺序 **`capture()` → Mixer → 抓取动画基底 → 视线叠加 → pat 叠加 → 单次写回 → Physics 根变换 → render**；`head`/`eyeL`/`eyeR` 只允许仲裁器写。**"本帧动画有没有重写这根骨"改为用 `mixer.update()` 前后快照判定**（ADR 0029：three 的 `PropertyMixer.apply()` 在停帧后会跳过冗余写入，旧的"骨值 = 我上次写的值"判据在浮点噪声下会误判，把上一帧偏移当成新基底 → 逐帧累积）；未受动画驱动的骨骼仍然安全。
 - **视线改造（本轮）**：`gaze.ts` 不再持绑定姿态快照，改为向仲裁器提交 yaw/pitch 偏移；Idle 动画驱动头/眼时视线仍然有效（自检：左右光标 `yaw` 分别为 -0.24 / +0.24）。
-- **摸头反应（本轮，ADR 0014 D6）**：`pat-react.ts` 纯函数（`sin(πp)` 包络、权重、姿态）；头部后仰 `-0.3 rad` + 侧倾 `0.08 rad` + 身体前倾 `0.05 rad`，嘴型切图集第 4 帧（shy）；**说话时权重封顶 0.4、且不改嘴型**，`emotion` 临时投影 `shy`、结束回到 `intent_resolved` 的值。
+- **头部区改由头骨半径判定（2026-11-03，ADR 0040）**：`cmd:interactive.head` 的权威口径从"掩膜 alpha 包围盒顶部 22%"（R-10 旧文）改为"以 `bones.head` 的内容区 CSS 位置为圆心、`HEAD_PAT_RADIUS_RATIO=0.125 × 内容区高度` = **90px**（422×720）为半径的圆"，判定在渲染侧 `headSampleAt(x, y, maskHead, hit)` 完成；头骨/模型缺失时退回旧的 bbox 22%，两者都不可用 → `head = null`（主进程保守丢弃）。实测几何：头骨 y≈343、发顶 y≈260、脸 y≈350–420、光环 y≈120–205 → 圆覆盖 **253–433**（发顶到下颚），**光环落在圆外**。诊断：`headBandDiagnostics()` 返回 `{source, headBoneCss, headRadiusPx, bandBottomCssY, bbox, holdClip}`；probe 日志每次打印 `boneY/radius/dist/src`。自检点位从"包围盒顶部 17%"改为"头骨 + 1% 内容高"，新增 3 条口径断言 + 2 条端到端验收（点脸触发且播官方片段 / 点光环不触发）
+- **落地冲击换口径并收平（2026-11-03，ADR 0040 D3）**：删除 `settlePeakDownVelocity`（settling 期间窗口向下峰值——自由落体必然饱和，导致每次拖拽都按"重摔"压满 8%），改用 **`drag_released.vy`**；`LANDING_MAX_SQUASH 0.08 → 0.03`、`LANDING_DURATION_MS 300 → 220`、`LANDING_IMPACT_MIN 150 → 700px/s`。实测：向下甩手 `vy=2220` → `impact=1.00`、`squashMax=0.0300`；轻放（`vy=0`）→ `impact=0`、`squashMax=0`（自检新增"轻放不缩"断言）。窗口反跳同时由 `SETTLE_RESTITUTION 0.28 → 0.15` 收小（shell 侧常量）
+- **摸头改为纯官方片段（2026-11-03，ADR 0039）**：`clip-bank.ts` 的 `pat` 角色改绑 `CH0335_Victory_Start_Random` 0.3–2.4s——全量普查（44 段 × 0.2s 采样骨骼事实：身高代理/手到头距离/头骨 pitch-roll/脚底高度）后唯一"站姿 → 缩身抱手低头 → 保持 → 抬头回正"的闭环片段；`Cafe_Reaction` 只留 `greet`（0–2.2s）。**删除 `pat-react.ts` 与其单测**，render 里所有摸头专用骨骼偏移（头 pitch/roll）、`animationRoot.rotation.z` 的身体前倾、`'pat'` 嘴层归属全部移除——摸头不再有任何程序化姿态或 `scale`/squash。表情改为把 `effective emotion` 临时投影 `shy`（走官方差分，ADR 0026）；`PatDiagnostics` 改为 `{active, body, clip, blockedBy}`。`hfsm.dragStarted/dragReleased` 清空 `reaction`，`headPatted/intent` 在 `dragged` 也拒绝；`handleIntent('pat_react')` 在已有摸头反应时不重启（避免把 2.1s 官方片段截成 1.1s）。§5.3 三行（说话/行走/坐着被摸头）改为"身体通道不动、只表情"。**顺带**：`nod` 的"整身 `scale.y` 压扁 6%"也换成头骨低头 0.26rad + 颈骨 0.35 倍（同一类"生硬压缩"，且它是兜底台词的常用 intent）——`REACTIONS` 里再无 `squash`，`animationRoot.scale` 只剩落地与惊跳两处
 - **拖拽姿态（ADR 0014 D3）**：`drag_started` → crossFade 到 `Formation_Pickup`（被拎着的垂姿，ADR 0023 D3）、`animationRoot` 抬升 18px + 周期 1.6s / ±0.05 rad 摇摆；`drag_released` → Physics=`settling`，回弹过程中淡回 Idle。
 - **行走调度与窗口位移（2026-10-31，ADR 0024 D1）**：`hfsm.ts` 的 Base 增加 `walking`——idle 满 20–40s（注入随机源，可单测）后随机方向 + 100–300px，`tick()` 返回 `startWalk`；`render-module` 收到后播 `Cafe_Walk` 并经 `cmd:walk` 让 shell 位移。**不用动画 root motion**：位移由 `shared/motion.ts` 的 `stepWalk`（刹车曲线 v=√(2ad)）驱动，窗口 16ms 更新一次。到达/撞边/被拖拽打断都由 `motion_ended{kind:'walk'}` 收步。
 - **真实回弹（2026-10-31，ADR 0024 D2/D3）**：`drag_released` 进入 `settling`，shell 用弹簧-阻尼（k=140、c=12、恢复系数 0.28）把窗口落到工作区地面线，水平速度按 `e^(-5t)` 衰减；落地后 render 加 180ms / 6% 的下蹲缓冲。回弹期间 `intent` 与 `head_patted` 被忽略（唯一例外是重新拖拽）。物理全部是纯函数（`stepSpring`/`stepWalk`/`stepSettle`），单测 12 条。
 - **配件隐藏（本轮，ADR 0014 D5）**：`HIDE_ATTACHMENTS` 默认 `(weapon|prop|brush|outline)`，实测隐藏 `CH0335_Weapon` / `CH0335_Prop_Outlline` / `brush_01` 三件；只 `visible=false`（不删节点、不改材质），隐藏集合同时不参与取景。
 - **地面校正（本轮，ADR 0014 D4）**：加载后按 Idle 姿态做一次 CPU 蒙皮采样（每网格 ≤4096 顶点），把可见网格最低点对齐内容区底边；实测 `Cafe_Idle` 校正 **-0.2px**，`resize` 后重算，不逐帧。
-- **口型通道（本轮接线，ADR 0015 D4）**：`facial-texture.ts` 以 EyeMouth 贴图为底、8× 超采样 CanvasTexture：刷肤色底板 + 画图集帧。渲染侧语音播放器按 **30Hz** 把包络电平映射成 8 级帧，经内部接口 `setMouthFrame(frame)` → `MouthChannel.setFrame` 驱动贴图；`speech_ended`（任何 reason）调 `resetMouthFrame()` 回闭嘴帧。口型通道优先级最高：说话开始时 `restorePatMouth()` 立即让位（§5.2）；`setFrame` 的另一个调用方仍是摸头的 shy 帧（第 4 帧）。
+- **口型通道（本轮接线，ADR 0015 D4）**：`facial-texture.ts` 以 EyeMouth 贴图为底、8× 超采样 CanvasTexture：刷肤色底板 + 画图集帧。渲染侧语音播放器按 **30Hz** 把包络电平映射成 8 级帧，经内部接口 `setMouthFrame(frame)` → `MouthChannel.setFrame` 驱动贴图；`speech_ended`（任何 reason）调 `resetMouthFrame()` 回闭嘴帧。口型通道优先级最高：`speech_started` 时立刻 `applyFacial(force)` 让嘴层归 `lip-sync`（ADR 0039 起嘴层只剩 **口型 > 表情 > 静态闭嘴** 三级，`'pat'` 已删除）。
 - **口型诊断（本轮）**：`getDiagnostics().speech = { frame, driven }`（内部，不进 `RenderState`）；自检用它与 `window.petVoice.getDiagnostics()`（包络电平/帧/AudioContext 状态）互相校验。
 - **`model_ready`（阶段 4.5）**：首帧渲染后经 `evt:broadcast` 上行，payload `{modelId, loadMs}`；shell 记日志并走与 `did-finish-load` 相同的幂等显示路径（§6.3、§7.3）。
-- **能力探测**：`getState().modelReady` 真实反映加载结果；更细的诊断（包围盒、ppm、骨骼名、当前动作/权重、HFSM 快照、pat 权重、隐藏网格、地面校正、视线角度、口型通道）在内部 `window.petModel.getDiagnostics()`。**动作名按 ADR 0014 D7 不进入 `RenderState`**（§7.1 字段固定）。
+- **能力探测**：`getState().modelReady` 真实反映加载结果；更细的诊断（包围盒、ppm、骨骼名、当前动作/权重、HFSM 快照、`pat {active,body,clip,blockedBy}`、隐藏网格、地面校正、视线角度、口型通道）在内部 `window.petModel.getDiagnostics()`。**动作名按 ADR 0014 D7 不进入 `RenderState`**（§7.1 字段固定）。
 - 掩膜采集与 `cmd:probe` 应答（128×72、20Hz、垂直翻转、cold/stale/矩形退路）、`cmd:drag` 上行、R-8 暂停链路保持上一轮实现，未回退。
 
 ### 未完成
@@ -297,7 +304,7 @@
 | `resize` | `resize(width: number, height: number): void` | 实现细节，非契约 |
 | `dispose` | `dispose(): void` | 实现细节，非契约 |
 
-> 内部接口（不属于 §7.3，且不跨进程暴露）：`handleEvent(event)`（`evt:broadcast` 的渲染侧入口）、`setCursor(cssX,cssY,at)`、`noteGrabPoint(cssX,cssY,at)`（ADR 0035 抓取点）、`setDebugBoneOffset/clearDebugBoneOffsets/listBones/getBoneWorld`（ADR 0035 骨骼标定）、`setWalkInterval(min,max)`（自检压缩行走间隔）、`getDiagnostics()`（含 `facial` 块：emotion/eyeShape/mouthShape/mouthOwner/blush/alpha/faceDistance/textureDigest；`toon` 块：enabled/ambient/directional/direction/gradientSteps/gradientWidth/materials/litMeshes——ADR 0037）、`applyFacial`（内部装配点，私有）、`FacialChannel.setMouth/setEyes/repaint` / `BlushChannel.setBlush/repaint` / `MaskCapture.setPaused` / `setTickListener` / `snapshot` / `markContextLost`。
+> 内部接口（不属于 §7.3，且不跨进程暴露）：`handleEvent(event)`（`evt:broadcast` 的渲染侧入口）、`setCursor(cssX,cssY,at)`、`noteGrabPoint(cssX,cssY,at)`（ADR 0035 抓取点）、**`headSampleAt(x,y,maskHead,hit)`（ADR 0040 头部区判定：头骨半径优先 + 掩膜 bbox 兜底，返回 `{head, source}`）**、**`headBandDiagnostics()`（ADR 0040 头部区几何：`source/headBoneCss/headRadiusPx/bandBottomCssY/bbox/holdClip`）**、`setDebugBoneOffset/clearDebugBoneOffsets/listBones/getBoneWorld`（ADR 0035 骨骼标定）、`setWalkInterval(min,max)`（自检压缩行走间隔）、`getDiagnostics()`（含 `facial` 块：emotion/eyeShape/mouthShape/mouthOwner/blush/alpha/faceDistance/textureDigest；`pat` 块：active/body/clip/blockedBy——ADR 0039；`toon` 块——ADR 0037；`outline`/`render` 块——ADR 0038）、`applyFacial`（内部装配点，私有）、`FacialChannel.setMouth/setEyes/repaint` / `BlushChannel.setBlush/repaint` / `MaskCapture.setPaused` / `setTickListener` / `snapshot` / `markContextLost`。
 >
 > 着色与材质诊断专用（只在 `window.diagnostics` 同页暴露）：`inspectMaterials()`（网格/材质/`map`/`colorSpace`/手部顶点/UV 采样色）、`tintSkin('hand'|'both'|'none')`（只染手/小臂顶点，用于证明手在哪块网格）、`testHandMaterial(color)`（整块 Body 材质换纯色，对照实验）、**`setToon(false|true)`（ADR 0037：摘灯 + 还原无光照材质 ↔ 3 阶 Toon）**、**`setOutline(false|true)`（ADR 0038：只切描边壳 `visible`）**、**`setHaloToon(false|true)`（ADR 0038 D6：光环吃光的对照开关）**、`resetMaterials()`、`handScreenPoints()`（双手骨骼的 CSS 坐标，截图取样用）。
 > `PET_TOON_DIAG=1`（配合 `PET_SELFTEST=1`）只跑 Toon 对照：产出 `dist/diagnostics/toon-comparison.json` 与 `dist/selftest/toon-00-before.png` / `toon-01-after.png` / `toon-{before,after}-{coat,torso,face,handL,handR}.png`。
@@ -310,11 +317,11 @@
 
 | 事件 | 用途 |
 |---|---|
-| `speech_started` | Overlay=`speaking`；立即交还嘴型（§5.2 口型通道最高优先级）；之后口型由渲染侧播放器按包络驱动（ADR 0015 D4） |
+| `speech_started` | Overlay=`speaking`；`applyFacial(force)` 立刻把嘴层交还 `lip-sync`（§5.2 口型通道最高优先级）；之后口型由渲染侧播放器按包络驱动（ADR 0015 D4） |
 | `speech_ended` | Overlay 退出 `speaking`；嘴型 `resetMouthFrame()` 回闭嘴帧（任何 reason） |
-| `drag_started` | Physics=`dragged`；R-8 暂停掩膜采集；crossFade 到 `Carrier_Idle` 并抬升/摇摆 |
-| `drag_released` | Physics 退出；R-8 从此刻起等 500ms 再恢复采集；crossFade 回 Idle |
-| `head_patted` | Overlay=`reacting`；`pat_react` 低权重叠加（说话时 ≤0.4、不改嘴型）；回弹期间忽略 |
+| `drag_started` | Physics=`dragged`；**先 `cancelOneShot()` 收走在播的摸头片段**，再 crossFade 到 `Carrier_Idle` 并抬升/摇摆；R-8 暂停掩膜采集；清除摸头表情投影（ADR 0039 D5） |
+| `drag_released` | Physics=`settling`（同时清空 reaction）；R-8 从此刻起等 500ms 再恢复采集；crossFade 回 Idle |
+| `head_patted` | Overlay=`reacting`；**只有 Base=`idle`、无 Physics、不在说话时**才播官方 `pat` 片段（其余场景只有 `shy` 表情）；`dragged`/`settling` 期间直接拒绝并记日志（ADR 0039 D4/D5） |
 | `intent_resolved` | 只取 `emotion`（不触发动作）；摸头期间投影为 `shy`；该值驱动**面部贴图合成**（眼型/嘴型/红晕，ADR 0026） |
 | `motion_ended` | ADR 0024：`kind:'walk'` → Base 回 `idle` 并重新排期；`kind:'settle'` → Physics 退出、加落地缓冲 |
 | `snap_applied` | ADR 0028：Physics=`sitting`、收步、播官方坐姿片段并停在最后一帧（缺片则程序化降级）；期间不做行走调度 |
@@ -330,7 +337,7 @@
 | **头发是"重叠的卡片"**：每张卡片的轮廓都会各外扩一圈，几层投影重合处线宽叠加 | 1.2px 档在侧发重叠处叠出 **12 设备像素（6 CSS px）**，像贴纸黑边 | 头发单独一档 **0.8px**（`OUTLINE_HAIR_WIDTH`），重叠区收敛到 2–3px；单层发梢仍是清晰一条线（ADR 0038 D4）。要根治只能合并外壳或走后处理，两条都被"不做后处理"否掉 |
 | **`Face` 是开口曲面**：`BackSide` 对正对镜头的三角形全部剔除 | 脸皮的描边**几乎看不见**（"装了但没有像素"）；下巴/颈部那条线其实来自 Body 与 Hair | 这是资产事实，不是 bug；`Face` 仍按需求接入（换成封闭脸皮的模型才会显现）。**不要**为了"看得见"改用 `DoubleSide`——那会把描边糊在脸上（ADR 0038 D5） |
 | **描边壳与近共面表面会 z-fighting**（脸皮、双层衣料） | 轮廓内侧出现闪烁的黑色碎片 | 视空间推远 0.6px（`OUTLINE_DEPTH_BIAS`）+ `polygonOffset(1,1)` 双保险 |
-| **描边会把"轮廓"算进掩膜** | 掩膜（128×72）比之前大约 ≤1.5px，轮廓也可被点中 | 这是想要的行为；R-9 的矩形退路、双线性采样与头部带比例都不变，不需要改契约 |
+| **描边会把"轮廓"算进掩膜** | 掩膜（128×72）比之前大约 ≤1.5px，轮廓也可被点中 | 这是想要的行为；R-9 的矩形退路与双线性采样不变。头部区已不依赖掩膜比例（ADR 0040：头骨半径优先），所以描边宽度变化不再影响"哪儿算头" |
 | **A/B 截图会被动画污染**（呼吸/眨眼/手指微动） | 隔 300ms 拍两张可能一张闭眼一张睁眼，拿去做"有/无描边"证据不严谨 | 用 **16×16 灰度缩略图差**挑姿态最接近的一对（1px 的描边线在缩略图里被平均掉，整体位移不会）；`PET_OUTLINE_DIAG=1` 自动连拍 6 对 |
 | **本资产没有 Mask / Ramp 贴图**：8 张贴图全是 RGBA8 颜色图，10 个材质只有 `baseColorTexture` 一个槽，也没有第二套 UV | "阴影范围可画"这条路不存在；二分只能由光照模型产生 | ADR 0037：`MeshToonMaterial` + 3 阶 `gradientMap`（硬边由 `NearestFilter` 给）。**换模型/换皮肤前先跑 `node tools/audit-glb-assets.mjs`**，若新资产带 Ramp，改 `TOON_STEPS` 或直接用它 |
 | **`COLOR_0` 的 RGB 是常量、alpha 才是数据**（0/0.102/0.2/0.251/0.349/0.502/0.745/1 = 8bit 的 26/51/64/89/128/190/255，疑似描边遮罩） | 最新版本的顶点色**不能**当颜色/明暗乘子（只有常量），也**不能**接进 `alphaTest`/`transparent`——`Eyebrow`/`EyeMouth` 的 alpha 恒为 0，接进去眉毛和五官会整块消失 | Toon 材质显式 `vertexColors: false`；要消费 alpha 必须先出 ADR + 单测（ADR 0037 D4） |
@@ -379,16 +386,24 @@
 | **动作名不能进 `RenderState`**（§7.1 字段固定） | 想从 `getState()` 读当前 clip 的人会找不到字段 | 走内部诊断 `getDiagnostics().animation.current` + 动作切换日志；要进 `getState()` 必须契约 minor + ADR（ADR 0014 D7） |
 | **抓脚的"倒吊"在 422×720 窗口里装不下**：绕脚骨转 180° 会把头转到窗口底边以下，被透明窗口裁掉 | 只能做"被拎住脚踝的挣扎"（前折 + 举臂 + 屈膝），不是真倒吊 | 接受为 ADR 0035 的明确取舍；要真倒吊必须动态加高窗口/改锚点，另立 ADR |
 | **`window.screenX/Y` 有 1px 量化噪声**：直接二阶差分求加速度会抖 | 单摆会被噪声驱动，看起来像"抽搐" | 两级 EMA（55/90ms）+ 死区 80px/s² + 加速度上限 6000px/s²；单测锁死极值/NaN |
-| **落地膝盖弯曲可能让脚离地/穿出窗口底边**（没有 IK） | 重摔时脚可能离开底边 | 下蹲以 `scale.y` 为主、膝盖 ≤0.16rad；实拍 10px/300px 两张 `landing-*.png` 复核，若穿帮把 `LANDING_KNEE_MAX_RAD` 降为 0 |
+| **落地膝盖弯曲可能让脚离地/穿出窗口底边**（没有 IK） | 重摔时脚可能离开底边 | 下蹲以 `scale.y` 为主、膝盖 ≤0.16rad；ADR 0040 D3 起压扁上限只有 **3%**、时长 220ms，穿帮风险进一步降低。实拍 `window-landing.png` / `window-landed.png` 复核 |
+| **头部判定圆会跟着头骨走**：摸头动画本身把她压低了 ~57px（`Victory_Start_Random` 的缩身段），此时圆心也跟着下移 | 动画播放中再点"原来的那个点"可能刚好在圆外（实测圆心 y 343 → 399） | 这是**想要**的行为：判的是"她的头在哪"，不是屏幕坐标。用户在缩身过程中重新点，只要点在她当前头上就仍然算；要避免误判就让冷却（800ms）吃掉这段时间 |
+| **向上甩手再落下的拖拽不会触发落地压缩**（ADR 0040 D3 的推论）：`drag_released.vy < 0` → `releaseDownVelocity = 0` | "把她往上一抛"的玩法没有落地反馈 | 刻意的：冲击只看"松手瞬间有没有向下送"。若将来要按"落下高度"分级，需另立 ADR 从窗口轨迹反推 |
+| **`HEAD_PAT_RADIUS_RATIO = 0.125` 与四个落地阈值都是本资产/本机标定值** | 换模型（身高比例不同）或改窗口高度后，圆可能盖住胸口或盖不到下巴 | 自检的 `头部区几何` 会打印 `headBoneCss / headRadiusPx / bandBottomCssY`；换资产先跑一遍再定比例 |
+| **`head = null` 的三层降级只在"骨骼+掩膜都不可用"时出现**（占位胶囊体、掩膜 cold 且无模型） | 此时点哪都不算摸头（保守丢弃） | 符合 ADR 0004 D1.6；日志里 `blockedBy="head-rejected"`、`headRejectedBecause="mask-unavailable"` 可确认 |
 | **坐姿片段末帧闭眼**：视线/表情在最后 0.5s 不易读 | 坐姿"看着用户"的观感被闭眼削弱 | 已在 11.2–13.5s 内尝试标定；接受资产事实，保持头部 yaw 可读；换模型要重新选窗口 |
+| **窗口移动期间的轻点都不算摸头**（回弹 / 行走 / 吸附跟随）：`movedWindow` 判据会把它压掉并记日志 | 想摸正在走路的她，可能"点不动" | 已知取舍（ADR 0039 D5）：移动中的目标无法与"拖拽后的抬手"区分。要修必须让 D-3 的距离排除窗口自身位移（`cmd:drag` 加窗口位移或把 motion 状态喂给判定），属契约变更，暂不做 |
 | **抓取点用骨骼最近点分类**：点到光环/武器（已隐藏）或发梢可能落到 head/body 的边界 | 极端点位可能选错支点 | 骨骼缺失/不可信时退回掩膜 bbox 三段带；点到光环的概率低，且光环不是可拖拽语义 |
-| 摸头没有专门动画；`Cafe_Reaction`（10.75s）/`Formation_Pickup`（14s）都是整身演出 | 整身动画会抢身体/口型通道（H-1/H-2） | 程序化三通道合成（头后仰 + 身体前倾 + 嘴型第 4 帧），说话时权重 ≤0.4 且不改嘴型（ADR 0014 D6） |
-| 嘴型"shy"帧（索引 4）是**资产相关标定** | 换图集/换角色后该帧可能不是微笑 | 常量集中在 `pat-react.ts`；换资产需重新看图集选帧（写进本坑位） |
+| **6 个 `*_interaction_*` / `Victory_*_Random` 片段的可用性只有目视结论**：`Victory_Start_interaction_01` 首帧是腾空翻滚的过场（带根位移/镜头感），`Victory_End_interaction_01` 是原地小动作 | 直接拿来当"互动反应"会穿帮（她先飞起来再落地） | 片段表里只接 `Victory_Start_Random`（正面、站姿起、闭环回正）；过场片段在 `clip-bank` 不登记，换资产要重新用 `tools/clip-preview` 过一遍 |
+| **摸头反应在"说话 / 走路 / 坐着"时只有表情**（§5.3 / ADR 0039 D4）：身体通道一动不动 | 观感比"整身片段"安静，容易被误判成"没反应" | 这是"删掉程序化姿态"后的唯一诚实实现；表情仍是官方 `shy` 差分投影。要身体反应就必须允许整身片段接管，那与 §5.3 冲突 |
+| **摸头片段 2.1s 长于 800ms 冷却**：冷却期内再点会重启片段（`playOnce` 重置） | 连续摸头看起来像"一直在缩着" | 符合 §4.1"被同类型新反应替换"；若要"冷却期内忽略"需要改 D-4，属于契约变更 |
+| **`pat` 的裁剪窗口（0.3–2.4s）与 `sit` 的（11.2–13.5s）都是本资产标定值** | 换模型/换动作集后可能剪到半个动作 | 换资产必须用 `tools/clip-preview/census.cjs` + `filmstrip.cjs` 重新标定（ADR 0039 D1） |
+| 嘴型"shy"帧（索引 4）曾是**资产相关标定** | ADR 0039 起摸头不再单独切这一帧，改为 `emotion=shy` 的官方差分；该常量已随 `pat-react.ts` 删除 | 若将来又要"只换嘴型不改眼型"，重新看图集选帧并写回本坑位 |
 | **口型的 8 级映射是未标定假设**：图集 8×8=64 帧没有语义标注，实现假定 `0..7` 是"闭口→逐步张口"，帧 0 一定闭嘴 | 换图集/换角色时帧序可能完全不同，嘴型会"跳帧"或不对应音素 | 映射只在 `shared/constants.ts`（`MOUTH_LEVELS`）与 `mouth-mapping.ts`；帧 0 被 `resetMouthFrame` 强制回闭嘴。实测本资产帧 7 是明显张口，截图可辨 |
-| `speech_ended` 会立刻 `resetMouthFrame()` | 若把"说完后的余韵"当成表现需求，会被这行抵消 | §5.2 口型通道最高优先级；宁可闭嘴也不要"说完张着嘴"。摸头 shy 帧若仍在，下一帧 `syncPatMouth` 会重新画回来 |
+| `speech_ended` 会立刻 `resetMouthFrame()` | 若把"说完后的余韵"当成表现需求，会被这行抵消 | §5.2 口型通道最高优先级；宁可闭嘴也不要"说完张着嘴"。摸头的 `shy` 表情由 `applyFacial` 的状态指纹重画，不依赖嘴型帧 |
 | **`capturePage()` 返回的是物理像素**（本机 844×1440），而诊断点位是 CSS px（422×720） | 自检像素差一开始全 0（裁到了左上角透明区）；肉眼截图明明有变化 | 自检按 `image.width / contentBounds.width` 缩放区域；任何截图比对都必须先算 DPR |
 | 44 段 clip 全部建 action（`mixer.clipAction`），只有 2 段在跑 | 初始化多一点开销与内存；无按次成本 | 这是 three 的常规做法，切片段时才需要 action 已存在；如后续片段数暴涨再评估懒加载 |
-| `dragging` / `patMouthActive` / `dragSwayGain` 是**内部标志位**，不是 §4.1 的状态名 | 读代码/日志时容易误以为新增了状态 | 只会出现在 render 内部；对外状态仍只有 `base/overlay/physics` 三个字段（§4.1 集合未变）。`reaction.kind` 里的 `head_patted` 是"触发来源"，不是状态名 |
+| `dragging` / `lastPatActive` / `dragPoseGain` 是**内部标志位**，不是 §4.1 的状态名 | 读代码/日志时容易误以为新增了状态 | 只会出现在 render 内部；对外状态仍只有 `base/overlay/physics` 三个字段（§4.1 集合未变）。`reaction.kind` 里的 `head_patted` 是"触发来源"，不是状态名 |
 
 ### TODO
 - [x] 资产审查（贴图/通道/Mask-Ramp/顶点色）：`tools/audit-glb-assets.mjs`（ADR 0037）
@@ -406,7 +421,8 @@
 - [x] 口型通道接口 + 静态闭嘴底图（8×8 图集标定）
 - [x] `model_ready` 上行 + `modelReady` 真实状态
 - [x] HFSM 三层壳（Base/Overlay/Physics）+ 自带动画接入 + 骨骼仲裁（ADR 0014）
-- [x] `head_patted` → `pat_react`（程序化、说话时 ≤0.4 权重）
+- [x] `head_patted` → 官方 `pat` 片段 + `emotion=shy` 投影（ADR 0039；程序化通道已删除）
+- [x] 拖拽 / 回弹与摸头严格互斥（HFSM 清 reaction + render 拒绝 + shell `patArmed`/`movedWindow`，ADR 0039 D5）
 - [x] 拖拽悬空姿态（`Carrier_Idle` + 抬升 + 摇摆）与松手回 Idle
 - [x] 拖拽抓取点分类 / 绕支点旋转 / 受迫单摆 / 松手惯性（ADR 0035）
 - [x] 落地冲击分级下蹲（`vDownMax` → impact → `scale.y` + 脊柱/膝辅助，ADR 0035 D4）
@@ -705,7 +721,7 @@
 
 | 日期 | 模块 | 摘要 | 契约版本 |
 |---|---|---|---|
-| 2026-11-02 | 全局 | **封版 `v1.1.0-visual-final`（M15 视觉完全体）**：视觉侧三件套槽位封闭 —— ① ADR 0037 全局光照 + 身体/头发 3 阶硬边 Toon（受光面 = 贴图原色，`ambient+directional=π`）；② ADR 0038 背面法描边（共享几何/骨骼、屏幕像素宽度 1.5 / 头发 0.8、深褐 `0x2a1b1a`、`smoothstep` 规避楔形黑块）；③ 面部与光环死守无光照（光环吃光实测变"脏塑料"，见 ADR 0038 D6）。**封版验收**：`npm test` 全绿（含 memory 25/25）、四套自检 **136 / 29 / 30 / 4** 全 exit 0、`tsc --noEmit` 0 错。**所有者拍板**：宽度与颜色不再调；"合并材质外壳消除头发叠线"明确不做（性价比低、易破坏模型，留在 TODO）；官方表情差分随缘。0 新依赖 / 0 新 pass / 0 按次计费调用 | 1.15.0 |---|
+| 2026-11-02 | 全局 | **封版 `v1.1.0-visual-final`（M15 视觉完全体）**：视觉侧三件套槽位封闭 —— ① ADR 0037 全局光照 + 身体/头发 3 阶硬边 Toon（受光面 = 贴图原色，`ambient+directional=π`）；② ADR 0038 背面法描边（共享几何/骨骼、屏幕像素宽度 1.5 / 头发 0.8、深褐 `0x2a1b1a`、`smoothstep` 规避楔形黑块）；③ 面部与光环死守无光照（光环吃光实测变"脏塑料"，见 ADR 0038 D6）。**封版验收**：`npm test` 全绿（含 memory 25/25）、四套自检 **136 / 29 / 30 / 4** 全 exit 0、`tsc --noEmit` 0 错。**所有者拍板**：宽度与颜色不再调；"合并材质外壳消除头发叠线"明确不做（性价比低、易破坏模型，留在 TODO）；官方表情差分随缘。0 新依赖 / 0 新 pass / 0 按次计费调用 | 1.15.0 |
 | 2026-11-02 | render、全局 | **背面法描边 + 光环定论（ADR 0038）**：① 新增 `outline.ts`：`applyOutline(mesh)` = 克隆同一几何（`SkinnedMesh.copy()` 共享 `Skeleton`）+ `ShaderMaterial{side:BackSide}` + 顶点里 `#include <skinning_*>` 后按视空间法线外扩；`OutlineSet` 负责装配/开关/诊断/销毁。**宽度按屏幕像素**（身体/脸 1.5、头发 0.8）——模型单位 0.003 在本资产等于 172px，已实测否掉。② 范围：Body/Hair/Face 描边；EyeMouth/Eyebrow/Halo/配件不描。③ 两个实测修正：`viewNormal.xy` **不能归一化**（否则正对镜头的面被噪声放大成楔形黑块），改 `smoothstep(0.02,0.30,len)`；头发卡片会叠线，单独降到 0.8px。④ **光环对照定论：保持 `MeshBasicMaterial`**（亮度 198.2→193.0、暗像素 13.2%→16.7%，观感变"脏塑料"），`setHaloToon` 只作诊断。⑤ 诊断：`RenderDiagnostics.outline`（含 `tracked/matrixDelta`）与 `render`（calls/triangles/frameMs）；`PET_OUTLINE_DIAG=1` / `PET_HALO_DIAG=1`，A/B 用 16×16 缩略图做姿态对齐。**实测**：draw call 7→10、帧时间 EMA 16.7→16.7ms、`matrixDelta=0`（不穿模不滞后）。契约 **1.15.0**（§7.3 描边规则表、§11 降级行）。单测 +6（outline）、`tsc` 0 错、主链路自检 **136/136**、输入条 29 / 语音 30 / 缺失模型 4 均 exit 0；0 新依赖 / 0 新 pass / 0 新 IPC / `RenderState` 未增删字段 | 1.15.0 |
 | 2026-11-02 | render、全局 | **资产审查 + 全局光照 / Toon（ADR 0037）**：① 新增只读工具 `tools/audit-glb-assets.mjs`（自带 PNG 解码、按通道统计、判定 Mask/Ramp、统计 `COLOR_0` 直方图并按骨骼归类）：实测 **8 张贴图全是 RGBA8 颜色图、10 个材质只有 baseColor 槽、无 Mask/Ramp、无第二套 UV**；`COLOR_0` 的 **RGB 是常量、alpha 才是数据**（8bit 量化值，`Eyebrow`/`EyeMouth` 恒为 0 → 绝不能接进 alphaTest）。② 新增 `toon-shading.ts`：主方向光（2.6，斜上方偏左前）+ 极低环境光（0.55），**`ambient+directional=π`** 让受光面等于贴图原色；代码生成 **3 阶** `DataTexture` 色阶（32×1 / NearestFilter / NoColorSpace，`dot≤0.12→0.58 / ≤0.38→0.80 / >0.38→1.00`）；只替换 `CH0335_Body` 与 `CH0335_Hair` 为 `MeshToonMaterial`（显式 `vertexColors:false`）。③ **面部死守**：`Face`/`EyeMouth`/`Eyebrow*` 正则双重排除，永不参与。④ **ADR 0036 的手部顶点色烘焙整体废止**（删 `skin-shading.ts` / 单测 / `setSkinBake` / `shadeSkin` / `setShading`），`dominantBoneNames`/`matchesSkinBone` 迁入 `material-diagnostics.ts`。⑤ 诊断 `RenderDiagnostics.skin` → `toon`；`window.diagnostics.setToon(bool)`；`PET_TOON_DIAG=1` 连拍 before/after 并取脸部统计最接近的一对。**A/B 实测**：外套近白 38.6%→30.6%、左手 35.1%→19.3%、全身亮度只降 4.2%（不灰）。契约 **1.14.0**（§7.3 着色规则表、§11 一行降级）。单测 +6（toon）/ −6（skin）、`tsc` 0 错、主链路自检 **131/131**、其余三套 exit 0；0 新依赖 / 0 新 IPC / 0 新事件 / `RenderState` 未增删字段 | 1.14.0 |
 | 2026-11-01 | render | **真机 bug：坐姿时头疯狂打转**（ADR 0029）。二分结论：不是视线（提交的 yaw/pitch 只有 ±0.2 rad）、不是 `HaloRoot` 挂载（GLB 层级里它与骨架平级、只写 position）、不是 `playHold` 重入（`time` 恒为 2.3s）、不是窗口抖动。根因是骨骼仲裁的基底判定依赖"骨值 = 我上次写的值"，而 three 的 `PropertyMixer.apply()` 在**停帧**后会跳过冗余写入 → 误判成"动画写了" → 每帧把偏移叠在上一帧结果上（实测 2.51 rad/s）。修法：`arbiter.capture()` 在 `mixer.update()` 前快照受控骨骼，`beginFrame()` 用"这中间变没变"判定；阈值 1e-8 → 1e-6；新增 `baseFrom`/`applied` 诊断与 `headQuat/headWorld/headBase` 字段。修后 1s 漂移 **0.000 rad**；新增单测 `bone-arbiter` 4 条、自检 +1 条（头骨不漂移），主链路 **119/119** | 1.9.0 |
@@ -735,3 +751,5 @@
 | 2026-11-01 | render、全局 | **编码事故与重建**（ADR 0027）：用 PowerShell `Get-Content/Set-Content` 临时改行，GBK 解码把 `render-module.ts` 变成乱码并吃掉换行（305 个语法错误，编码不可逆）。当时**没有 git**、`dist` 被 `rm -rf` 清空、无编辑器历史/卷影副本 → 只能重写。① 先建 git（`f653cd3` 事故基线、`8dc450a` 重建）；② 分三轮重写 `render-module.ts`（骨架与加载 / 动画视线交互 / 口型贴花）；③ 新增 ADR 0027（禁止 shell 文本往返、强制 git、破坏性实验走副本）；④ ADR 0026 补 **D7 官方线稿贴花层**（`face-decal.ts`：头骨下的深度测试平面，贴图由 `FX_TEX_CH0335_Img_Face_01.png` 按连通域裁出）。验证：`tsc` 0 错、单测 **272**（25 套件）全绿、自检 **97/97**（连跑两次，其中一次仅 shell 侧"冷却拦下"日志断言偶发，属既有 flaky） | 1.6.0 |
 | 2026-11-01 | render | **移除多余贴花，回归官方动画眨眼**（ADR 0026 D7 否决）：实测 `Cafe_Idle` 在 t≈2.5s 用**眼皮骨骼平移**（`bone_eye_D_L/R` 的 `translation.x` 0.000262→0.000435，0.3s 回落）完成眨眼。此前自建的「遮罩 + 线稿」贴花层多余且每帧写 `applyBlink(0)` 覆盖了动画——这是"看不见眨眼"的真正原因。① 删除 `render-module` 里的贴花接线、眨眼计时器、眼骨缩放、`PET_DECAL_DEBUG` 调试通道；② `face-decal.ts` 保留为储备，默认不创建、不加载贴图；`DECAL_FACE_FILES` 移出 `EXPRESSION_FILES` 白名单，任何代码都不再读取；③ 嘴型换用官方高清图集 `Character_Mouth_High-BgFqI_9W.png`（2048²/8×8=64 帧）；④ 表情嘴型改用图集帧，不再用 Canvas 图元；⑤ 自检 fixture 默认关闭（`PET_SELFTEST_FIXTURES=1` 才启用），截图=真机效果。**教训：先查动画，再做渲染；不要写动画拥有的骨骼** | 1.6.0 |
 | 2026-11-02 | shell、render、全局 | **拖拽生命感 + 吸附接近**（ADR 0034 / ADR 0035）：① 拖拽：渲染侧 `noteGrabPoint` 按骨骼最近点分类 head/body/foot（缺失退回掩膜 bbox），`drag-motion.ts` 受迫单摆（窗口 `screenX/Y` 两级 EMA 求加速度）+ 绕抓取点 `pivotCompensation` + 松手 θ/ω 衰减；落地按 `vDownMax` 分级做 `scale.y` + 脊柱/膝/臂下蹲，脚底不穿窗口。② 吸附：新增 `snap_approach_started`（契约 §6.3），`sitting` 扩展为"接近 + 落座"生命周期；`approach.ts` 纯函数（walk/leap、300–900ms），倒计时挂在既有 16ms `snap.tick`，`t>=1` 才 `commit` + `snap_applied`；只有拖拽能立即中断，其余解除延迟到到达。③ 坐姿：`snap_applied` 才 `playHold('sit')`，视线继续跟随；`snap_released` 按 clicked/command/window-gone/fullscreen 播惊跳。④ 骨骼标定：`window.diagnostics` + `PET_CALIBRATE=1` 13 张截图，确认 spine/neck pitch>0=低头、upperArm roll<0=抬手、thigh pitch<0=前抬、calf pitch>0=后摆；`ModelBones` 6→21 根。⑤ 落地标定：`PET_LANDING_CALIBRATE=1` 10px/300px 两张截图（impact 0.00/1.00，squash 0/0.078）。契约 **1.13.0**；单测全绿、四套自检 **127 / 29 / 30 / 4** 全 exit 0；`tsc` 0 错；0 新依赖 / 0 新定时器 / 0 新 IPC 通道 | 1.13.0 |
+| 2026-11-03 | shell、render、全局 | **摸头改官方片段 + 拖拽/摸头严格互斥**（ADR 0039）：① **全量普查 44 段动画**——新增 `tools/clip-preview/census.cjs`（按 0.2s 采样头/骨盆/双手/双脚世界坐标 + 头骨欧拉角，输出 `shots/census.json`）与 `inspect-census.cjs`（逐帧表格）、`list-clips.cjs`（只读 GLB 列出 44 段），并用 `filmstrip.cjs`（改为 `FILM_JOBS`/`FILM_CLIP` 环境变量驱动）目视复核。结论：`Cafe_Reaction` 3.2–6.4s 只有"缩下去"没有回正（剪到哪都停在含胸姿态）；`Victory_Start_interaction_01` 首帧是腾空翻滚过场；**唯一闭环**是 `Victory_Start_Random` 0.4–2.2s（站姿 → 缩身抱手低头 → 保持 → 抬头回正）。② `clip-bank.pat` 改绑 `CH0335_Victory_Start_Random` 0.3–2.4s，`Cafe_Reaction` 只留 `greet`。③ **删除 `pat-react.ts` + 其单测**（build.mjs / package.json 同步），render 里的摸头头部 pitch/roll、身体前倾、`'pat'` 嘴层归属全部移除——摸头不再有任何程序化姿态或 `scale`；`nod` 也从"整身压扁 6%"改为"头骨低头 0.26rad"。④ 表情改为 `effective emotion = shy`（官方差分），`MouthOwner` 收敛为 口型 > 表情 > 静态。⑤ **严格互斥三层**：HFSM 在 `dragStarted/dragReleased` 清 `reaction` 且 `dragged` 也拒绝 `head_patted`/`intent`；render 在 `drag_started` 先 `cancelOneShot()` 并拒绝 settling 期事件；shell 新增 `patArmed`（一次拖拽解除到下次 pointerdown）与 `movedWindow`（按下期间窗口被搬过就不判摸头、且不伪造拖拽）+ 轮询器沉降窗口丢弃。⑥ §5.3 三行改为"身体通道不动、只表情"。契约 **1.16.0**（§3.4 D-2/D-3、§4.4 `pat_react`、§5.3 三行、§7.3 摸头规则、§11 降级行）。验证：`tsc` 0 错、单测 **433**（含新增 6 条互斥用例，删除 `pat-react` 4 条）、四套自检 **140 / 29 / 30 / 4** 全 exit 0、截图 `window-pat.png`（缩身害羞）/`window-drag.png`（被拎起）；证据 `dist/selftest/evidence-{pat,drag}-adr0039.png` | 1.16.0 |
+| 2026-11-03 | shell、render、全局 | **头部判定换基准 + 落地收平**（ADR 0040）：① **排查打点**：shell 侧 `[drag-gesture] pointerdown/pointerup/emit head_patted?`、render 侧 `收到 head_patted + HFSM 状态`、`摸头片段回报（weight/paused/hold）`、`probe … boneY/radius/dist`、`回弹触地反跳 {vyBefore,vyAfter}`；新增 `tools/diag/log-shot.py` 把日志渲染成图（UTF-16LE 的 Tee 输出也能读）。② **根因 1**：`cmd:interactive.head` 用"掩膜 bbox 顶部 22%"，光环把 bbox 顶到 y≈90–120 → 头部带只有 **y≈120–275**（光环+发顶），脸在 **y≈340–420**，实测点脸 `blockedBy=head-not-in-band`、一轮运行 0 次触发。改为**头骨半径**（`0.125×720=90px`，圆心=头骨 CSS 位置），光环落在圆外，骨骼/掩膜缺失时退回 bbox 22%，都不可用才 `head=null`。③ **根因 2**：落地 `impact=(vDown−150)/1000` 用 settling 峰值 → 自由落体必然饱和（实测 1500–1716px/s）→ 每次拖拽压满 8%，再叠 `restitution 0.28` 的窗口反跳（948→−169、2137→−491），看起来就是"弹一下/被截断的摸头"。改为冲击只看 `drag_released.vy`、门槛 700、上限 3%、时长 220ms、恢复系数 0.15。④ 自检点位改"头骨 + 1%"，新增 3 条口径断言 + 3 条验收（点脸触发/点光环不触发/轻放不缩）+ 2 张落地帧截图。契约 **1.17.0**（R-10、D-1、`cmd:interactive`、§7.3 落地缓冲规则）。验证：单测 **433**、四套自检 **147 / 29 / 30 / 4** 全 exit 0、`tsc` 0 错 | 1.17.0 |

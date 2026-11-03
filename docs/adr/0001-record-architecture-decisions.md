@@ -118,3 +118,26 @@
 | 0015 | 本地 TTS 与 LLM 部署架构（Ollama + GPT-SoVITS）与语音打断 | 已接受 | orchestrator、voice、render、shell |
 | 0016 | 输入条的窗口装配、热键降级与关闭归属 | 已接受 | shell |
 | 0017 | TTS 权重与配置权威源（`tts_infer.yaml` 的 `custom` 段，凯伊 e10 + e18_s288） | 已接受 | voice、部署 |
+| 0018 | LLM 输出清洗、系统托盘与 `.env` 加载器 | 已接受 | 全局、shell、orchestrator |
+| 0019 | TTS 语种配置（日文参考音频，`prompt_lang`/`text_lang`） | 已接受 | voice、配置 |
+| 0020 | 记忆 schema 与关键词检索（FTS5 `trigram` + `LIKE` 降级） | 已接受 | memory、orchestrator |
+| 0021 | 字幕显示时机（`intent_resolved` 只登记、`speech_started` 显示） | 已接受 | shell、voice |
+| 0022 | 只讲日文的人格与语言硬约束 | 已接受 | orchestrator、voice |
+| 0023 | 官方片段接线：语义表、一次性演出与朝向约束 | 已接受 | render |
+| 0024 | 行走、回弹与窗口位移（单一 16ms 轮询器） | 已接受 | shell、render |
+| 0025 | 记忆保留：按条数淘汰、有界批量 | 已接受 | memory |
+| 0026 | 行走朝向与情绪的面部贴图合成（官方差分为唯一路线） | 已接受 | render |
+| 0027 | 禁止用 shell 做文本往返（编码事故复盘） | 已接受 | 流程 |
+| 0028 | 前台窗口吸附与 `sitting` | 已接受 | shell、render |
+| 0029 | 骨骼仲裁的基底判定（`capture()` + mixer 前后对比） | 已接受 | render |
+| 0030 | 在场感 `presence` 与提示词段 3.5「环境事实」 | 已接受 | orchestrator、memory |
+| 0031 | 主动话语（idle-drive）与打扰预算 | 已接受 | orchestrator |
+| 0032 | 前台应用类别、冷启动预热与托盘只读诊断 | 已接受 | orchestrator、presence、shell |
+| 0033 | 预热与主动性解耦（生命周期心跳 + `model_ready` 触发） | 已接受 | runtime、orchestrator |
+| 0034 | 吸附接近与 `sitting` 生命周期（walk/leap） | 已接受 | shell、render |
+| 0035 | 拖拽的抓取点、受迫单摆与分级落地 | 已接受 | render、shell |
+| 0036 | 平涂身体贴图的手部明暗烘焙 | 被替代（0037） | render |
+| 0037 | 全局光照与材质替换（3 阶 Toon，面部死守无光照） | 已接受 | render |
+| 0038 | 背面法描边与光环光照定论 | 已接受 | render |
+| 0039 | 摸头改官方片段；拖拽与摸头严格互斥 | 已接受 | shell、render |
+| 0040 | 头部区改由头骨半径判定；落地冲击改用松手速度并收平 | 已接受 | render、shell |

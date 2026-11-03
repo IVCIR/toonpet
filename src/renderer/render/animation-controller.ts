@@ -55,6 +55,10 @@ export interface OneShotStatus {
   name: string;
   time: number;
   duration: number;
+  /** `getEffectiveWeight()`：交叉淡入结束后应为 1（ADR 0039 排查用） */
+  weight: number;
+  paused: boolean;
+  enabled: boolean;
 }
 
 /**
@@ -301,6 +305,9 @@ export function createModelAnimations(
         time: holdAction.time,
         duration: clip.duration,
         done: holdAction.time >= clip.duration - 1e-3,
+        weight: holdAction.getEffectiveWeight(),
+        paused: holdAction.paused,
+        enabled: holdAction.enabled,
       };
     },
 
@@ -344,6 +351,9 @@ export function createModelAnimations(
         name: clip.name,
         time: oneShotAction.time,
         duration: clip.duration,
+        weight: oneShotAction.getEffectiveWeight(),
+        paused: oneShotAction.paused,
+        enabled: oneShotAction.enabled,
       };
     },
 

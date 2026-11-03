@@ -18,6 +18,8 @@ declare global {
     /** 内部：模型/骨骼/视线/呼吸/口型预留诊断，仅供自检与同页脚本（ADR 0009 D7.2） */
     petModel: {
       getDiagnostics(): ReturnType<RenderModule['getDiagnostics']>;
+      /** ADR 0039 排查：头部带几何（掩膜 bbox / 22% 下边界 / 头骨位置） */
+      headBandDiagnostics(): ReturnType<RenderModule['headBandDiagnostics']>;
     };
     /** 内部：语音播放侧诊断（包络电平/口型帧/AudioContext 状态；ADR 0015 D4） */
     petVoice: {

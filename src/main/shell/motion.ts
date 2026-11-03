@@ -103,6 +103,8 @@ export function createMotionController(deps: MotionDeps): MotionController {
   let kind: MotionKind = 'idle';
   let walk: WalkRuntime | null = null;
   let settle: SettleRuntime | null = null;
+  /** ADR 0039 排查：本次回弹里窗口自己反跳了几次（诊断用，不进状态） */
+  let settleBounces = 0;
   let lastTickAt = 0;
   let lastEnd: MotionDiagnostics['lastEnd'] = null;
 
@@ -135,7 +137,8 @@ export function createMotionController(deps: MotionDeps): MotionController {
     settle = null;
     kind = 'idle';
     lastEnd = { kind: 'settle', reason };
-    deps.logInfo('回弹结束（ADR 0024 D3）', { reason });
+    // bounces：窗口自己弹了几下（ADR 0024 D2 的恢复系数 0.28 允许一次轻弹）
+    deps.logInfo('回弹结束（ADR 0024 D3）', { reason, bounces: settleBounces });
     deps.emitMotionEnded('settle', reason);
   }
 
@@ -222,6 +225,7 @@ export function createMotionController(deps: MotionDeps): MotionController {
         maxX: area ? Math.max(area.x, area.x + area.width - bounds.width) : clamped.x,
       };
       kind = 'settling';
+      settleBounces = 0;
       deps.logInfo('开始回弹（D-6 / ADR 0024 D3）', {
         from: { x: bounds.x, y: bounds.y },
         velocity: { vx: Math.round(settle.state.vx), vy: Math.round(settle.state.vy) },
@@ -262,8 +266,20 @@ export function createMotionController(deps: MotionDeps): MotionController {
       }
 
       if (kind === 'settling' && settle) {
+        const previousVy = settle.state.vy;
         const result = stepSettle(settle.state, settle.groundY, SETTLE_CONFIG, dtSeconds);
         settle.state = result.state;
+        // ADR 0039 排查打点（只读）：窗口自己有没有"弹一下"——落地后 vy 由下翻转向上就算一次。
+        if (previousVy > 40 && result.state.vy < 0) {
+          settleBounces += 1;
+          deps.logInfo('回弹触地反跳（ADR 0024 D2 的恢复系数）', {
+            bounce: settleBounces,
+            vyBefore: Math.round(previousVy),
+            vyAfter: Math.round(result.state.vy),
+            y: Math.round(result.state.y),
+            groundY: Math.round(settle.groundY),
+          });
+        }
         const x = Math.min(settle.maxX, Math.max(settle.minX, Math.round(result.state.x)));
         const y = Math.round(result.state.y);
         deps.setPosition(x, y);

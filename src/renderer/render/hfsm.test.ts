@@ -124,15 +124,57 @@ test('回弹期间不接受新的动作意图与摸头（唯一例外是重新�
   assert.equal(hfsm.snapshot().physics, 'dragged', '重新拖拽仍然可以接管');
 });
 
-test('拖拽期间的声音与摸头仍可叠加（互不打断，§5.3）', () => {
+test('dragged 期间同样拒绝摸头与 intent（ADR 0039 D5 严格互斥）', () => {
+  const hfsm = make();
+  hfsm.dragStarted(0);
+  hfsm.headPatted(10);
+  assert.equal(hfsm.snapshot().reaction, null, 'dragged 期间摸头不得进入 reacting');
+  assert.equal(hfsm.intent(20, 'pat_react', 400), false, 'dragged 期间 pat_react 必须被拒');
+  assert.equal(hfsm.intent(30, 'nod', 400), false, 'dragged 期间普通 intent 也必须被拒');
+});
+
+test('drag_started / drag_released 清空在播的摸头反应（ADR 0039 D5）', () => {
+  const pat = make();
+  pat.headPatted(0);
+  assert.equal(pat.snapshot().overlay, 'reacting');
+  pat.dragStarted(100);
+  assert.equal(pat.snapshot().reaction, null, '拖拽开始的同一刻摸头反应必须消失');
+  assert.equal(pat.snapshot().overlay, null, 'Overlay 不得残留 reacting');
+
+  // 松手同理：不允许把反应从 dragged 带进 settling
+  const released = make();
+  released.snapApplied(0); // sitting 允许摸头
+  released.headPatted(10);
+  assert.equal(released.snapshot().reaction?.kind, 'head_patted');
+  released.dragReleased(20); // 直接松手（shell 侧的场景）
+  assert.equal(released.snapshot().reaction, null, 'settling 不得带摸头反应');
+});
+
+test('pat_react intent 不得重启或截短已在播的摸头反应（ADR 0039 D5）', () => {
+  const hfsm = make();
+  hfsm.headPatted(0, 2100);
+  assert.equal(hfsm.snapshot().reaction?.kind, 'head_patted');
+  assert.equal(hfsm.snapshot().reaction?.durationMs, 2100, '官方片段时长');
+
+  assert.equal(hfsm.intent(20, 'pat_react', 900), false, '不得替换已在播的反应');
+  assert.equal(hfsm.snapshot().reaction?.kind, 'head_patted', '仍是 head_patted 那条');
+  assert.equal(hfsm.snapshot().reaction?.durationMs, 2100, '时长没有被截短');
+
+  // 没有摸头时，pat_react 仍然是一条合法入口（§4.4）
+  const fresh = make();
+  assert.equal(fresh.intent(0, 'pat_react', 900), true);
+  assert.equal(fresh.snapshot().reaction?.intent, 'pat_react');
+});
+
+test('拖拽期间：声音继续，摸头被拒（ADR 0039 D5）', () => {
   const hfsm = make();
   hfsm.speechStarted(0, 'u-3');
   hfsm.dragStarted(10);
   hfsm.headPatted(20);
   const snapshot = hfsm.snapshot();
   assert.equal(snapshot.physics, 'dragged');
-  assert.equal(snapshot.overlay, 'speaking');
-  assert.equal(snapshot.reaction?.kind, 'head_patted');
+  assert.equal(snapshot.overlay, 'speaking', '说话不受拖拽影响');
+  assert.equal(snapshot.reaction, null, '拖拽期间不得叠加摸头反应');
 });
 
 test('行走调度：idle 满 20–40s 才触发，且只触发一次（§4.1）', () => {

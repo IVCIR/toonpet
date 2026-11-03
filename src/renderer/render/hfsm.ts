@@ -7,6 +7,8 @@
  * - Physics：`dragged`（指针拖拽）/ `settling`（松手回弹）/ `sitting`（吸附在别的窗口边缘）。
  *   `settling` 期间不接受新的动作意图与摸头（用户要求"回弹期间不被事件打断"，
  *   唯一例外是重新拖拽——那是 `drag_started` 事件，优先级更高）。
+ *   ADR 0039 D5 起 `dragged` 与 `settling` **一样**拒绝摸头/意图，并且进入 `dragged`
+ *   或 `settling` 时**清空 `reaction`**：拖拽开始的那一刻，任何在播的摸头反应都必须消失。
  *   `sitting` 期间不做行走调度（她坐在那里，不会乱跑），只接受拖拽打断。
  *
  * 纯逻辑：不引用 three、不碰 DOM、不读时钟（时间由调用方传入），可脱离 WebGL 单测。
@@ -39,6 +41,17 @@ export interface HfsmReaction {
   durationMs: number;
 }
 
+/**
+ * 这条 reaction 是不是"摸头"（事件 `head_patted` 或 intent `pat_react`）。
+ *
+ * ADR 0039 D5 用它做两件事：① 编排层伴随台词的 `pat_react` 不得重启/截短已在播的
+ * 摸头反应；② 渲染侧据此决定"身体通道要不要接管"（§5.3 的表）。
+ */
+export function isPatReaction(reaction: HfsmReaction | null): boolean {
+  if (!reaction) return false;
+  return reaction.kind === 'head_patted' || reaction.intent === 'pat_react';
+}
+
 /** 一次行走计划：方向 + 期望距离（px）。实际距离由 shell 按工作区边界钳制。 */
 export interface WalkPlan {
   direction: 'left' | 'right';
@@ -66,7 +79,7 @@ export interface HfsmTickResult {
 }
 
 export interface HfsmOptions {
-  /** `head_patted` 的一次性反应时长（与 pat-react 同源） */
+  /** `head_patted` 没有可用片段时的表情窗口（毫秒，ADR 0039 D4） */
   patDurationMs: number;
   /** 行走调度参数（缺省取 §4.1 的 20–40s / 100–300px） */
   walk?: Partial<WalkScheduleOptions>;
@@ -162,8 +175,8 @@ export function createHfsm(options: HfsmOptions): Hfsm {
     },
 
     headPatted(now: number, durationMs?: number): void {
-      // 回弹期间不接受新事件（用户要求）；重新拖拽会先走 dragStarted
-      if (physics === 'settling') return;
+      // ADR 0039 D5：拖拽与回弹期间一律不建反应（严格互斥；`pressed` 阶段仍可摸头）
+      if (physics === 'dragged' || physics === 'settling') return;
       startReaction(
         now,
         'head_patted',
@@ -174,8 +187,11 @@ export function createHfsm(options: HfsmOptions): Hfsm {
 
     intent(now: number, intent: Intent, durationMs: number): boolean {
       if (!isReactingIntent(intent)) return false;
-      // 回弹期间不接受新的动作意图（同上）
-      if (physics === 'settling') return false;
+      // ADR 0039 D5：同上（回弹期间不得被 intent 打断，已经是既有规则）
+      if (physics === 'dragged' || physics === 'settling') return false;
+      // ADR 0039 D5：摸头反应已经在播时，编排层那条伴随台词的 `pat_react`
+      // 不得重启或截短它（否则官方片段会被切成 1.1s 的表情窗口）
+      if (intent === 'pat_react' && isPatReaction(reaction)) return false;
       startReaction(now, 'intent', intent, durationMs);
       return true;
     },
@@ -183,6 +199,8 @@ export function createHfsm(options: HfsmOptions): Hfsm {
     dragStarted(_now: number): void {
       // H-4：只有事件可以进 dragged
       physics = 'dragged';
+      // ADR 0039 D5：拖拽立刻清掉在播的摸头（reaction；官方片段由 render 一起取消）
+      reaction = null;
       // §4.1：`walking` 的退出条件之一就是被拖拽打断
       if (base === 'walking') base = 'idle';
       nextWalkAt = null;
@@ -191,6 +209,8 @@ export function createHfsm(options: HfsmOptions): Hfsm {
     dragReleased(_now: number): void {
       // D-6：松手先进入回弹（settling），回弹结束才整层退出（§5.1）
       physics = 'settling';
+      // ADR 0039 D5：松手不得把任何摸头反应带进 settling（"拖完还在缩着"的根因之一）
+      reaction = null;
     },
 
     snapApproaching(_now: number): void {
