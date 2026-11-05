@@ -94,7 +94,29 @@ export const ENVELOPE_ATTACK = 0.55; // level 上升的平滑系数
 export const ENVELOPE_RELEASE = 0.3; // level 下降的平滑系数
 export const MOUTH_LEVELS = 8; // 8 级张口度 → 图集帧 0..7
 export const MOUTH_UPDATE_MIN_INTERVAL_MS = 33; // 嘴部重绘 ≤30Hz（ADR 0010 成本项）
-export const MOUTH_FRAME_CLOSED = 0; // 闭嘴帧
+/**
+ * "闭嘴"在**官方嘴型图集**里的帧号（ADR 0046 D3.2：7 → **0**）。
+ *
+ * 逐帧目视复核（`Character_Mouth_High-BgFqI_9W.png` 8×8）：
+ * `0` 平直细线（抿嘴，最像"闭嘴"）/ `7` 上扬小弧（微笑）/ `8` 下垂弧（不满）/
+ * `14` 小椭圆（微张）/ `6` 扁小椭圆（微张）/ `2` 宽张（白齿）/ `1`/`4`/`9` 张口。
+ * 上一版用 7：弧线在"情绪嘴型"的尺寸下会被看成一个小圆（"常驻微张"），
+ * 现在统一用 **0**，任何人一眼都能看出是闭着的。
+ */
+export const MOUTH_FRAME_CLOSED = 0;
+/**
+ * 口型的**四档元音**（ADR 0045 D4.2）：闭 → 微张 → 中张 → 大张。
+ * 用固定 4 档而不是 `round(level·7)` 的连续量化，因为 8 级在稳定电平下只会停在
+ * 同一帧（真机表现："说话时永远只有一张嘴"）。
+ */
+export const MOUTH_VISEME_FRAMES = [MOUTH_FRAME_CLOSED, 6, 1, 2] as const;
+/** 同一档位内轮换用的"大张口"备选帧（与 2 交替，模拟不同元音） */
+export const MOUTH_VISEME_WIDE_ALTERNATE = 9;
+/**
+ * 档内轮换的槽长（ms）：每 180ms 在"同档的另一个张口帧"之间换一次。
+ * 太快（<100ms）会闪，太慢（>300ms）又回到"定格"。
+ */
+export const MOUTH_VISEME_SLOT_MS = 180;
 
 // --- 字幕气泡（契约 §3.2 R-1、§2 shell；ADR 0015 D3、ADR 0021） ---
 export const SUBTITLE_HOLD_MS = 6000; // 无语音可对齐时的停留时长
@@ -309,6 +331,10 @@ export const DRAG_RELEASE_POSE_FADE_MS = 420;
  * - damping：角速度阻尼（1/s）；越小越"甩"；
  * - angleLimit：根骨骼摆角上限（rad），同时受窗口尺寸约束；
  * - struggleHz/struggleRad：抓脚时叠的高频挣扎。
+ *
+ * **ADR 0041 D1：抓取带只影响这套物理参数，不再决定播哪段官方片段。**
+ * 原来的 `liftPx`（整身抬升 4/12/8px）属于"程序化根位移"，已删除：
+ * 悬空观感由官方片段 `Formation_Pickup` 自己的姿态给出。
  */
 export const DRAG_PENDULUM = {
   head: {
@@ -317,8 +343,6 @@ export const DRAG_PENDULUM = {
     angleLimitRad: 0.35,
     struggleHz: 0,
     struggleRad: 0,
-    /** "被拎起"的整身抬升（px）；抓头时只轻抬，靠支点旋转表现下垂 */
-    liftPx: 4,
   },
   body: {
     lengthPx: 230,
@@ -326,7 +350,6 @@ export const DRAG_PENDULUM = {
     angleLimitRad: 0.32,
     struggleHz: 0,
     struggleRad: 0,
-    liftPx: 12,
   },
   foot: {
     lengthPx: 130,
@@ -334,7 +357,6 @@ export const DRAG_PENDULUM = {
     angleLimitRad: 0.25,
     struggleHz: 2.5,
     struggleRad: 0.045,
-    liftPx: 8,
   },
 } as const;
 
@@ -342,6 +364,150 @@ export const DRAG_PENDULUM = {
 export const DRAG_FOOT_KICK_MIN_INTERVAL_MS = 800;
 export const DRAG_FOOT_KICK_MAX_INTERVAL_MS = 1400;
 export const DRAG_FOOT_KICK_DURATION_MS = 180;
+
+// --- 待机小动作（ADR 0041 D4；ADR 0045 起**只剩官方片段**） ---
+/**
+ * 空闲时"偶尔做一个有趣的小动作"的间隔（ms）。
+ *
+ * 与待机姿态轮换（22–40s 换一个循环姿势）是两件事：轮换换的是**底噪**，
+ * 这里是一次性的小演出。
+ *
+ * ADR 0045 D1：**原地转圈已删除**。真机反馈"3D 角色原地平移转圈像陀螺，非常出戏"。
+ * 现在只剩官方片段 `fidget.shy`（`Cafe_Reaction` 3.2–4.9s 的掩面缩身）；
+ * 片段缺失时**什么都不做**（不再回退到程序化动作）。
+ */
+export const IDLE_FIDGET_MIN_MS = 45_000;
+export const IDLE_FIDGET_MAX_MS = 95_000;
+
+// --- 坐姿活体微动（ADR 0044） ---
+/**
+ * **注意：这里是坐姿所有"活感"的唯一出处。**
+ *
+ * 上一版把坐姿片段循环 0.42s 来制造动感，结果读作"抽搐"（ADR 0043 D2 被本轮否决）。
+ * 现在的分工：官方片段**停帧**提供姿态（骨架基线），所有运动都由本组参数驱动的
+ * 程序化微动给出 —— 呼吸、自主张望、眨眼、悬空晃腿。
+ */
+
+/** 呼吸周期（ms）：3–4 秒，一定要慢；低于 2.5s 会读成"喘" */
+export const SIT_BREATH_PERIOD_MS = 3600;
+/** 整体高低浮动（px，峰峰值的一半）：**≤1px**，再大就会和"落地缓冲"混在一起 */
+export const SIT_BREATH_FLOAT_PX = 0.9;
+/** 胸腔/脊柱的呼吸旋转（rad）：spine + spine1 同向，neck 反向一点点（抬头感） */
+export const SIT_BREATH_SPINE_RAD = 0.006;
+export const SIT_BREATH_SPINE1_RAD = 0.004;
+export const SIT_BREATH_NECK_RAD = -0.0025;
+/**
+ * 肩膀的呼吸起伏（rad，ADR 0045 D2.3）：锁骨 ±0.02、上臂同幅但相位略领先。
+ *
+ * 为什么需要：停帧之后只有脊柱在动，肩线完全不动 → 上半身像块板子。
+ * 0.02rad ≈ 1.1°，是"看得到但说不出"的量级；再大就会读成"耸肩"。
+ */
+export const SIT_BREATH_SHOULDER_RAD = 0.02;
+
+/**
+ * 自主张望：一次注视保持多久（ms，含随机区间）。
+ * ADR 0045 D2.2：3–6s → **2.2–4.2s**，换得更勤才有"东张西望"的活物感。
+ */
+export const SIT_GAZE_HOLD_MIN_MS = 2200;
+export const SIT_GAZE_HOLD_MAX_MS = 4200;
+/**
+ * 新目标的范围（rad）。
+ *
+ * ADR 0045 D2.2：**偏向抬头**。她坐的那一帧（14.5–14.7s）自带低头，程序化张望是叠在
+ * 这个低头之上的，所以"平视 + 略微抬头"才能抵消掉；全部给正俯角只会让她继续看地。
+ * 这里的 pitch 与 `BoneArbiter` 同一口径（**正 = 低头**），所以抬头用负值。
+ */
+export const SIT_GAZE_YAW_RAD = 0.36;
+/** 抬头的幅度区间（rad，负值方向）：3.4°–12.6° */
+export const SIT_GAZE_UP_MIN_RAD = 0.06;
+export const SIT_GAZE_UP_MAX_RAD = 0.22;
+/** 偶尔往下瞄一眼（rad，正值方向），幅度要明显小于抬头 */
+export const SIT_GAZE_DOWN_MAX_RAD = 0.06;
+/** 选"抬头"而不是"往下"的概率（0..1）：抬头占多数 */
+export const SIT_GAZE_UP_CHANCE = 0.72;
+/**
+ * 眼球相对头部的额外幅度（与 gaze.ts 同一口径）。
+ * ADR 0046 D1：坐姿会把眼球基底重置为**绑定姿态**（不再带着片段的"向下看"），
+ * 再叠 `gaze × 这个系数` —— 眼睛跟着头一起转，不再死盯地面。
+ */
+export const SIT_GAZE_EYE_EXTRA = 0.35;
+/**
+ * 张望的过渡时长（ms，ADR 0045 D2.2）：每次换方向用一个 `easeInOutCubic` 走完，
+ * 比指数阻尼"干脆"。220–420ms ≈ 一次自然的转头。
+ */
+export const SIT_GAZE_MOVE_MIN_MS = 220;
+export const SIT_GAZE_MOVE_MAX_MS = 420;
+/**
+ * 已废弃（ADR 0045 D2.2 起改用固定时长的 easeInOutCubic）：
+ * 保留常量只为不破坏旧诊断读数，运行时不再使用。
+ */
+export const SIT_GAZE_SMOOTH_RATE = 3.2;
+
+/**
+ * 坐姿的**微侧身**（rad，绕世界 Y，ADR 0046 D3.1）。
+ *
+ * 正面 0° 死板地对着镜头，配合"头部完全回正"会显得像证件照；身体先侧 8.6°，
+ * 头再由张望带回来，才有"坐在窗沿上偏头看人"的活物感。
+ *
+ * 加在 `animationRoot.rotation.y` 上、按 `sitGain` 淡入淡出；**头部基准要把它扣掉**
+ * （见 `captureSitHeadLevel`），否则头部补偿会把侧身也一起转回去（脖子拧成 90°）。
+ */
+export const SIT_BODY_YAW_RAD = 0.15;
+
+/**
+ * 坐姿头部的**人工微调**（rad，正 = 低头）。ADR 0048 D2。
+ *
+ * 这个数**不是算出来的**：坐姿把上半身骨骼对齐到站立姿态之后，用键盘 ↑/↓ 现场微调，
+ * 直到特写里"肉眼看着她是在看镜头"，再把那个值抄到这里。
+ *
+ * 0 = 完全照搬站立姿态（不额外低头也不抬头）。
+ */
+export const SIT_HEAD_TUNE_RAD = 0;
+
+// 停帧状态**不再眨眼**（ADR 0046 D2）：ADR 0044 D4 的 `bone_eye_D_L/R.translation.x`
+// 手写位移已整套删除 —— 停帧时没有动画混合与联动，眼皮子骨只会平移不会转，
+// 真机表现是"下眼皮被硬拉上去"（翻白眼）。坐姿的灵动感改由呼吸 + 张望承担。
+
+/**
+ * 悬空晃腿（ADR 0044 D5；幅度/频率/不对称按 ADR 0045 D3 调整）。
+ *
+ * - 角速度 2 → **2.6 rad/s**（一个来回 ≈ 2.4s，比原来快一点）；
+ * - 大腿 0.08 → **0.17 rad**（≈9.7°），小腿跟随 = 大腿 × 0.8（0.136rad）——
+ *   真机上"小腿不跟"会让整条腿像根棍子，膝盖必须折得比上一版明显；
+ * - 包络用 `lift^k`：顶部变平 → 抬到位会"停一下"再放下，不是纯余弦的匀速摆动；
+ * - **左右不对称**（`RATE_SKEW` / `AMP_SKEW_R` / 左右不同的 `LIFT_POWER`）：
+ *   完全对称 + 严格反相读起来就是节拍器。让左腿快 5%、抬得高 11%，
+ *   两条腿的相位会缓慢漂移，几秒内看不出规律，但永远不会"同时落地"。
+ */
+export const SIT_LEG_SWING_RAD_PER_SEC = 2.6;
+export const SIT_LEG_THIGH_RAD = 0.17;
+/** 小腿弧度（rad）：必须与大腿同步（= 大腿 × SIT_LEG_CALF_RATIO） */
+export const SIT_LEG_CALF_RATIO = 0.8;
+export const SIT_LEG_CALF_RAD = SIT_LEG_THIGH_RAD * SIT_LEG_CALF_RATIO;
+export const SIT_LEG_PHASE_RAD = Math.PI;
+/**
+ * 抬腿包络的幂次（ADR 0045 D3）：`lift = (0.5 - 0.5cos)^k`。
+ * k < 1 → 顶部更平（"抬起来停一下"）、上升/回落更陡；k = 1 就是纯余弦。
+ * 左右取不同值（0.66 / 0.82）：同一条曲线上"左腿更快到顶、右腿更慢放下"，
+ * 这是**不对称**里最容易被眼睛读出来的一项。
+ */
+export const SIT_LEG_LIFT_POWER_L = 0.66;
+export const SIT_LEG_LIFT_POWER_R = 0.82;
+/** 左右摆动速度差（比例）：左 = 基准 × (1+skew)、右 = 基准 × (1-skew) */
+export const SIT_LEG_RATE_SKEW = 0.05;
+/** 右腿幅度相对左腿的比例（左腿是"主腿"，抬得高一点） */
+export const SIT_LEG_AMP_SKEW_R = 0.9;
+/**
+ * 小腿跟随的相位滞后（rad）：膝盖比大腿**晚一点**折起来。
+ * 0.32rad ≈ 周期的 5%（约 70ms）——足以去掉"大腿小腿焊死"的刚体感，
+ * 又不会让脚在低点甩出去（小腿只往"折"的方向走，脚永远不会低于静止姿态）。
+ */
+export const SIT_LEG_CALF_LAG_RAD = 0.32;
+/** 晃腿的开启/停止包络（ms）：从 0 平滑升到 1，不允许"啪"地开始晃 */
+export const SIT_LEG_RAMP_MS = 600;
+
+/** 整套坐姿微动的总包络（ms）：落座后淡入、解除时淡出，避免切换瞬间跳变 */
+export const SIT_MOTION_RAMP_MS = 500;
 
 // --- 落地冲击（契约 §5.3、D-6；ADR 0035 D4；参数与口径改见 ADR 0040 D3） ---
 /**
@@ -371,6 +537,33 @@ export const STARTLE_SURPRISED_MS = 400;
 export const STARTLE_CLICKED_MS = 120;
 export const STARTLE_COMMAND_MS = 260;
 export const STARTLE_LOST_MS = 320;
+
+// --- 坐下的过渡与解除下落（ADR 0042） ---
+/**
+ * "从站到坐"的过渡时长（ms）：官方坐姿片段是瞬间进入坐姿的，直接交叉淡入会读成
+ * "融化成坐姿"。这 240ms 里额外叠一个**半蹲**（身体先略高于座面、再落到座面，
+ * 同时大腿前弯、脊柱微前倾），眼睛看到的是"她屈膝坐下去了"。
+ */
+export const SIT_LOWER_MS = 240;
+/** 半蹲起点的"悬空高度"（px）：从座面上方这么多开始落下 */
+export const SIT_LOWER_LIFT_PX = 14;
+/** 半蹲时额外的膝/髋弯曲（rad）与躯干前倾（rad），在 SIT_LOWER_MS 内回到 0 */
+export const SIT_LOWER_THIGH_RAD = 0.22;
+export const SIT_LOWER_LEAN_RAD = 0.05;
+/**
+ * 解除吸附时"从窗沿落回地面"的冲击分档（px/s，喂给落地缓冲的 impact 口径）。
+ * 窗口消失/全屏时她脚下没有东西，必须落到工作区地面线：shell 用回弹弹簧下落，
+ * render 按这个名义竖直速度算冲击（`motion_ended{settle}` 的载荷里没有速度）。
+ */
+export const SNAP_RELEASE_FALL_VY_PX_PER_SEC = 620;
+/** 低于这个离地高度就不必下落（她已经在地面线附近），直接站着换姿势 */
+export const SNAP_RELEASE_FALL_MIN_PX = 48;
+/**
+ * 吸附跟随的"追赶"节流（ms）：目标窗口正在移动时，每个 16ms tick 都重算位置，
+ * 目标停下后 `SNAP_FOLLOW_SETTLE_MS` 再退回常规节流（默认 120ms）。
+ */
+export const SNAP_FOLLOW_CATCHUP_INTERVAL_MS = 16;
+export const SNAP_FOLLOW_SETTLE_MS = 220;
 
 // --- 背面法描边（ADR 0038） ---
 /**

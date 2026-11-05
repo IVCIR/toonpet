@@ -13,6 +13,8 @@ import { app, globalShortcut, ipcMain, screen } from 'electron';
 import type { BrowserWindow, IpcMainEvent } from 'electron';
 import path from 'node:path';
 import {
+  SNAP_RELEASE_FALL_MIN_PX,
+  SNAP_RELEASE_FALL_VY_PX_PER_SEC,
   TRAY_STATS_REFRESH_MS,
   WINDOW_HEIGHT_PX,
   WINDOW_WIDTH_PX,
@@ -20,6 +22,8 @@ import {
 import { isEventName } from '../../shared/events';
 import type { BroadcastEvent, EventName, EventPayloads, ModelReadyPayload } from '../../shared/events';
 import { computeWindowSize } from '../../shared/model-frame';
+import { groundYFor } from '../../shared/motion';
+import { intersectionArea } from '../../shared/geometry';
 import type { Rect } from '../../shared/geometry';
 import { IPC_CHANNELS } from '../../shared/ipc';
 import type { PointerFact, ProbeResponse, WalkCommand } from '../../shared/ipc';
@@ -662,7 +666,15 @@ function startPointerPoller(window: BrowserWindow): void {
       isBusy: () => motion.kind !== 'idle' || dragging,
       emitApproach: (payload) => appBus.emit('snap_approach_started', payload),
       emitApplied: (payload) => appBus.emit('snap_applied', payload),
-      emitReleased: (payload) => appBus.emit('snap_released', payload),
+      emitReleased: (payload) => {
+        appBus.emit('snap_released', payload);
+        // ADR 0042 D4：窗沿消失/变全屏 → 她脚下没东西了，必须落回桌面。
+        // 只在"窗户消失"两类原因下落（clicked/command/dragged 时目标窗口还在，站在边缘上是合法的），
+        // 并且只在离地面还有一段高度时才落（否则等于一次无意义的回弹）。
+        if (payload.reason === 'window-gone' || payload.reason === 'fullscreen') {
+          dropToGroundAfterRelease(payload.reason);
+        }
+      },
       notify: notifyUser,
       logInfo: (message, data) => logInfo('shell', message, data),
       logWarn: (message, data) => logWarn('shell', message, data),
@@ -670,6 +682,57 @@ function startPointerPoller(window: BrowserWindow): void {
     { ...snapConfig, mode: effectiveMode },
   );
   snapController = snap;
+
+  /**
+   * ADR 0042 D4：吸附解除后"从窗沿落回桌面"。
+   *
+   * 她坐在别的窗口**上边缘**时，脚下踩的是那个窗口；窗口被关掉或变成全屏之后，
+   * 原来那条边缘线就不存在了，必须落回工作区地面线。这里复用回弹弹簧
+   * （`motion.startSettle`，同一 16ms 轮询器、同一 `settling` 语义），
+   * **不新增状态、不新增定时器、不新增 IPC**；render 侧由 `snap_released` 已经播了惊跳，
+   * `motion_ended{settle}` 到达时按名义竖直速度补一次落地缓冲。
+   */
+  function dropToGroundAfterRelease(reason: string): void {
+    if (motion.kind !== 'idle') {
+      logInfo('shell', '解除吸附后不落下（位移正忙，由当前位移收尾）', { reason, kind: motion.kind });
+      return;
+    }
+    const bounds = mainWindow?.getContentBounds();
+    if (!bounds) return;
+    const areas = getAllWorkAreas();
+    let area: Rect | null = null;
+    let bestArea = 0;
+    for (const candidate of areas) {
+      const overlap = intersectionArea(bounds, candidate);
+      if (overlap >= bestArea) {
+        bestArea = overlap;
+        area = candidate;
+      }
+    }
+    if (!area) {
+      logWarn('shell', '解除吸附后找不到工作区，跳过下落', { reason });
+      return;
+    }
+    const groundY = groundYFor(area, bounds.height);
+    const distancePx = groundY - bounds.y;
+    if (distancePx <= SNAP_RELEASE_FALL_MIN_PX) {
+      logInfo('shell', '解除吸附后已在地面线附近，不需要下落', {
+        reason,
+        y: bounds.y,
+        groundY,
+        distancePx: Math.round(distancePx),
+      });
+      return;
+    }
+    logInfo('shell', '解除吸附 → 从窗沿落回桌面（ADR 0042 D4）', {
+      reason,
+      from: bounds.y,
+      groundY,
+      distancePx: Math.round(distancePx),
+      vy: SNAP_RELEASE_FALL_VY_PX_PER_SEC,
+    });
+    motion.startSettle({ vx: 0, vy: SNAP_RELEASE_FALL_VY_PX_PER_SEC });
+  }
 
   const poller = createPointerPoller({
     getWindow: () => mainWindow,

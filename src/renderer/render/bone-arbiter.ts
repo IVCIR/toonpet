@@ -1,13 +1,18 @@
 /**
- * 骨骼仲裁器（ADR 0014 D1/D2）。
+ * 骨骼仲裁器（ADR 0014 D1/D2；ADR 0046 D1 起支持**基底覆写**）。
  *
  * 每帧的受控骨骼只允许被写一次，写的内容是：
  *
- *     final = rollQ · pitchQ · yawQ · animatedLocal
+ *     final = rollQ · pitchQ · yawQ · baseLocal
  *
- * 其中 `animatedLocal` 是 `AnimationMixer` 本帧写出的本地旋转（或上一帧的原样），
- * 三个 offset 由视线通道、反应通道以**加法**方式提交（父空间、绕世界轴，
- * 避免依赖 3ds Max / Blender 导出的局部轴朝向）。
+ * 其中 `baseLocal` 默认是 `AnimationMixer` 本帧写出的本地值（或上一帧的原样），
+ * 偏移由视线通道、坐姿微动以**加法**方式提交（父空间、绕世界轴，避免依赖
+ * 3ds Max / Blender 导出的局部轴朝向）。
+ *
+ * **基底覆写**（ADR 0046 D1）：坐姿停帧时官方片段把眼球转成"向下看"，而停帧后
+ * Mixer 不再重写它。眼球需要回到"绑定姿态"这个基底，再叠张望；`overrideBase()`
+ * 就是给某根骨骼换一个固定基底。只影响旋转，不碰位置（**位置通道已删除**：
+ * ADR 0044 D4 用眼皮平移做眨眼，真机表现为"翻白眼"，见 ADR 0046 D2）。
  *
  * 为什么需要"写回检测/还原"：three 的 AnimationMixer 没有骨骼级 mask，
  * 我们无法在写之前知道本帧哪些骨骼被动画驱动。若每帧都直接乘上去，
@@ -36,6 +41,8 @@ export interface BoneArbitrationState {
   baseFrom: 'mixer' | 'cache' | null;
   /** 上一帧我们写出的四元数（[x,y,z,w]，诊断用） */
   applied: [number, number, number, number];
+  /** 本帧是否用了基底覆写（ADR 0046 D1：眼球） */
+  overridden: boolean;
 }
 
 /** 叠加偏移的接收端（视线、反应通道只依赖这个窄接口）。 */
@@ -43,11 +50,9 @@ export interface BoneOffsetSink {
   add(bone: THREE.Bone, yaw: number, pitch: number, roll?: number): void;
 }
 
-export interface BoneArbiter {
+export interface BoneArbiter extends BoneOffsetSink {
   /** 登记一根受控骨骼（幂等）。 */
   register(bone: THREE.Bone): void;
-  /** 提交本帧的叠加偏移（弧度，父空间绕世界轴）。同帧多次调用会累加。 */
-  add(bone: THREE.Bone, yaw: number, pitch: number, roll?: number): void;
   /**
    * 渲染循环第 0 步（**必须在 `mixer.update()` 之前**）：记下每根受控骨骼当前的
    * 本地四元数。第 2 步的 `beginFrame()` 用"这中间有没有变化"判定动画是否重写了该骨骼。
@@ -57,6 +62,23 @@ export interface BoneArbiter {
   beginFrame(): void;
   /** 渲染循环第 5 步：写回最终四元数（每根骨骼只写一次）。 */
   endFrame(): void;
+  /**
+   * 读取某根骨骼**本帧的动画基底**（本地四元数；未登记返回 null）。
+   *
+   * ADR 0045 D2.1：坐姿头部基准要在"Mixer 已经不写这根骨"之后量一次片段自带的姿态。
+   * 直接读 `bone.quaternion` 不行——停帧时它还是我们上一帧写出的**最终值**（含张望），
+   * 而这里返回的是 `beginFrame()` 判定的动画基底，两种情况下都干净。
+   *
+   * **只读**：返回的是仲裁器内部对象，调用方不得修改（需要保留就 `clone()`）。
+   */
+  animationBase(bone: THREE.Bone): THREE.Quaternion | null;
+  /**
+   * 覆写某根骨骼的**旋转基底**（ADR 0046 D1：坐姿眼球回到绑定姿态）。
+   *
+   * 传 `null` = 取消覆写、回到动画基底。覆写只影响 `endFrame()` 的合成起点，
+   * 不改变 `beginFrame()` 的"mixer 有没有重写"判定。
+   */
+  overrideBase(bone: THREE.Bone, quaternion: THREE.Quaternion | null): void;
   /** 释放：把骨骼恢复到最近一次动画基底。 */
   reset(): void;
   snapshot(): BoneArbitrationState[];
@@ -81,6 +103,8 @@ interface Entry {
   yaw: number;
   pitch: number;
   roll: number;
+  /** 基底覆写（ADR 0046 D1：坐姿眼球回到绑定姿态）；null = 用动画基底 */
+  overrideBase: THREE.Quaternion | null;
 }
 
 const WORLD_X = new THREE.Vector3(1, 0, 0);
@@ -125,6 +149,7 @@ export function createBoneArbiter(): BoneArbiter {
         yaw: 0,
         pitch: 0,
         roll: 0,
+        overrideBase: null,
       };
       byBone.set(bone, entry);
       entries.push(entry);
@@ -180,6 +205,7 @@ export function createBoneArbiter(): BoneArbiter {
         } else {
           mixerWrote = !(entry.written && sameRotation(quaternion, entry.applied));
         }
+
         entry.captured = false;
         entry.baseFrom = mixerWrote ? 'mixer' : 'cache';
         if (mixerWrote) entry.base.copy(quaternion);
@@ -194,14 +220,18 @@ export function createBoneArbiter(): BoneArbiter {
 
     endFrame(): void {
       for (const entry of entries) {
-        if (entry.yaw === 0 && entry.pitch === 0 && entry.roll === 0) continue;
+        const hasRotation = entry.yaw !== 0 || entry.pitch !== 0 || entry.roll !== 0;
+        // 覆写基底即使零偏移也要写：否则"眼球回到绑定姿态"要等到第一个非零张望才生效
+        const hasOverride = entry.overrideBase !== null;
+        if (!hasRotation && !hasOverride) continue;
 
         const parent = entry.bone.parent;
         if (parent) parent.getWorldQuaternion(parentWorld);
         else parentWorld.identity();
         inverseParent.copy(parentWorld).invert();
 
-        finalQuat.copy(entry.base);
+        // 基底：ADR 0046 D1 的覆写优先（坐姿眼球回到绑定姿态）
+        finalQuat.copy(entry.overrideBase ?? entry.base);
         if (entry.roll !== 0) {
           axis.copy(WORLD_Z).applyQuaternion(inverseParent).normalize();
           rollQuat.setFromAxisAngle(axis, entry.roll);
@@ -224,6 +254,16 @@ export function createBoneArbiter(): BoneArbiter {
       }
     },
 
+    animationBase(bone: THREE.Bone): THREE.Quaternion | null {
+      const entry = byBone.get(bone);
+      return entry ? entry.base : null;
+    },
+
+    overrideBase(bone: THREE.Bone, quaternion: THREE.Quaternion | null): void {
+      const entry = entryFor(bone);
+      entry.overrideBase = quaternion ? quaternion.clone() : null;
+    },
+
     reset(): void {
       for (const entry of entries) {
         entry.bone.quaternion.copy(entry.base);
@@ -232,6 +272,7 @@ export function createBoneArbiter(): BoneArbiter {
         entry.yaw = 0;
         entry.pitch = 0;
         entry.roll = 0;
+        entry.overrideBase = null;
       }
     },
 
@@ -249,6 +290,7 @@ export function createBoneArbiter(): BoneArbiter {
           Number(entry.applied.z.toFixed(6)),
           Number(entry.applied.w.toFixed(6)),
         ],
+        overridden: entry.overrideBase !== null,
       }));
     },
   };

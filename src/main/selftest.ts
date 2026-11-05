@@ -11,6 +11,7 @@ import type { NativeImage } from 'electron';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Rect } from '../shared/geometry';
+import { SIT_HEAD_TUNE_RAD } from '../shared/constants';
 import { logInfo, logWarn } from './log';
 import { getRuntime } from './runtime';
 import { SELFTEST_LLM_MODEL, SELFTEST_TTS_PORT, startSelftestStubs } from './selftest-stubs';
@@ -94,13 +95,41 @@ interface ModelDiagnostics {
     procedural: boolean;
     clip: string | null;
     done: boolean | null;
+    /** ADR 0043 D2 的循环坐姿已在 ADR 0044 废止，恒为 false；保留只为不破坏诊断形状 */
+    looping?: boolean;
+    /** ADR 0043 D3：坐姿混合权重 0..1 */
+    blend?: number;
+    clipWeight?: number;
     dropPx: number;
-    bobPx: number;
+    /** ADR 0044/0046：活体微动（呼吸 / 自主张望 / 眼球 / 晃腿） */
+    motion?: {
+      gain: number;
+      breathPx: number;
+      spinePitch: number;
+      claviclePitch?: number;
+      upperArmPitch?: number;
+      gaze: { yaw: number; pitch: number; targetYaw: number; targetPitch: number; nextInMs: number };
+      eye?: { yaw: number; pitch: number };
+      legs: { gain: number; thighL: number; thighR: number; calfL: number; calfR: number };
+    } | null;
+    /** ADR 0042：坐下过渡（半蹲）的进度与"悬空高度" */
+    transition?: number;
+    transitionLiftPx?: number;
     offsetPx?: { x: number; y: number };
+    rawOffsetPx?: { x: number; y: number };
+    /** ADR 0046 D3.1：微侧身偏航（rad） */
+    bodyYaw?: number;
     /** 头骨本地四元数（诊断"头在打转"的累积漂移） */
     headQuat?: [number, number, number, number] | null;
     headWorld?: { x: number; y: number } | null;
     headBase?: { baseFrom: string | null; yaw: number; pitch: number; roll: number } | null;
+    /** ADR 0048 D1：站立上半身姿态（胸/颈/头的局部四元数）是否已记录 */
+    idleUpperCaptured?: boolean;
+    /** ADR 0048 D2：当前人工微调量（rad，正 = 低头） */
+    headTune?: number;
+    headOrientation?: { pitch: number; yaw: number } | null;
+    /** ADR 0046 D1：眼球当前相对头骨的朝向 */
+    eyeOrientation?: { pitch: number; yaw: number } | null;
   };
   /** ADR 0035：拖拽抓取点/受迫摆/落地分级 */
   drag?: {
@@ -113,6 +142,10 @@ interface ModelDiagnostics {
     supportAcceleration: { x: number; y: number };
     landingImpact: number | null;
     landingSquash?: number;
+    /** 最近一次落地冲击（缓冲只有 220ms，诊断读不到时靠它） */
+    lastLandingImpact?: number;
+    lastLandingSquash?: number;
+    landingCount?: number;
     startle: string | null;
   };
   facial?: {
@@ -131,6 +164,13 @@ interface ModelDiagnostics {
       eyeCalibrated: boolean;
       eyePixels: number;
       mouthPixels: number;
+      /** ADR 0045 D4.1：最近一次画嘴的图集帧 / alpha 裁边 / 目标矩形 */
+      mouth?: {
+        kind: string;
+        frame: number | null;
+        box: { x: number; y: number; width: number; height: number } | null;
+        target: { x: number; y: number; width: number; height: number } | null;
+      } | null;
       textureDigest?: string | null;
       /** 与首次绘制基线的平均绝对差（0..1） */
       faceDistance?: number | null;
@@ -710,6 +750,46 @@ async function findCurrentHitPoint(window: BrowserWindow): Promise<ProbePoint | 
           offsets.push(d);
           if (d !== 0) offsets.push(-d);
         }
+        // 命中点必须落在"实心区域"里（周围 8px 的四个邻点至少 3 个也命中）：
+        // ADR 0043 起坐姿是活的（呼吸/片段循环会让身体逐帧移动 1–3px），
+        // 落在轮廓边缘（例如两腿之间、裙摆边、发梢）的点会在几百毫秒后变成透明，
+        // 按下就被判 not-interactive。
+        const isSolid = (x, y) => {
+          const neighbors = [
+            m.probe(x - 8, y).hit,
+            m.probe(x + 8, y).hit,
+            m.probe(x, y - 8).hit,
+            m.probe(x, y + 8).hit,
+          ];
+          return neighbors.filter(Boolean).length >= 3;
+        };
+        // ① 优先从**骨盆**所在高度往上下扫：躯干是最大的一块实心区域，最稳
+        let bodyY = null;
+        try {
+          const d = window.petModel && window.petModel.getDiagnostics();
+          bodyY = d && d.probePoints && d.probePoints.body ? d.probePoints.body.y : null;
+        } catch {}
+        if (typeof bodyY === 'number' && Number.isFinite(bodyY)) {
+          for (let dy = 0; dy < h / 2; dy += 12) {
+            for (const y of dy === 0 ? [bodyY] : [bodyY - dy, bodyY + dy]) {
+              if (y < 48 || y > h - 48) continue;
+              for (const offset of offsets) {
+                const x = centerX + offset;
+                if (x < 24 || x > w - 24) continue;
+                if (m.probe(x, y).hit && isSolid(x, y)) return JSON.stringify({ x, y });
+              }
+            }
+          }
+        }
+        // ② 退回"从下往上扫"（旧行为），仍要求实心
+        for (let y = h - 48; y > 48; y -= 16) {
+          for (const offset of offsets) {
+            const x = centerX + offset;
+            if (x < 24 || x > w - 24) continue;
+            if (m.probe(x, y).hit && isSolid(x, y)) return JSON.stringify({ x, y });
+          }
+        }
+        // ③ 兜底：任意命中点（保证旧路径可用）
         for (let y = h - 48; y > 48; y -= 16) {
           for (const offset of offsets) {
             const x = centerX + offset;
@@ -1164,6 +1244,74 @@ async function runSpeechSuite(window: BrowserWindow, checks: AcceptanceCheck[]):
     const idle = await captureToImage(window, 'window-idle.png');
     logInfo('selftest', 'capture', { mode: 'idle', pngPath: idle.pngPath });
 
+    // ADR 0045 D4.1：不开口时必须停在图集的**闭嘴帧**（7 号小弧线），
+    // 不能停在微张帧、也不能因为 `frameCount=1` 被夹成 0 号极细横线。
+    const idleFacial = await readDiagnostics(window);
+    check(
+      '口型：neutral 且不发声 → 闭嘴帧（speech.frame=0、driven=false，ADR 0046 D3.2）',
+      idleFacial?.speech.frame === 0 && idleFacial?.speech.driven === false,
+      { speech: idleFacial?.speech ?? null, mouth: idleFacial?.facial?.channel?.mouth ?? null },
+    );
+
+    // ADR 0045 D4 取证：把嘴型钉在 7 / 6 / 14 / 2 / 9 各截一帧，用"与闭嘴帧的像素差"
+    // 证明（a）闭嘴帧本身是一张小嘴、（b）四档帧确实画出不同的形状。
+    const mouthFrameShots: Array<{ frame: number; png: string; changed: number; box: string }> = [];
+    for (const frame of [7, 6, 14, 2, 9]) {
+      await window.webContents.executeJavaScript(`window.petRender.setMouthFrame(${frame})`, true);
+      await sleep(90);
+      const shot = await captureToImage(window, `mouth-frame-${frame}.png`);
+      const region = mouthRegion(idleFacial, window.getContentBounds());
+      const scale = idle.image.getSize().width / Math.max(1, window.getContentBounds().width);
+      const diff = diffRegion(
+        idle.image,
+        shot.image,
+        {
+          x: region.x * scale,
+          y: region.y * scale,
+          width: region.width * scale,
+          height: region.height * scale,
+        },
+      );
+      mouthFrameShots.push({
+        frame,
+        png: shot.pngPath,
+        changed: diff.changed,
+        box: `${diff.rect.x},${diff.rect.y} ${diff.rect.width}x${diff.rect.height}`,
+      });
+    }
+    await window.webContents.executeJavaScript('window.petRender.resetMouthFrame()', true);
+    await sleep(120);
+    const mouthFramesDistinct = new Set(mouthFrameShots.map((shot) => shot.changed)).size;
+    check(
+      '口型：四档嘴型各自画出不同形状（7/6/14/2/9 五帧互不相同，ADR 0045 D4.2）',
+      mouthFrameShots.length === 5 &&
+        mouthFramesDistinct >= 3 &&
+        mouthFrameShots.filter((shot) => shot.changed > 0).length >= 4,
+      { shots: mouthFrameShots },
+    );
+
+    // 口型多帧化取证：在页面内以 25ms 采样 voice 播放器的当前嘴型帧（单次 ~微秒，
+    // 不像 `getDiagnostics()` 那样要 300ms），覆盖"开口前 → 说话中 → 结束"。
+    await window.webContents.executeJavaScript(
+      `(() => {
+        const trace = [];
+        window.__mouthTrace = trace;
+        const started = performance.now();
+        const timer = setInterval(() => {
+          const d = window.petVoice.getDiagnostics();
+          trace.push({
+            t: Math.round(performance.now() - started),
+            frame: d.frame,
+            level: Number(d.level.toFixed(3)),
+            speaking: d.speaking === true,
+          });
+          if (performance.now() - started > 12000) clearInterval(timer);
+        }, 25);
+        return true;
+      })()`,
+      true,
+    );
+
     // ------------------------------------------------------------------
     // 1) 规则路径 → TTS 桩 → 播放 → 口型 → 自然结束
     // ------------------------------------------------------------------
@@ -1222,6 +1370,30 @@ async function runSpeechSuite(window: BrowserWindow, checks: AcceptanceCheck[]):
 
     await waitForLog('speech_ended completed', 1, 8000);
     check('语音：自然结束发 speech_ended{completed}', (await countInLog('speech_ended completed')) >= 1);
+
+    // ADR 0045 D4.2：说话期间嘴型必须在 3–4 档官方帧之间切换（不再只有一张嘴）。
+    const mouthTrace = JSON.parse(
+      (await window.webContents.executeJavaScript(
+        'JSON.stringify(window.__mouthTrace ?? [])',
+        true,
+      )) as string,
+    ) as Array<{ t: number; frame: number; level: number; speaking: boolean }>;
+    const spokenFrames = new Set(mouthTrace.filter((s) => s.speaking).map((s) => s.frame));
+    const allFrames = new Set(mouthTrace.map((s) => s.frame));
+    check(
+      '口型：说话时多帧切换（≥2 种嘴型，且闭嘴帧也在轨迹里，ADR 0045 D4.2）',
+      spokenFrames.size >= 2 && allFrames.has(0) && mouthTrace.length >= 10,
+      {
+        spokenFrames: [...spokenFrames],
+        allFrames: [...allFrames],
+        samples: mouthTrace.length,
+        curve: mouthTrace
+          .filter((s) => s.speaking)
+          .slice(0, 24)
+          .map((s) => `${s.frame}@${s.level.toFixed(2)}`),
+      },
+    );
+    await window.webContents.executeJavaScript('window.__mouthTrace = null; true', true);
 
     // ------------------------------------------------------------------
     // 2) LLM 路径（合法 JSON）
@@ -2687,6 +2859,29 @@ export async function runSelfTestIfRequested(): Promise<void> {
     diagnostics?.animation?.walk?.name === 'CH0335_Cafe_Walk',
     diagnostics?.animation?.walk ?? null,
   );
+  // ADR 0041 D3/D4：本轮接进来的新角色必须逐个落到片段上（缺失会走降级，不会报错）
+  {
+    const roleLog = (await readPetLog()).split('\n').filter((line) => line.includes('语义角色：')).pop() ?? '';
+    const expectedRoles = [
+      ['idle.alt2', 'CH0335_Carrier_Idle'],
+      ['idle.alt3', 'CH0335_Victory_End_Random'],
+      ['nod', 'CH0335_Cafe_Reaction'],
+      ['fidget.shy', 'CH0335_Cafe_Reaction'],
+      ['greet', 'CH0335_Cafe_Reaction'],
+      ['happy', 'CH0335_Victory_Start'],
+    ] as const;
+    const missing = expectedRoles.filter(([role, clip]) => !roleLog.includes(`${role}=${clip}`));
+    check(
+      '动画：新增语义角色全部命中官方片段（待机池 ×4 / nod / fidget.shy，ADR 0041）',
+      roleLog.length > 0 && missing.length === 0,
+      { missing, roleLog: roleLog.slice(-600) },
+    );
+    check(
+      '动画：抓头的旧角色 held.limp 已删除（拖拽统一走 held，ADR 0041 D1）',
+      !roleLog.includes('held.limp'),
+      { roleLog: roleLog.slice(-600) },
+    );
+  }
   const hidden = diagnostics?.hiddenMeshes ?? [];
   check(
     '配件：Weapon/Prop/brush 三件已隐藏（visible=false）',
@@ -2735,7 +2930,19 @@ export async function runSelfTestIfRequested(): Promise<void> {
       const probes = [];
       for (let ratio = 0.10; ratio <= 0.50001; ratio += 0.04) {
         const y = Math.round(window.innerHeight * ratio);
-        const s = window.petMask.probe(x, y);
+        // 为什么沿这一行再扫一遍 x，而不是只取中线：光环（HaloRoot）在角色的右上方，
+        // 中线在 y≈130–200 这一段常常是空气。旧写法只探中线，"光环上有没有命中点"
+        // 就取决于当帧头发/光环摆到哪儿 —— 实测会随机假失败（2026-11-03 复现两次）。
+        let s = window.petMask.probe(x, y);
+        if (!s.hit) {
+          for (let px = Math.round(window.innerWidth * 0.1); px <= window.innerWidth * 0.9; px += 8) {
+            const candidate = window.petMask.probe(px, y);
+            if (candidate.hit) {
+              s = candidate;
+              break;
+            }
+          }
+        }
         const h = window.petRender.headSampleAt(s.x, s.y, s.head, s.hit);
         probes.push({ ratio: Number(ratio.toFixed(2)), y, hit: s.hit, headMask: s.head, headNow: h.head, src: h.source });
       }
@@ -2834,6 +3041,47 @@ export async function runSelfTestIfRequested(): Promise<void> {
     Boolean(idleA && idleB) &&
       (idleA?.targetYaw !== idleB?.targetYaw || idleA?.targetPitch !== idleB?.targetPitch),
     { idleA, idleB },
+  );
+
+  // ------------------------------------------------------------------
+  // 2.9) ADR 0047：**站姿脸部特写 + 眼骨 A/B**
+  //
+  // 这一组截图回答一个只能靠像素回答的问题：瞳孔朝下到底是**画在贴图上的**
+  // 还是**眼骨转出来的**。
+  // - face-idle.png        站姿原样（真机上她 90% 的时间是这个姿态）
+  // - face-idle-eye-down   眼骨额外 +0.35rad（标定：正 = 低头）
+  // - face-idle-eye-up     眼骨额外 -0.35rad（抬头）
+  //
+  // 判据：上下两张图里**瞳孔在眼眶内的位置**若明显移动 → 眼球是骨骼驱动的，
+  // 姿态能修；若纹丝不动 → 视线是贴图画的，只能改贴图/UV。
+  // ------------------------------------------------------------------
+  const idleFaceBox = (await window.webContents.executeJavaScript(
+    'window.diagnostics.faceZoom(260)',
+    true,
+  )) as { x: number; y: number; size: number } | null;
+  await sleep(260);
+  const idleFaceShot = await captureScreenshot(window, 'face-idle.png', 'face-idle');
+  await window.webContents.executeJavaScript(
+    `window.diagnostics.setBone('Bip001_eye_L', 0, 0.35, 0); window.diagnostics.setBone('Bip001_eye_R', 0, 0.35, 0); true`,
+    true,
+  );
+  await sleep(260);
+  const idleEyeDownShot = await captureScreenshot(window, 'face-idle-eye-down.png', 'face-idle-eye-down');
+  await window.webContents.executeJavaScript(
+    `window.diagnostics.clear(); window.diagnostics.setBone('Bip001_eye_L', 0, -0.35, 0); window.diagnostics.setBone('Bip001_eye_R', 0, -0.35, 0); true`,
+    true,
+  );
+  await sleep(260);
+  const idleEyeUpShot = await captureScreenshot(window, 'face-idle-eye-up.png', 'face-idle-eye-up');
+  await window.webContents.executeJavaScript('window.diagnostics.clear()', true);
+  await window.webContents.executeJavaScript('window.diagnostics.faceZoom(0)', true);
+  check(
+    '脸部特写：站姿 + 眼骨 A/B 已产出（face-idle*.png，ADR 0047）',
+    idleFaceShot.length > 0 &&
+      idleEyeDownShot.length > 0 &&
+      idleEyeUpShot.length > 0 &&
+      (idleFaceBox?.size ?? 0) === 260,
+    { idleFaceBox, idleFaceShot, idleEyeDownShot, idleEyeUpShot },
   );
 
   // ------------------------------------------------------------------
@@ -3036,6 +3284,9 @@ export async function runSelfTestIfRequested(): Promise<void> {
   );
 
   // §5.3 必测组合：说话时被摸头 —— 身体通道不动、只做表情、overlay 仍投影 speaking
+  // 先等上一次摸头反应播完：`pat_react` 是幂等的（已在播就不重启），
+  // 上一拍还没退干净时这条测的就不是"新起一次反应"（ADR 0047 自检修正）。
+  await waitFor(window, 3000, (d) => d?.pat?.active === false);
   const speakingPat = JSON.parse(
     (await window.webContents.executeJavaScript(
       `(() => {
@@ -3062,12 +3313,20 @@ export async function runSelfTestIfRequested(): Promise<void> {
     speakingPat.hfsm.overlay === 'speaking' && speakingPat.state.overlay === 'speaking',
     speakingPat.hfsm,
   );
+  // `pat.*` 诊断在**渲染帧**里刷新，而且"反应进行中"是个瞬态窗口：同一个 JS 同步块里
+  // 读到的可能还是上一帧，等 200ms 又可能已经自愈退出。用轮询取"至少观察到一次"。
+  const speakingPatFrame =
+    (await waitFor(
+      window,
+      1600,
+      (d) => d?.pat?.active === true && d.pat.blockedBy === 'speaking',
+    )) ?? null;
   check(
     '说话时被摸头：身体通道不动、只做表情（§5.3 / ADR 0039 D4）',
-    speakingPat.pat.active === true &&
-      speakingPat.pat.body === false &&
-      speakingPat.pat.blockedBy === 'speaking',
-    speakingPat.pat,
+    speakingPatFrame?.pat?.active === true &&
+      speakingPatFrame?.pat?.body === false &&
+      speakingPatFrame?.pat?.blockedBy === 'speaking',
+    { sync: speakingPat.pat, polled: speakingPatFrame?.pat ?? null },
   );
   check(
     '说话时被摸头：emotion 仍临时投影 shy',
@@ -3183,6 +3442,7 @@ export async function runSelfTestIfRequested(): Promise<void> {
   pushScriptedCursor(current.x + body.x + 150, current.y + body.y - 30);
   await sleep(25);
   const boundsBeforeRelease = shell.getBounds();
+  const landingCountBefore = dragDiag?.drag?.landingCount ?? 0;
 
   // 抬手的坐标必须是**当前窗口**里的坐标：窗口已经被拖到别处，
   // 还用按下时的局部坐标会让窗口在松手瞬间跳一段（实测 23px），
@@ -3276,12 +3536,33 @@ export async function runSelfTestIfRequested(): Promise<void> {
     Math.abs(groundBounds.y - expectedGroundY) <= 2,
     { y: groundBounds.y, expectedGroundY },
   );
+  // 落地缓冲只活 220ms（ADR 0040 D3），而 `getDiagnostics()` 单次约 300ms —— 读得稍晚
+  // 就只剩 null（2026-11-04 复现）。改成读 render 侧留存的 `lastLandingImpact/lastLandingSquash`，
+  // 它是"最近一次冲击"的持久值，不再受采样时机影响。
+  const landingDiag = settledDiag;
+  const lastLandingImpact = landingDiag?.drag?.lastLandingImpact ?? 0;
+  // 冲击峰值是在 220ms 窗口里逐帧取的，读得**太早**会拿到 0（本轮实测偶发）。
+  // 这里轮询到峰值出现为止；`lastLandingSquash` 是持久值，晚读不会丢。
+  const landedDiag = await waitFor(
+    window,
+    1500,
+    (d) => (d?.drag?.lastLandingSquash ?? 0) > 0,
+  );
+  const lastLandingSquash = landedDiag?.drag?.lastLandingSquash ?? landingDiag?.drag?.lastLandingSquash ?? 1;
+  const landingCountAfter = landedDiag?.drag?.landingCount ?? landingDiag?.drag?.landingCount ?? 0;
   check(
     '落地：向下快速松手 → 轻微下蹲（impact>0；squash ≤3%，ADR 0040 D3）',
-    typeof settledDiag?.drag?.landingImpact === 'number' &&
-      settledDiag.drag.landingImpact > 0 &&
-      (settledDiag.drag?.landingSquash ?? 1) <= 0.0301,
-    settledDiag?.drag ?? null,
+    landingCountAfter > landingCountBefore &&
+      lastLandingImpact > 0 &&
+      lastLandingSquash > 0 &&
+      lastLandingSquash <= 0.0301,
+    {
+      landingCountBefore,
+      landingCountAfter,
+      lastLandingImpact,
+      lastLandingSquash,
+      live: { impact: landingDiag?.drag?.landingImpact ?? null, squash: landingDiag?.drag?.landingSquash ?? null },
+    },
   );
 
   // ADR 0040 验收 3 的视觉证据：落地中（最多 3% 压扁）→ 400ms 后静止，两帧对比应只差一点点。
@@ -3311,6 +3592,49 @@ export async function runSelfTestIfRequested(): Promise<void> {
     '松手：500ms 沉降窗口后掩膜恢复采集（R-8）',
     (await countInLog('掩膜采集恢复')) > resumeBaseline && pausedMs !== null && pausedMs >= 500,
     { pausedMs },
+  );
+
+  // 3.55 抓头拖拽（ADR 0041 D1 的核心验收）：播的必须是**同一段**官方悬空片段。
+  // 旧实现按抓取带分片：抓头 → `Carrier_Idle`（普通站姿）+ 手写骨骼偏移，
+  // 于是"拖上半部分不触发官方动画"。这里在头骨附近按下、拖过 4px，断言
+  // ① band=head（分类仍生效，只影响单摆物理）② 片段仍是 Formation_Pickup。
+  current = window.getContentBounds();
+  pushScriptedCursor(current.x + head.x, current.y + head.y);
+  await sleep(320);
+  const headDragBoundsBefore = shell.getBounds();
+  await dispatchPointer('down', head.x, head.y);
+  await sleep(40);
+  pushScriptedCursor(current.x + head.x + 28, current.y + head.y + 6);
+  await sleep(160);
+  const headDragDiag = await readDiagnostics(window);
+  check(
+    '拖拽（抓头）：Physics=dragged 且播同一段官方悬空片段 Formation_Pickup（ADR 0041 D1）',
+    headDragDiag?.hfsm.physics === 'dragged' &&
+      headDragDiag?.drag?.band === 'head' &&
+      headDragDiag?.animation?.current?.name === 'CH0335_Formation_Pickup',
+    {
+      hfsm: headDragDiag?.hfsm ?? null,
+      band: headDragDiag?.drag?.band ?? null,
+      current: headDragDiag?.animation?.current ?? null,
+    },
+  );
+  check(
+    '拖拽（抓头）：窗口同样跟随（部位只影响单摆，不影响位移链）',
+    shell.getBounds().x - headDragBoundsBefore.x >= 16,
+    { before: headDragBoundsBefore.x, after: shell.getBounds().x },
+  );
+  {
+    const boundsNow = shell.getBounds();
+    await dispatchPointer(
+      'up',
+      current.x + head.x + 28 - boundsNow.x,
+      current.y + head.y + 6 - boundsNow.y,
+    );
+  }
+  await waitFor(
+    window,
+    4000,
+    (diagnostics) => diagnostics?.hfsm.physics === null && diagnostics?.motion.base === 'idle',
   );
 
   // 3.6 拖到屏幕外被 D-7 钳制
@@ -3563,6 +3887,16 @@ export async function runSelfTestIfRequested(): Promise<void> {
     arrived?.sit?.arrived === true && arrived?.hfsm.physics === 'sitting',
     arrived?.sit ?? null,
   );
+  // ADR 0042 D1：落座不是瞬间切换——到达后 240ms 内有一个"半蹲"过渡
+  // （身体从座面上方 14px 落下、大腿前弯 0.22rad、躯干微前倾），之后全部归零。
+  check(
+    '坐姿：落座时有半蹲过渡（transition ∈ (0,1)、transitionLiftPx > 0，ADR 0042 D1）',
+    typeof arrived?.sit?.transition === 'number' &&
+      arrived.sit.transition > 0 &&
+      arrived.sit.transition < 1 &&
+      (arrived.sit.transitionLiftPx ?? 0) > 0,
+    arrived?.sit ?? null,
+  );
 
   const notepadBounds = notepad.getBounds();
   const seatedBounds = shell.getBounds();
@@ -3589,7 +3923,7 @@ export async function runSelfTestIfRequested(): Promise<void> {
     seated?.hfsm ?? null,
   );
   check(
-    '吸附：播放官方坐姿片段（pastmemory 11.2–13.5s），不是程序化降级（ADR 0028 D8）',
+    '吸附：播放官方坐姿片段（pastmemory 14.5–14.92s **停帧**），不是程序化降级（ADR 0044 D1）',
     (seated?.animation?.current?.name ?? '').includes('pastmemory') &&
       seated?.sit?.procedural === false,
     { current: seated?.animation?.current ?? null, sit: seated?.sit ?? null },
@@ -3599,34 +3933,271 @@ export async function runSelfTestIfRequested(): Promise<void> {
     seated?.motion.walking === null && seated?.motion.nextWalkInMs === null,
     seated?.motion ?? null,
   );
+  // ADR 0043 D3：落座过程中补偿必须跟着片段权重走（不能一帧内硬切 ~390px）。
+  // 断言的是**不变量**而不是某一帧的绝对值：`offset == raw × blend`（±1px 取整误差）。
+  // 这样与截图/IPC 的时序无关，又能证明"补偿被权重缩放"。
+  {
+    const sitNow = arrived?.sit ?? null;
+    const rawX = sitNow?.rawOffsetPx?.x ?? 0;
+    const rawY = sitNow?.rawOffsetPx?.y ?? 0;
+    const offX = sitNow?.offsetPx?.x ?? 0;
+    const offY = sitNow?.offsetPx?.y ?? 0;
+    const blend = sitNow?.blend ?? 0;
+    check(
+      '坐姿：补偿按混合权重缩放（offset ≈ raw × blend，落座瞬间不会硬切，ADR 0043 D3）',
+      Math.abs(rawX) > 50 &&
+        blend > 0 &&
+        blend < 1 &&
+        Math.abs(offX - rawX * blend) < 1.5 &&
+        Math.abs(offY - rawY * blend) < 1.5,
+      { raw: sitNow?.rawOffsetPx ?? null, offset: sitNow?.offsetPx ?? null, blend: sitNow?.blend ?? null },
+    );
+  }
 
-  const sitDone = await waitFor(window, 6000, (diagnostics) => diagnostics?.sit?.done === true);
+  // 等坐姿停帧 + 微动包络起来（片段权重到 1），再验证"活着"
+  await waitFor(window, 3000, (diagnostics) => (diagnostics?.sit?.blend ?? 0) >= 0.98);
+
+  // ADR 0044/0045/0046：一次采样覆盖 呼吸 / 自主张望 / 眼球 / 晃腿 / 头部基准（每 250ms 一帧，共 5s）。
+  const samples: Array<{
+    t: number;
+    breath: number;
+    gazeYaw: number;
+    gazePitch: number;
+    targetYaw: number;
+    targetPitch: number;
+    legGain: number;
+    thighL: number;
+    thighR: number;
+    headPitch: number | null;
+    headYaw: number | null;
+    eyePitch: number | null;
+    eyeYaw: number | null;
+  }> = [];
+  const samplingStartedAt = Date.now();
+  for (let i = 0; i < 21; i += 1) {
+    const d = await readDiagnostics(window);
+    const m = d?.sit?.motion ?? null;
+    if (m) {
+      samples.push({
+        t: Date.now() - samplingStartedAt,
+        breath: m.breathPx,
+        gazeYaw: m.gaze.yaw,
+        gazePitch: m.gaze.pitch,
+        targetYaw: m.gaze.targetYaw,
+        targetPitch: m.gaze.targetPitch,
+        legGain: m.legs.gain,
+        thighL: m.legs.thighL,
+        thighR: m.legs.thighR,
+        headPitch: d?.sit?.headOrientation?.pitch ?? null,
+        headYaw: d?.sit?.headOrientation?.yaw ?? null,
+        eyePitch: d?.sit?.eyeOrientation?.pitch ?? null,
+        eyeYaw: d?.sit?.eyeOrientation?.yaw ?? null,
+      });
+    }
+    await sleep(250);
+  }
+  const sitAlive = await readDiagnostics(window);
+  const rangeOf = (values: number[]): number =>
+    values.length < 2 ? 0 : Math.max(...values) - Math.min(...values);
+  const breathRange = rangeOf(samples.map((s) => s.breath));
+  const thighRange = rangeOf(samples.map((s) => s.thighL));
+  const targets = new Set(samples.map((s) => `${s.targetYaw.toFixed(3)}/${s.targetPitch.toFixed(3)}`));
+  const maxAbsTargetYaw = Math.max(0, ...samples.map((s) => Math.abs(s.targetYaw)));
+  const maxAbsTargetPitch = Math.max(0, ...samples.map((s) => Math.abs(s.targetPitch)));
+  const maxLeg = Math.max(0, ...samples.map((s) => Math.abs(s.thighL)), ...samples.map((s) => Math.abs(s.thighR)));
+  // 交替：两条腿各自当过"主导"（A 明显比 B 抬得高，反过来也出现过）
+  const legAlternating =
+    samples.some((s) => Math.abs(s.thighL) - Math.abs(s.thighR) > 0.02) &&
+    samples.some((s) => Math.abs(s.thighR) - Math.abs(s.thighL) > 0.02);
+  // 不对称（ADR 0045 D3）：任何一帧左右都不是镜像
+  const legAsymmetric = samples.some(
+    (s) => Math.abs(Math.abs(s.thighL) - Math.abs(s.thighR)) > 0.004,
+  );
+  const headPitches = samples.map((s) => s.headPitch).filter((v): v is number => v !== null);
+  const headYaws = samples.map((s) => s.headYaw).filter((v): v is number => v !== null);
+  const headPitchRange = rangeOf(headPitches);
+  const headYawRange = rangeOf(headYaws);
+
   check(
-    '吸附：坐姿片段播完停在最后一帧（playHold，不会自己站回去）',
-    sitDone?.sit?.done === true &&
-      (sitDone?.animation?.current?.name ?? '').includes('pastmemory'),
-    { sit: sitDone?.sit ?? null, current: sitDone?.animation?.current ?? null },
+    '坐姿：停在最后一帧（playHold 的 clamp；不是循环、也不会自己站回去，ADR 0044 D1）',
+    sitAlive?.sit?.done === true &&
+      sitAlive?.hfsm.physics === 'sitting' &&
+      (sitAlive?.animation?.current?.name ?? '').includes('pastmemory'),
+    { sit: sitAlive?.sit ?? null, current: sitAlive?.animation?.current ?? null },
+  );
+  check(
+    '坐姿：不发声时嘴层是静态闭嘴（speech.frame=0、driven=false，ADR 0046 D3.2）',
+    sitAlive?.speech.frame === 0 && sitAlive?.speech.driven === false,
+    {
+      speech: sitAlive?.speech ?? null,
+      mouth: sitAlive?.facial?.channel?.mouth ?? null,
+      owner: sitAlive?.facial?.mouthOwner ?? null,
+      shape: sitAlive?.facial?.mouthShape ?? null,
+    },
+  );
+  check(
+    '坐姿：呼吸平缓（breathPx 在 5s 内有起伏，且 |breath| ≤ 1px，ADR 0044 D2）',
+    breathRange > 0.15 && samples.every((s) => Math.abs(s.breath) <= 1.0001),
+    { range: Number(breathRange.toFixed(3)), samples: samples.map((s) => Number(s.breath.toFixed(3))) },
+  );
+  check(
+    '坐姿：自主张望（目标在 ±0.36 / +0.06 / -0.22 内，且 5s 内换过方向，ADR 0045 D2.2）',
+    samples.length > 0 &&
+      maxAbsTargetYaw <= 0.3601 &&
+      maxAbsTargetPitch <= 0.2201 &&
+      (targets.size >= 2 || rangeOf(samples.map((s) => s.gazeYaw)) > 0.02),
+    { targets: [...targets].slice(0, 6), maxAbsTargetYaw, maxAbsTargetPitch },
+  );
+  check(
+    '坐姿：上半身照抄站立姿态（胸/颈/头的局部四元数已记录并覆盖，ADR 0048 D1）',
+    sitAlive?.sit?.idleUpperCaptured === true,
+    { idleUpperCaptured: sitAlive?.sit?.idleUpperCaptured ?? null, headTune: sitAlive?.sit?.headTune ?? null },
+  );
+  check(
+    '坐姿：头真的在转（头骨相对绑定姿态的朝向在 5s 内摆动 ≥0.05rad，不是只动眼，ADR 0045 D2.2）',
+    Math.max(headYawRange, headPitchRange) >= 0.05,
+    { headYawRange, headPitchRange, samples: headYaws.slice(0, 8).map((v) => Number(v.toFixed(3))) },
+  );
+  check(
+    '坐姿：悬空晃腿（左右交替、幅度 0.12–0.18rad、包络已开，ADR 0045 D3）',
+    samples.some((s) => s.legGain > 0.9) &&
+      legAlternating &&
+      legAsymmetric &&
+      maxLeg >= 0.12 &&
+      maxLeg <= 0.1801 &&
+      thighRange > 0.04,
+    {
+      maxLeg,
+      thighRange: Number(thighRange.toFixed(3)),
+      legAsymmetric,
+      legGain: samples.at(-1)?.legGain ?? null,
+    },
   );
 
-  // ADR 0034 D5：坐姿不锁死上身——视线通道仍在跑（把光标放到左上角，头部 yaw 应变化）
-  const gazeBefore = sitDone?.gaze?.yaw ?? 0;
+  check(
+    '坐姿：微侧身（bodyYaw ≈ 0.15rad，不再正面死板对镜头，ADR 0046 D3.1）',
+    Math.abs((sitAlive?.sit?.bodyYaw ?? 0) - 0.15) <= 0.02,
+    { bodyYaw: sitAlive?.sit?.bodyYaw ?? null },
+  );
+
+  // ADR 0046 D2：**停帧不再眨眼** —— 眼皮骨（bone_eye_D_*）的位移通道已整套删除。
+  // 这里只留一条"眼骨旋转确实被接管"的结构级断言（位移通道不存在，写不出来）。
+  check(
+    '坐姿：不再手写眼皮位移（眼骨只走旋转基底覆写，ADR 0046 D2）',
+    sitAlive?.sit?.motion?.eye !== undefined &&
+      Number.isFinite(sitAlive?.sit?.motion?.eye?.pitch ?? Number.NaN),
+    { eye: sitAlive?.sit?.motion?.eye ?? null },
+  );
+
+  const sitDone = sitAlive;
+
+  // ADR 0044 D3：坐姿期间**关闭光标视线**——把光标挪到左上角，视线不应再被光标带走。
+  const gazeBeforeCursor = sitAlive?.gaze?.yaw ?? 0;
   await window.webContents.executeJavaScript(
     'window.petRender.setCursor(8, 8, performance.now())',
     true,
   );
-  await sleep(600);
-  const gazeSitting = await readDiagnostics(window);
+  await sleep(700);
+  const cursorMoved = await readDiagnostics(window);
   check(
-    '坐姿：视线仍跟随光标（sitting 不锁死上身，ADR 0034 D5）',
-    gazeSitting?.hfsm.physics === 'sitting' &&
-      Math.abs((gazeSitting?.gaze?.yaw ?? 0) - gazeBefore) > 0.01,
-    { before: gazeBefore, after: gazeSitting?.gaze ?? null },
+    '坐姿：不再跟随光标（gaze.update 在坐姿期间关闭，ADR 0044 D3）',
+    cursorMoved?.hfsm.physics === 'sitting' &&
+      cursorMoved?.sit?.motion !== null &&
+      Math.abs((cursorMoved?.gaze?.yaw ?? 0) - gazeBeforeCursor) < 0.005,
+    { before: gazeBeforeCursor, after: cursorMoved?.gaze ?? null },
   );
+
+  // 活体微动取证：6 帧 / 约 1.2s 一帧，肉眼复核"自主转头 + 悬空晃腿"（ADR 0044 D3/D5）。
+  for (let i = 0; i < 6; i += 1) {
+    await captureScreenshot(window, `sit-alive-0${i}.png`, `sit-alive(${i})`);
+    await sleep(1100);
+  }
   await window.webContents.executeJavaScript(
     'window.petRender.setCursor(211, 360, performance.now())',
     true,
   );
   const sittingShot = await captureScreenshot(window, 'window-sitting.png', 'sitting');
+  // ADR 0047 取证：**脸部特写**。正交相机缩到 260px 方框，眼睛在画面里从 ~14px
+  // 变成 ~90px —— 只有这个尺寸才看得清"瞳孔朝上还是朝下"。
+  const faceBox = await window.webContents.executeJavaScript(
+    'window.diagnostics.faceZoom(260)',
+    true,
+  ) as { x: number; y: number; size: number } | null;
+  await sleep(260);
+  const faceShot = await captureScreenshot(window, 'face-sit.png', 'face-sit');
+  // 对照实验：同一张脸 + EyeMouth 贴图上的绿色准星。
+  // 准星 = 我们标定出来的**眼区几何中心**（不是瞳孔位置）。
+  const probeInfo = await window.webContents.executeJavaScript(
+    'window.diagnostics.eyeProbe(true)',
+    true,
+  ) as { eyeRects: Array<{ x: number; y: number; width: number; height: number }>; texture: { width: number; height: number } } | null;
+  await sleep(260);
+  const probeShot = await captureScreenshot(window, 'face-probe.png', 'face-probe');
+  await window.webContents.executeJavaScript('window.diagnostics.eyeProbe(false)', true);
+  await window.webContents.executeJavaScript('window.diagnostics.faceZoom(0)', true);
+  check(
+    '脸部特写：已产出（face-sit.png 正常 / face-probe.png 带眼区准星，ADR 0047）',
+    faceShot.length > 0 &&
+      probeShot.length > 0 &&
+      (probeInfo?.eyeRects.length ?? 0) > 0 &&
+      (faceBox?.size ?? 0) === 260,
+    { faceBox, faceShot, probeShot, eyeRects: probeInfo?.eyeRects ?? null, texture: probeInfo?.texture ?? null },
+  );
+  // ADR 0047 取证 2：**头部俯仰 A/B**。同一张脸，只在头骨上叠一个额外的 pitch：
+  // - face-sit-head-down：+0.25rad（≈ 片段自带的那份低头，即"没做抬头补偿"的样子）
+  // - face-sit-head-up  ：-0.12rad（再多抬一点）
+  // 用途：确定"瞳孔看起来朝下"到底是头抬得不够，还是抬过头（脸卡后仰、虹膜被压扁）。
+  await window.webContents.executeJavaScript('window.diagnostics.faceZoom(260)', true);
+  const headPitchShots: Array<{ pitch: number; png: string }> = [];
+  for (const pitch of [0.25, -0.12]) {
+    await window.webContents.executeJavaScript(
+      `window.diagnostics.clear(); window.diagnostics.setBone('Bip001_Head', 0, ${pitch}, 0); true`,
+      true,
+    );
+    await sleep(260);
+    const png = await captureScreenshot(
+      window,
+      `face-sit-head-${pitch > 0 ? 'down' : 'up'}.png`,
+      `face-sit-head(${pitch})`,
+    );
+    headPitchShots.push({ pitch, png });
+  }
+  await window.webContents.executeJavaScript('window.diagnostics.clear()', true);
+  // ADR 0048 D2 取证 3：**头部微调扫描**。上半身已经照抄站立姿态，这里只拧"低头/抬头"，
+  // 一次拍 5 档，肉眼挑一档写死进 `SIT_HEAD_TUNE_RAD`。
+  const tuneShots: Array<{ tune: number; png: string }> = [];
+  for (const tune of [-0.20, -0.10, 0, 0.10, 0.20]) {
+    await window.webContents.executeJavaScript(`window.diagnostics.headTune(${tune})`, true);
+    await sleep(180);
+    const png = await captureScreenshot(
+      window,
+      `face-tune-${tune >= 0 ? 'p' : 'm'}${Math.abs(tune * 100).toFixed(0)}.png`,
+      `face-tune(${tune})`,
+    );
+    tuneShots.push({ tune, png });
+  }
+  await window.webContents.executeJavaScript(`window.diagnostics.headTune(${SIT_HEAD_TUNE_RAD})`, true);
+  await window.webContents.executeJavaScript('window.diagnostics.faceZoom(0)', true);
+  check(
+    '脸部特写：坐姿头部微调扫描已产出（face-tune-*.png 五档，ADR 0048 D2）',
+    tuneShots.length === 5,
+    { shots: tuneShots, applied: SIT_HEAD_TUNE_RAD },
+  );
+  // ADR 0046 D3.2 取证：停帧姿态下把嘴型钉在 0 / 7 / 14 / 2 各截一帧。
+  // 身体是静止的（playHold），四张图的差异只来自嘴 —— 用来肉眼确认"哪一帧真的像闭嘴"。
+  const mouthSitShots: Array<{ frame: number; png: string }> = [];
+  for (const frame of [0, 7, 14, 2]) {
+    await window.webContents.executeJavaScript(`window.petRender.setMouthFrame(${frame})`, true);
+    await sleep(90);
+    const png = await captureScreenshot(window, `mouth-sit-${frame}.png`, `mouth-sit(${frame})`);
+    mouthSitShots.push({ frame, png });
+  }
+  await window.webContents.executeJavaScript('window.petRender.resetMouthFrame()', true);
+  check(
+    '截图：停帧嘴型取证已产出（0 / 7 / 14 / 2 四帧，dist/selftest/mouth-sit-*.png）',
+    mouthSitShots.length === 4,
+    { shots: mouthSitShots },
+  );
   // 桌面抓取（desktopCapturer）在合成透明置顶窗口时可能拿到稍早的一帧：
   // 先等坐姿停稳，再抓一次；两次写同一路径，后一次覆盖（只是验收证据，不参与断言）。
   await sleep(1500);
@@ -3636,24 +4207,23 @@ export async function runSelfTestIfRequested(): Promise<void> {
     desktopShot !== null,
     { sittingShot, desktopShot },
   );
-  // 停帧语义：截图（含 ~1s 的桌面抓取）之后姿态必须还在最后一帧，不能自己循环/漂移
+  // ADR 0043 D2：截图（含 ~1.5s 的桌面抓取）之后她必须**还在坐姿循环里**，
+  // 而不是像旧实现那样停在末帧（也不是自己站回去）。
   const afterDesktop = await readDiagnostics(window);
   check(
-    '吸附：截图之后姿态仍停在最后一帧（playHold 的 clamp 生效）',
+    '吸附：截图之后仍停在最后一帧（done=true、physics=sitting，不会自己站回去）',
     afterDesktop?.sit?.done === true &&
-      Math.abs(
-        (afterDesktop?.animation?.current?.time ?? 0) -
-          (sitDone?.animation?.current?.time ?? 0),
-      ) < 0.05,
+      afterDesktop?.hfsm.physics === 'sitting' &&
+      (afterDesktop?.animation?.current?.name ?? '').includes('pastmemory'),
     {
-      before: sitDone?.animation?.current ?? null,
       after: afterDesktop?.animation?.current ?? null,
       sit: afterDesktop?.sit ?? null,
     },
   );
 
-  // 头骨稳定性（真机 bug 回归）：坐姿停帧后，头骨本地四元数在 1s 内不得漂移。
-  // 之前"头疯狂打转"就是这个量在累积——骨骼仲裁把上一帧的偏移当成新基底。
+  // 头骨稳定性（真机 bug 回归）：坐姿 1s 内头骨本地四元数不得**持续累积**漂移。
+  // 之前"头疯狂打转"实测 2.51 rad/s，就是这个量在累积（骨骼仲裁把上一帧偏移当新基底）。
+  // ADR 0043 起坐姿是活的（片段循环 + 视线微动），所以阈值放到 0.6 rad —— 它只拦"发散"。
   const headA = afterDesktop?.sit?.headQuat ?? null;
   await sleep(1000);
   const headDiag = await readDiagnostics(window);
@@ -3669,10 +4239,92 @@ export async function runSelfTestIfRequested(): Promise<void> {
         )
       : Number.NaN;
   check(
-    '吸附：坐姿 1s 内头骨不漂移（回归"头在打转"，≤0.15 rad）',
-    Number.isFinite(headDriftRad) && headDriftRad <= 0.15,
+    '坐姿：1s 内头骨不累积漂移（回归"头在打转"，≤0.6 rad；活体微动不算）',
+    Number.isFinite(headDriftRad) && headDriftRad <= 0.6,
     { headA, headB, headDriftRad, headBase: headDiag?.sit?.headBase ?? null, headWorld: headDiag?.sit?.headWorld ?? null },
   );
+
+  // ------------------------------------------------------------------
+  // ADR 0043 取证：落座过渡逐帧抓图（12 帧）。
+  //
+  // 这一轮**故意让窗口不动**：先解除坐姿、再在原地重新吸附（距离 ≤8px → 直接 commit，
+  // 没有接近阶段）。这样截图里只剩"姿态交叉淡入 + 身体平移补偿"这一件事——
+  // 正是上一版"snap_applied 瞬间硬套 265px 补偿 → 模型瞬移出框"的现场。
+  // 窗口移动的那部分另有 window-walking.png / window-sitting-desktop.png 作证。
+  // ------------------------------------------------------------------
+  shell.releaseSnap();
+  await waitFor(window, 3000, (diagnostics) => diagnostics?.hfsm.physics === null);
+  // 等坐姿混合权重退到 0（0.35s 淡出 + 余量），否则下一轮起点不是"站着"
+  await sleep(600);
+  pushScriptedForeground(dipRectToPhysical(notepad.getBounds()));
+  await sleep(160);
+  const sequenceFrames: string[] = [];
+  // 第 1 遍：只抓图。`getDiagnostics()` 单次约 300ms（含面部贴图摘要），
+  // 混进循环里会把采样间隔拉到 400ms，抓不到 240ms 的半蹲——所以图与数字分开采。
+  shell.snapToForeground();
+  for (let step = 0; step < 12; step += 1) {
+    const shot = await captureScreenshot(
+      window,
+      `sit-step-${String(step).padStart(2, '0')}.png`,
+      `sit-sequence(${step})`,
+    );
+    sequenceFrames.push(shot);
+    await sleep(20);
+  }
+  check('坐姿：落座过渡已逐帧取证（12 帧，dist/selftest/sit-step-*.png）', sequenceFrames.length >= 10, {
+    frames: sequenceFrames.length,
+    first: sequenceFrames[0] ?? null,
+    last: sequenceFrames[sequenceFrames.length - 1] ?? null,
+  });
+
+  // 第 2 遍：同样的"原地重新落座"，只采数字（每次读诊断 ~300ms，正好均匀覆盖 1.2s）。
+  // ADR 0043 D3 要证明的两件事：① 补偿 = 原始补偿 × 混合权重；② 头骨世界 x 连续、不发散。
+  const sequenceTrace: Array<{
+    step: number;
+    blend: number | null;
+    offsetX: number | null;
+    rawOffsetX: number | null;
+    headX: number | null;
+    physics: string | null;
+    arrived: boolean | null;
+  }> = [];
+  shell.releaseSnap();
+  await waitFor(window, 3000, (diagnostics) => diagnostics?.hfsm.physics === null);
+  await sleep(600);
+  shell.snapToForeground();
+  for (let step = 0; step < 4; step += 1) {
+    const trace = await readDiagnostics(window);
+    sequenceTrace.push({
+      step,
+      blend: trace?.sit?.blend ?? null,
+      offsetX: trace?.sit?.offsetPx?.x ?? null,
+      rawOffsetX: trace?.sit?.rawOffsetPx?.x ?? null,
+      headX: trace?.sit?.headWorld?.x ?? null,
+      physics: trace?.hfsm.physics ?? null,
+      arrived: trace?.sit?.arrived ?? null,
+    });
+    await sleep(120);
+  }
+  {
+    const heads = sequenceTrace
+      .map((item) => item.headX)
+      .filter((value): value is number => typeof value === 'number');
+    let maxStep = 0;
+    for (let i = 1; i < heads.length; i += 1) {
+      maxStep = Math.max(maxStep, Math.abs(heads[i]! - heads[i - 1]!));
+    }
+    const scaledOk = sequenceTrace.every((item) => {
+      if (typeof item.blend !== 'number' || typeof item.offsetX !== 'number' || typeof item.rawOffsetX !== 'number') {
+        return false;
+      }
+      return Math.abs(item.offsetX - item.rawOffsetX * item.blend) < 2;
+    });
+    check(
+      '坐姿：落座过程连续且补偿按权重缩放（头骨 x 跳变 < 40px、offset ≈ raw×blend，ADR 0043 D3）',
+      heads.length >= 3 && maxStep < 40 && scaledOk,
+      { trace: sequenceTrace, maxStepPx: Number(maxStep.toFixed(1)), scaledOk },
+    );
+  }
 
   // 跟随：目标窗口移动 → 她在同一个 16ms 轮询器里跟着走（节流 120ms）
   const notepadMoved = {
@@ -3696,6 +4348,13 @@ export async function runSelfTestIfRequested(): Promise<void> {
     Math.abs(followedBounds.y + followedBounds.height - expectedEdge) <= 8 &&
       followedBounds.y !== seatedBounds.y,
     { before: seatedBounds, after: followedBounds, target: notepadMoved },
+  );
+  // ADR 0042 D2：目标在动的那几拍里，跟随必须进"追赶模式"（每 tick 重算，
+  // 而不是 8Hz）；目标停下后自动回落到 120ms 节流。
+  check(
+    '吸附：目标移动期间进入跟随追赶模式（catchUpTicks ≥ 1，ADR 0042 D2）',
+    (shell.snapSnapshot()?.catchUpTicks ?? 0) >= 1,
+    shell.snapSnapshot(),
   );
 
   // 解除 1：点她一下 → 立即离开窗口边缘、站回 Idle
@@ -3732,9 +4391,10 @@ export async function runSelfTestIfRequested(): Promise<void> {
   const resnap = shell.snapToForeground();
   check('重新吸附：可以再吸一次（旧目标不残留）', resnap?.ok === true, resnap ?? null);
   await waitFor(window, 3000, (diagnostics) => diagnostics?.hfsm.physics === 'sitting');
-  // 等坐姿片段播完（姿态静止）：片段播放中身体一直在动，掩膜逐帧变化，
-  // 探针可能在"扫描命中"与"按下"之间变成透明（本轮踩到，按下被 D-2 拒绝）。
-  await waitFor(window, 6000, (diagnostics) => diagnostics?.sit?.done === true);
+  // 等坐姿循环真正接管（权重到 1）。ADR 0043 起坐姿是**活的**（片段循环 + 呼吸 + 视线），
+  // 掩膜本来就逐帧微动；这里只要保证"已经稳定坐下"，命中点由 `findCurrentHitPoint` 现场扫描。
+  await waitFor(window, 3000, (diagnostics) => (diagnostics?.sit?.blend ?? 0) >= 0.98);
+  await sleep(400);
   const sitPoint = await findCurrentHitPoint(window);
   check('吸附：坐姿下掩膜仍能命中她（探针随姿态变化）', sitPoint !== null, sitPoint);
   current = window.getContentBounds();
@@ -3790,6 +4450,8 @@ export async function runSelfTestIfRequested(): Promise<void> {
   await waitFor(window, 3000, (diagnostics) => diagnostics?.hfsm.physics === 'sitting');
   // "目标窗口被关掉"：句柄失效（脚本化前台置空，等价于 IsWindow 返回 false）
   pushScriptedForeground(null);
+  // 惊跳只有 320ms：必须**在等待解除的同时**轮询抓它，不能等 physics 归零后再读一次
+  const startleSeen = await waitFor(window, 2500, (diagnostics) => diagnostics?.drag?.startle === 'window-gone');
   await sleep(700);
   const closedOff = await waitFor(window, 3000, (diagnostics) => diagnostics?.hfsm.physics === null);
   const closedLog = lastJsonAfter(await runLogText(), '吸附解除（ADR 0028 D9）');
@@ -3799,6 +4461,35 @@ export async function runSelfTestIfRequested(): Promise<void> {
       closedOff?.hfsm.physics === null &&
       closedLog?.['reason'] === 'window-gone',
     { hfsm: closedOff?.hfsm ?? null, snap: shell.snapSnapshot(), closedLog },
+  );
+
+  // ADR 0042 D4：窗沿消失后她脚下没有东西 → 必须落回工作区地面线（复用回弹弹簧）。
+  let fallenBounds = shell.getBounds();
+  {
+    const fallDeadline = Date.now() + 5000;
+    while (Date.now() < fallDeadline) {
+      fallenBounds = shell.getBounds();
+      if (shell.motionSnapshot()?.kind === 'idle') break;
+      await sleep(80);
+    }
+  }
+  const fallArea = workAreaFor(fallenBounds);
+  const fallGroundY = fallArea.y + fallArea.height - fallenBounds.height;
+  const fallDiag = await readDiagnostics(window);
+  check(
+    '解除：窗沿消失后落回桌面地面线（±8px，ADR 0042 D4）',
+    shell.motionSnapshot()?.kind === 'idle' && Math.abs(fallenBounds.y - fallGroundY) <= 8,
+    { y: fallenBounds.y, groundY: fallGroundY, motion: shell.motionSnapshot() },
+  );
+  check(
+    '解除：窗沿消失时先播惊跳（startle=window-gone，ADR 0034 D5 / ADR 0042 D4）',
+    startleSeen?.drag?.startle === 'window-gone',
+    startleSeen?.drag ?? closedOff?.drag ?? null,
+  );
+  check(
+    '解除：落下按"轻放"处理（不伪造冲击 → landingImpact 不触发，ADR 0040 D3 口径）',
+    (fallDiag?.drag?.landingImpact ?? 0) === 0 && (fallDiag?.drag?.landingSquash ?? 1) === 0,
+    fallDiag?.drag ?? null,
   );
   shell.releaseSnap();
   resetScriptedForeground();

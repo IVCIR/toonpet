@@ -20,15 +20,17 @@ import * as THREE from 'three';
 export type ClipRole =
   | 'idle'
   | 'idle.alt1'
+  | 'idle.alt2'
+  | 'idle.alt3'
   | 'held'
-  | 'held.limp'
   | 'walk'
   | 'walk.carried'
   | 'sit'
   | 'pat'
   | 'greet'
+  | 'nod'
   | 'happy'
-  | 'victory'
+  | 'fidget.shy'
   // 以下为侧向战斗片段：只登记、默认不接线（留着做"战斗模式"或转屏演出）
   | 'attack'
   | 'skill'
@@ -50,12 +52,26 @@ export interface ClipRule {
    */
   startSeconds?: number;
   maxSeconds?: number;
+  /**
+   * 一次性演出的淡入/淡出（秒）。缺省 0.18 / 0.25（`animation-controller` 的常量）。
+   *
+   * 为什么要按角色配（ADR 0041 D2）：摸头片段结尾停在"缩着"的姿态，0.25s 淡回
+   * 站姿太快，读起来像被切断；给它 0.45s，让"抬头回正"由交叉淡入承担。
+   */
+  fadeInSeconds?: number;
+  fadeOutSeconds?: number;
 }
 
 /**
  * 角色 → 片段。`exact` 与 `patterns` 都对着模型原始名写，改模型只改这里。
  *
  * 每个 `exact` 后面的括号是实测结论（胶片条截图在 `tools/clip-preview/shots/`）。
+ *
+ * **朝向与"根位移"是两条硬约束**（ADR 0023 D7、ADR 0041 D3）：44 段里
+ * `Normal_*` / `Exs*` / `Vital_*` / `Public01` / `Move_*` 是侧身，不能用；
+ * `*_interaction_*` / `*_Interaction_*` 是过场，**根骨被搬到镜头外**
+ * （实测 `Victory_End_interaction_01` 偏左 128px、`Victory_Start_Interaction_02`
+ * 偏左 190px，`Victory_End_Interaction_02` 偏左 190px），也不接。
  */
 export const CLIP_RULES: Record<ClipRole, ClipRule> = {
   // ---- 常驻姿态（循环，正面）----
@@ -71,18 +87,29 @@ export const CLIP_RULES: Record<ClipRole, ClipRule> = {
     patterns: [/formation[_\s-]?idle(?!.*random)/i],
     loop: true,
   },
-  held: {
-    // 拖拽时的"被拎着"：四肢垂着、身体蜷起来（0.2s 之后一直保持这个姿态）。
-    // 注意 `Carrier_Idle` 其实是普通站姿，不是悬空姿态，只作降级候选。
-    exact: 'CH0335_Formation_Pickup',
-    patterns: [/formation[_\s-]?pickup/i, /carrier[_\s-]?idle/i, /pickup/i],
-    loop: true,
-  },
-  'held.limp': {
-    // 抓头时用普通站姿做底：手臂自然下垂、腿直立，再由 drag-motion 的骨骼偏移
-    // 做"头被拎住、身体下垂"的微调。`Formation_Pickup` 的蜷缩姿态不适合抓头。
+  'idle.alt2': {
+    // 正面静止站姿（双手交叠在身前），几乎不动 —— 最"乖"的一个待机（ADR 0041 D4）
     exact: 'CH0335_Carrier_Idle',
     patterns: [/carrier[_\s-]?idle/i],
+    loop: true,
+  },
+  'idle.alt3': {
+    // 正面、双手轻握在胸前、呼吸幅度极小；`Victory_End` 的收势姿态（ADR 0041 D4）
+    exact: 'CH0335_Victory_End_Random',
+    patterns: [/victory[_\s-]?end[_\s-]?random/i],
+    loop: true,
+  },
+  held: {
+    // ADR 0041 D1：**唯一**的官方悬空片段，抓头/抓身/抓脚**统一**用它。
+    //
+    // 事实（胶片条 + 普查）：0–1.2s 是从地上被拎起来的屈膝起势，1.4s 之后一直保持
+    // "被拎着"的垂姿（手臂垂在身前、膝盖微屈、身体略前倾），14s 内姿态基本不变。
+    // 所以**从 0 开始播**：`drag_started` 每一次都从第 0 秒进来，正好获得官方的
+    // "被拎起"那一下；拖拽超过 14s 才会循环回起势（已知取舍，见 ADR 0041）。
+    //
+    // 不再按抓取带切片段：抓取带只影响单摆物理（`DRAG_PENDULUM`），不影响播什么。
+    exact: 'CH0335_Formation_Pickup',
+    patterns: [/formation[_\s-]?pickup/i, /pickup/i, /carrier[_\s-]?idle/i],
     loop: true,
   },
   walk: {
@@ -92,60 +119,101 @@ export const CLIP_RULES: Record<ClipRole, ClipRule> = {
     loop: true,
   },
   'walk.carried': {
-    // 正面走、双手抱在胸前；比 Cafe_Walk 抬头，观感更自然，可作 walk 的替代
+    // 正面走、双手抱在胸前；与 `Cafe_Walk` 实测是同一份数据（普查逐项相同），
+    // 只作为 `walk` 的模式降级候选，不单独接线。
     exact: 'CH0335_Carrier2_Walk',
     patterns: [/carrier2?[_\s-]?walk/i],
     loop: true,
   },
   sit: {
-    // ADR 0028 D8：资产里没有名字带 Sit 的片段，唯一真坐姿藏在回忆片段里。
-    // 38.25s 整段是"走进咖啡厅 → 坐下 → 起身"的演出；11.2–13.5s 才是正面坐姿
-    // （屈膝坐在低处、双手在胸前），14.6s 之后起身。裁这一段、播一次并停住最后一帧
-    // （`playHold`），就是"坐在窗口边缘"的姿态。座位道具 `CH0335_Prop_Outlline`
-    // 已被 HIDE_ATTACHMENTS 隐藏，画面上只剩她本人。
+    // ADR 0044 D1：**回到停帧**。14.5–14.7s 是普查里最平稳、且**眼皮完全睁开**的一段坐姿
+    // （14.5→14.7 的骨骼差：头 y 0.0003、骨盆 0.0002、脚底 0.0005；眼皮 `translation.x`
+    // 稳定在 0.000263 —— 14.8s 之后她开始眯眼、14.92s 已到 0.000314，所以窗口不能再往后放，
+    // 否则"睁眼基线"就是半闭的，程序化眨眼会看不出来）。
+    //
+    // `playHold` 停在窗口末尾那一帧 = 姿态基线。
+    // 为什么不再循环：ADR 0043 D2 曾把这 0.42s 循环起来制造动感，真机读作"抽搐"——
+    // 循环接缝在 1–2px、且 0.42s 的节奏本身就快。现在**片段只给姿态、不给运动**，
+    // 呼吸/张望/眨眼/晃腿全部由 `sit-motion.ts` 以慢变量叠加（ADR 0044 D2–D5）。
     exact: 'CH0335_my_event088_pastmemory_01',
     patterns: [/pastmemory/i, /sit[_\s-]?(idle|down|loop)?$/i, /chair|seat/i],
     loop: false,
-    startSeconds: 11.2,
-    maxSeconds: 13.5,
+    startSeconds: 14.5,
+    maxSeconds: 14.7,
+    fadeInSeconds: 0.45,
+    fadeOutSeconds: 0.35,
   },
 
   // ---- 一次性演出（正面）----
   pat: {
-    // ADR 0039 D1：摸头反应的官方片段。
+    // ADR 0039 D1 + ADR 0041 D2：摸头反应的官方片段。
     //
     // `Victory_Start_Random` 是**唯一自带闭环**的"害羞缩一下"：
     //   0–0.4s 站姿 → 0.4–0.8s 快速缩身、双手抱到胸前、低头（缩身 13–16%、头 pitch −0.13）
-    //   → 0.8–2.0s 保持害羞 → 2.0–2.2s 抬头回正。裁 0.3–2.4s 正好"从站姿开始、回站姿结束"。
+    //   → 0.8–2.0s 保持害羞 → 2.0–2.2s 抬头回正。
     //
-    // 为什么不继续用 `Cafe_Reaction`（3.5–6.6s）：那一段一直含胸抱手，**没有回正**，
-    // 无论剪到哪一秒，结束淡回 Idle 时手都会突然放下（ADR 0039 的实测结论）。
-    // `Cafe_Reaction` 只保留给 `greet`（0–2.2s 的摊手）。
+    // **窗口收到 2.05s**（旧值 2.4）不是为了截短，而是为了"不要在片段自己 0.2s 的
+    // 快速抬头之后立刻又接一个 0.25s 淡出"：2.05s 停在"还缩着"姿态的末端，
+    // 抬头/放手全部交给 `fadeOutSeconds = 0.45` 的交叉淡入（实测 0.45s 的过渡
+    // 读起来是"慢慢直起身"，而不是"被切断"）。
+    //
+    // 为什么不继续用 `Cafe_Reaction`（3.5–6.6s）：那一段一直含胸抱手，**没有回正**。
+    // `Cafe_Reaction` 只保留给 `greet` / `nod` / `fidget.shy`。
     //
     // 武器/道具由 HIDE_ATTACHMENTS 隐藏；整段脚底高度只变化 0.01 单位（≈7px），无需补偿。
     exact: 'CH0335_Victory_Start_Random',
     patterns: [/victory[_\s-]?start[_\s-]?random/i],
     loop: false,
     startSeconds: 0.3,
-    maxSeconds: 2.4,
+    maxSeconds: 2.05,
+    fadeInSeconds: 0.18,
+    fadeOutSeconds: 0.45,
   },
   greet: {
-    // 同一段反应的开头 0–2.2s：正面、双手摊开，当"打招呼"用
+    // ADR 0041 D3：**资产里没有"挥手"**。44 段逐段普查：没有任何正面片段的
+    // 手抬到肩以上（唯一的"双手举过头"是 `Vital_Retreat`/`Vital_Death`，都是侧身/背身
+    // 的撤退与倒地）；正面家族里"手抬到胸肩"的只有本段 0–2.4s 的摊手与
+    // `Victory_Start` 的合手鞠躬。
+    // 所以 `greet` 沿用这段"抬手摊开"的开头 0–2.2s —— 它是资产里最接近"举手打招呼"
+    // 的正面动作；真正的鞠躬交给 `nod`。
     exact: 'CH0335_Cafe_Reaction',
     patterns: [/cafe[_\s-]?reaction/i, /reaction/i],
     loop: false,
+    startSeconds: 0.15,
     maxSeconds: 2.2,
+    fadeInSeconds: 0.2,
+    fadeOutSeconds: 0.35,
+  },
+  nod: {
+    // ADR 0041 D3：`nod` 不再只有程序化"低头 0.26rad"——`Cafe_Reaction` 的 8.7–9.9s
+    // 就是一段真的鞠躬（9.4s 到最低点、10.0s 起身）。裁 1.2s（契约 §4.4 的上限），
+    // 尾巴那半段"起身"由 0.3s 的交叉淡入补完。
+    exact: 'CH0335_Cafe_Reaction',
+    patterns: [/cafe[_\s-]?reaction/i, /reaction/i],
+    loop: false,
+    startSeconds: 8.7,
+    maxSeconds: 9.9,
+    fadeInSeconds: 0.16,
+    fadeOutSeconds: 0.3,
   },
   happy: {
-    // 正面胜利起势：双手合在胸前、微微鞠躬再抬头
+    // 正面胜利起势：双手合在胸前、微微鞠躬再抬头（开心/小庆祝）
     exact: 'CH0335_Victory_Start',
     patterns: [/victory[_\s-]?start(?!.*(random|interaction))/i],
     loop: false,
+    fadeInSeconds: 0.2,
+    fadeOutSeconds: 0.35,
   },
-  victory: {
-    exact: 'CH0335_Victory_End',
-    patterns: [/victory[_\s-]?end(?!.*(random|interaction))/i],
+  'fidget.shy': {
+    // ADR 0041 D4：空闲小动作之一 —— `Cafe_Reaction` 3.2–4.9s 的"双手掩到脸前、
+    // 身子缩一下"（害羞），1.7s 闭环后回站姿。同一段素材的第三个窗口。
+    exact: 'CH0335_Cafe_Reaction',
+    patterns: [/cafe[_\s-]?reaction/i, /reaction/i],
     loop: false,
+    startSeconds: 3.2,
+    maxSeconds: 4.9,
+    fadeInSeconds: 0.3,
+    fadeOutSeconds: 0.4,
   },
 
   // ---- 侧向战斗片段（只登记，默认不接线）----

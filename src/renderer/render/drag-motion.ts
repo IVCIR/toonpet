@@ -1,8 +1,12 @@
 /**
- * 拖拽的纯数学层（ADR 0035）：抓取部位、受迫单摆、绕支点补偿、三态骨骼姿态。
+ * 拖拽的纯数学层（ADR 0035；ADR 0041 D1 起收窄）：抓取分类、受迫单摆、绕支点补偿。
  *
  * 不引用 three / DOM / 时钟；所有输入由调用方注入，因此可以脱离 WebGL 单测。
  * 这里是"手感"的唯一出处：摆长、阻尼、限幅、挣扎频率都在 `shared/constants.ts`。
+ *
+ * **边界（ADR 0041 D1）**：抓取带只决定单摆的物理参数，**不决定播哪段官方片段**，
+ * 也不再提供任何"按部位手写的骨骼姿态"。悬空姿态由官方片段 `Formation_Pickup`
+ * 自己给出；这里只剩整身绕抓取点的旋转（θ）与它的位置补偿。
  *
  * 坐标约定：
  * - `angle` 是根骨骼绕世界 Z 轴的摆角（rad），正值 = 逆时针；
@@ -46,7 +50,6 @@ export interface DragPendulumConfig {
   angleLimitRad: number;
   struggleHz: number;
   struggleRad: number;
-  liftPx: number;
 }
 
 export function pendulumConfigFor(band: DragBand): DragPendulumConfig {
@@ -117,6 +120,8 @@ export function stepDragPendulum(
 /**
  * 抓脚时叠加的挣扎偏移（不再进积分状态，避免逐帧累积）。
  * 纯正弦 + 按周期出现的踢腿包络；`gain` 控制淡入淡出。
+ *
+ * ADR 0041 D1：它只作为**单摆角度**的一部分（整身绕抓取点摆），不再驱动任何骨骼。
  */
 export function struggleOffset(band: DragBand, nowMs: number, gain = 1): number {
   const config = pendulumConfigFor(band);
@@ -156,96 +161,4 @@ export function pivotCompensation(
     x: px - (px * cos - py * sin),
     y: py - (px * sin + py * cos),
   };
-}
-
-export type DragBoneKey =
-  | 'spine'
-  | 'spine1'
-  | 'neck'
-  | 'head'
-  | 'upperArmL'
-  | 'upperArmR'
-  | 'forearmL'
-  | 'forearmR'
-  | 'thighL'
-  | 'thighR'
-  | 'calfL'
-  | 'calfR'
-  | 'footL'
-  | 'footR';
-
-export interface DragBoneOffset {
-  bone: DragBoneKey;
-  yaw: number;
-  pitch: number;
-  roll: number;
-}
-
-/**
- * 三态悬挂姿态（ADR 0035 D2）。返回值是**未乘增益**的弧度，调用方统一乘 `gain`。
- *
- * 符号来自 2026-11-02 的实机标定（`dist/selftest/calib-*.png` + 骨骼世界坐标）：
- * - `pitch > 0`（绕世界 X 正转）：`spine`/`neck` **低头/前屈**；`upperArm`/`thigh`/`calf`
- *   是**向后摆**（世界 z 变小）。所以"腿往前抬/膝盖前屈"要用负 pitch。
- * - `roll < 0`（绕世界 Z 负转）：左右 `upperArm` **都抬手**（手的世界 y 变大）；
- *   `roll > 0` 是放下/内收。左右臂因此用同一个符号，而不是镜像。
- * - `yaw` 只用于轻微扭身，不做主要表达。
- *
- * 所有幅度都刻意保守：抓脚的上臂 roll 约 -1.4rad，窗口只有 422×720，
- * 实机若出现手臂被窗口裁切，优先降低 roll（见 ADR 0035 的"后果"）。
- */
-export function dragBoneOffsets(band: DragBand, nowMs: number): DragBoneOffset[] {
-  const struggle = band === 'foot' ? Math.sin((finiteOrZero(nowMs) / 1000) * Math.PI * 2 * 2.5) : 0;
-  if (band === 'head') {
-    return [
-      // 抓头：普通站姿底 + 头/颈/脊柱前屈 + 腿微垂（真实悬挂感）
-      { bone: 'spine', yaw: 0, pitch: 0.1, roll: 0 },
-      { bone: 'spine1', yaw: 0, pitch: 0.05, roll: 0 },
-      { bone: 'neck', yaw: 0, pitch: 0.12, roll: 0 },
-      { bone: 'head', yaw: 0, pitch: 0.08, roll: 0 },
-      // 手臂自然下垂：很小的前摆；不要用 roll 抬手，否则会变成"投降"
-      { bone: 'upperArmL', yaw: 0, pitch: -0.04, roll: 0.02 },
-      { bone: 'upperArmR', yaw: 0, pitch: -0.04, roll: 0.02 },
-      { bone: 'forearmL', yaw: 0, pitch: -0.12, roll: 0 },
-      { bone: 'forearmR', yaw: 0, pitch: -0.12, roll: 0 },
-      // 腿微垂：大腿略前（-pitch）、小腿略后（+pitch）
-      { bone: 'thighL', yaw: 0, pitch: -0.12, roll: 0 },
-      { bone: 'thighR', yaw: 0, pitch: -0.12, roll: 0 },
-      { bone: 'calfL', yaw: 0, pitch: 0.24, roll: 0 },
-      { bone: 'calfR', yaw: 0, pitch: 0.24, roll: 0 },
-    ];
-  }
-  if (band === 'body') {
-    return [
-      { bone: 'spine', yaw: 0, pitch: -0.04, roll: 0 },
-      { bone: 'spine1', yaw: 0, pitch: -0.02, roll: 0 },
-      { bone: 'neck', yaw: 0, pitch: -0.03, roll: 0 },
-      { bone: 'head', yaw: 0, pitch: -0.02, roll: 0 },
-      // 双臂略外张：负 roll 是抬手，幅度很小
-      { bone: 'upperArmL', yaw: 0, pitch: -0.02, roll: -0.14 },
-      { bone: 'upperArmR', yaw: 0, pitch: -0.02, roll: -0.14 },
-      { bone: 'forearmL', yaw: 0, pitch: -0.1, roll: 0 },
-      { bone: 'forearmR', yaw: 0, pitch: -0.1, roll: 0 },
-      { bone: 'thighL', yaw: 0, pitch: 0.02, roll: 0 },
-      { bone: 'thighR', yaw: 0, pitch: 0.02, roll: 0 },
-      { bone: 'calfL', yaw: 0, pitch: 0.06, roll: 0 },
-      { bone: 'calfR', yaw: 0, pitch: 0.06, roll: 0 },
-    ];
-  }
-  // 抓脚：不真倒吊（窗口装不下），用"前折 + 举臂 + 屈膝"表达挣扎。
-  // 举臂 = 负 roll（左右同号）；屈膝 = 大腿负 pitch + 小腿正 pitch。
-  return [
-    { bone: 'spine', yaw: 0, pitch: 0.22, roll: struggle * 0.012 },
-    { bone: 'spine1', yaw: 0, pitch: 0.12, roll: 0 },
-    { bone: 'neck', yaw: 0, pitch: 0.08, roll: struggle * 0.02 },
-    { bone: 'head', yaw: 0, pitch: -0.12, roll: struggle * 0.025 },
-    { bone: 'upperArmL', yaw: 0, pitch: -0.05, roll: -1.4 - struggle * 0.04 },
-    { bone: 'upperArmR', yaw: 0, pitch: -0.05, roll: -1.4 + struggle * 0.04 },
-    { bone: 'forearmL', yaw: 0, pitch: -0.3, roll: 0 },
-    { bone: 'forearmR', yaw: 0, pitch: -0.3, roll: 0 },
-    { bone: 'thighL', yaw: 0, pitch: -0.24, roll: 0 },
-    { bone: 'thighR', yaw: 0, pitch: -0.24, roll: 0 },
-    { bone: 'calfL', yaw: 0, pitch: 0.42, roll: 0 },
-    { bone: 'calfR', yaw: 0, pitch: 0.42, roll: 0 },
-  ];
 }

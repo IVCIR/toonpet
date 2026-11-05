@@ -28,6 +28,7 @@ import {
 import type { PixelImage } from './expression-assets';
 import {
   CH0335_MOUTH_LAYOUT,
+  atlasFrameIndex,
   buildSurface,
   clusterEyes,
   dedupeSurfaces,
@@ -37,6 +38,7 @@ import {
   trianglesBounds,
 } from './facial-texture';
 import type { UvTriangle } from './facial-texture';
+import { MOUTH_FRAME_CLOSED } from '../../shared/constants';
 
 function assertClose(actual: number, expected: number, tolerance = 1e-9): void {
   assert.ok(Math.abs(actual - expected) <= tolerance, `expected ${expected}, got ${actual}`);
@@ -292,6 +294,22 @@ test('嘴层仲裁：口型永远最高，其次表情，最后静态闭嘴（AD
   assert.equal(resolveMouthOwner(base), 'emotion');
   assert.equal(resolveMouthOwner({ ...base, emotionMouth: 'none' }), 'static');
   assert.equal(resolveMouthOwner({ ...base, alpha: 0 }), 'static');
+});
+
+test('静态闭嘴：必须画到图集的"闭嘴"帧（7），不能因为 frameCount=1 被夹成 0 号细线（ADR 0045 D4.1）', () => {
+  const { columns, rows, staticFrameIndex } = CH0335_MOUTH_LAYOUT;
+  assert.equal(staticFrameIndex, MOUTH_FRAME_CLOSED, '布局的静态帧与口型的闭嘴帧必须同源');
+  assert.equal(staticFrameIndex, 0, 'ADR 0046 D3.2：闭嘴用 0 号平直细线');
+
+  // 旧 bug：frameCount 传 1 → 任何帧号都被夹成 0
+  assert.equal(atlasFrameIndex(staticFrameIndex, 1, columns, rows), 0);
+  // 正确用法：传真实帧数 → 落到 7
+  assert.equal(atlasFrameIndex(staticFrameIndex, columns * rows, columns, rows), MOUTH_FRAME_CLOSED);
+  // 越界钳制 / 非法输入
+  assert.equal(atlasFrameIndex(-3, columns * rows, columns, rows), 0);
+  assert.equal(atlasFrameIndex(999, columns * rows, columns, rows), columns * rows - 1);
+  assert.equal(atlasFrameIndex(Number.NaN, columns * rows, columns, rows), 0);
+  assert.equal(atlasFrameIndex(6, 8, columns, rows), 6, '不足一行的帧数也要按真实帧数夹取');
 });
 
 // ---------------------------------------------------------------------------

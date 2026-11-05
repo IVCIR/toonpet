@@ -2,10 +2,11 @@
 
 | 项 | 值 |
 |---|---|
-| 对应契约版本 | 1.17.0（ADR 0040：头部区改由头骨半径判定、落地收平；ADR 0039：摸头只播官方片段 + 拖拽/摸头严格互斥；ADR 0038/0037：描边与 Toon） |
-| 最后更新 | 2026-11-03 |
-| 当前里程碑 | **M15 后续修复 2：头部判定换基准 + 落地收平（ADR 0040）**，已封版 **`v1.1.1-interaction-fix`**（`package.json` 1.1.1）—— `head_patted` 的入口从"掩膜 bbox 顶部 22%"（被光环顶到发顶之上、覆盖不到脸）改为"以头骨为圆心、0.125×内容高=90px 为半径"；落地冲击改取 `drag_released.vy`、压扁 8%→3%、时长 300→220ms、门槛 150→700px/s、恢复系数 0.28→0.15 |
-| 封版验收（2026-11-03，当前工作区） | `npm test` **433 / 0 失败**（exit 0）；四套 selftest **主链路 147 / 输入条 29 / 语音 30 / 缺失模型 4** 全部 exit 0；`tsc --noEmit` 0 错。真机手感验收（点脸 / 拖拽落地）由项目所有者在 `v1.1.1-interaction-fix` 上执行 |
+| 对应契约版本 | 1.24.0（ADR 0048：坐姿上半身照抄站立姿态 + 键盘微调；ADR 0047：脸部特写取证；ADR 0046：眼球接管 / 删手写眨眼 / 微侧身） |
+| 最后更新 | 2026-11-05 |
+| 当前里程碑 | **M20 坐姿上半身照抄站立姿态**（真机"下巴内收、眼神向下"），契约 1.23.0 → 1.24.0 |
+| 发布 | **v1.4.0-polish**（2026-11-05，封版）；封版提交见 `git log --oneline -1` |
+| 封版验收（2026-11-05，当前工作区） | `npm test` **493 / 0 失败**（48 个测试文件，exit 0）；四套 selftest **主链路 171 / 输入条 29 / 语音 33 / 缺失模型 4** 全部 exit 0；`tsc --noEmit` 0 错。关键实测：坐姿上半身（胸/颈/头）**局部四元数 = 站立值**（覆盖，无差值）；头部微调扫描 5 档里定档 **0**；眼骨 ±0.35rad 的 A/B 在 260px 特写下几乎看不出差别（虹膜画在贴图上）。截图 `face-tune-p0.png`（现方案）/ `face-tune-sweep.png`（五档扫描）/ `face-idle.png`（站立参照）/ `face-probe.png`（准星）/ `window-sitting.png` / `sit-step-*.png` |
 | 维护规则 | 每个模块对话收尾时必须更新本文件；只写事实，不写计划性描述（计划进 TODO） |
 
 ## 填写口径
@@ -24,6 +25,8 @@
 ## 模块：shell
 
 ### 已完成
+- **吸附跟随的追赶模式（2026-11-03，ADR 0042 D2）**：`snap.ts` 的跟随不再是固定 120ms 节流——检测到目标矩形变化（≥1px）后把节流压到**一个 tick（16ms）** 并持续 `SNAP_FOLLOW_SETTLE_MS=220ms`，目标停稳后自动回落到常规 120ms。没有新定时器（仍挂在既有 16ms 轮询器的 `onTick` 上），没有新 IPC。日志只在**进入**追赶那一拍打一条（避免 60Hz 刷屏）；诊断新增 `SnapDiagnostics.catchUp / catchUpTicks`。单测新增"目标连续移动时每 20ms 都重算、停下后回到节流"1 条；主链路自检新增"追赶模式 `catchUpTicks ≥ 1`"1 条
+- **解除吸附后落回桌面（2026-11-03，ADR 0042 D4）**：`snap_released{window-gone|fullscreen}` 之后，shell 用**回弹弹簧**（`motion.startSettle({vx:0, vy:SNAP_RELEASE_FALL_VY_PX_PER_SEC=620})`）把她从窗沿落到工作区地面线；离地面 ≤ `SNAP_RELEASE_FALL_MIN_PX=48px` 时不落下（避免无意义回弹）。`clicked`/`command`/`dragged` **不**落下（目标窗口还在，站在边缘是物理成立的）。没有新状态、新定时器、新通道；render 侧不伪造冲击速度（ADR 0040 D3 的"轻放不缩"口径），这次落地只由 `startle` + 弹簧表达。主链路自检新增 2 条（落回地面线 ±8px / 按轻放处理不触发 landing）
 - **回弹恢复系数与反跳可观测（2026-11-03，ADR 0040 D3）**：`SETTLE_RESTITUTION 0.28 → 0.15`（窗口整块反跳从 15–40px 降到 1/2 以下）；`motion.ts` 新增触地反跳打点（`回弹触地反跳 {bounce, vyBefore, vyAfter}`）与回弹结束的 `bounces` 计数，用来把"弹一下"与"摸头"区分开
 - **拖拽与摸头严格互斥（2026-11-03，ADR 0039 D5）**：`drag-gesture.ts` 新增两道闸——① `patArmed`：只有全新 `pointerdown` 才重新武装，任何一次进入拖拽立刻置 false（"直到下一次全 pointerdown"）；② `movedWindow`：按下期间窗口位置变过（拖拽位移 / 回弹弹簧 / 吸附跟随都会搬窗口）→ 不发 `head_patted`，且**不伪造** `drag_started`（否则回弹期轻点会把她重新拎起来），只留一条 `head_patted 未触发：按下期间窗口被移动过` 日志。`pointer-poller.ts` 在发出 `head_patted` 前再查一次 `settling`（500ms 沉降窗口）与 `isSettling()`，命中即丢弃并 WARN（`head_patted 被丢弃：拖拽/回弹期间严格互斥`）。单测 `drag-gesture` 新增 2 条（窗口被移动 / 拖拽后解除资格）；主链路自检新增"回弹期间 head_patted 被 render 拒绝"与"松手不经过 reacting"
 - **吸附接近（2026-11-02，ADR 0034）**：`src/main/shell/approach.ts` 纯函数（`planApproach` / `sampleApproach` / `approachDelta`）；`snap.ts` 的 `snapNow()` 在距离 >8px 时先发 `snap_approach_started`，在既有 16ms `snap.tick(now)` 里按 `t += dt/duration` 推进（**没有新定时器**），`t>=1` 才 `commit()` 并发 `snap_applied`；`mode='walk'` 用于同一地面线，`mode='leap'` 先水平走到目标 x 下方、再短弧跳上去。接近期间锁目标、暂停跟随；只有 `drag_started` 能立即中断，`clicked`/`command`/`window-gone`/`fullscreen` 延迟到到达后再释放。诊断 `SnapDiagnostics.approaching/approachProgress/approachMode`；单测新增 6 条（`approach.test.ts`）+ `snap.test.ts` 4 条接近用例
@@ -146,12 +149,15 @@
 | **本应用拿不到系统前台权**：主窗口 `focusable=false`（§3.2），自检里 `BrowserWindow.focus()` 无法把自建窗口变成系统前台窗口（Windows 前台锁） | 自检没法"打开一个记事本并让它成为前台"；第一版自检因此把桌宠吸到了真实前台（MuMu 模拟器）上，7 条断言全错 | 几何断言改用**脚本化前台**（`pushScriptedForeground`，仅 `PET_SELFTEST=1` 生效，输入是物理像素、仍走真实 `screenToDipPoint`）；真实 Win32 路径由另一条断言覆盖（"读到前台窗口 + 矩形自洽"） |
 | **DWM 扩展边框与 `GetWindowRect` 差 3–5px**（阴影/不可见调整边框） | 用后者吸附会留一条缝 | 优先 `DWMWA_EXTENDED_FRAME_BOUNDS`（9），失败才退回 `GetWindowRect`；日志记 `source` |
 | **全屏判定是"覆盖整块显示器 bounds"的矩形近似** | 带黑边的无边框全屏可能漏判成普通窗口 | 漏判时位置会被 D-7 夹取或按 `geometry` 拒绝，不会画到屏幕外；拖动目标窗口改变其矩形同样会触发重算/解除 |
-| **接近期间锁定目标、暂停跟随** | 目标窗口在 300–900ms 内移动时，她会落到旧位置，随后跟随轮询（≤120ms）再补正 | 接受为首版取舍；到达后 `lastFollowAt=null` 立即恢复跟随。要"边追边算"需要每帧重算目标，容易抖，暂不做（ADR 0034 D3） |
+| **接近期间锁定目标、暂停跟随** | 目标窗口在 300–900ms 内移动时，她会落到旧位置，随后跟随轮询（≤16ms 追赶 / 常规 120ms）再补正 | 接受为首版取舍；到达后 `lastFollowAt=null` 立即恢复跟随（ADR 0034 D3、ADR 0042 D2） |
+| **跟随的追赶模式只覆盖"变化后 220ms"** | 目标窗口每 300ms 才动一次的"点动"（键盘移动窗口 / 快速点标题栏）会夹在追赶窗口之外，回到 120ms 节流 | 感知上限是 120ms 一次的补正（约 3 帧），肉眼仍是"贴着走"；要更紧就调 `SNAP_FOLLOW_SETTLE_MS`，但空闲时的 Win32 查询会变多 |
+| **窗沿落差 < 48px 时解除吸附不落下** | 她站在目标窗口边缘上（物理成立），不会落到任务栏 | 刻意如此：几十像素的回弹没有观感收益，而且会打断 `startle`。真要"永远落回桌面"就调 `SNAP_RELEASE_FALL_MIN_PX`（ADR 0042 D4） |
+| **解除下落不叠落地缓冲** | 从窗沿掉到桌面时没有下蹲压缩 | ADR 0040 D3 的口径是"轻放不缩"，而"窗沿掉落"没有"松手瞬间竖直速度"这个事实；这次落地只由 `startle` + 弹簧表达（ADR 0042 D4） |
 | **接近中非拖拽解除被延迟** | 点她/托盘解除/目标消失时，她要先走完接近再起身，最长约 0.9s | 避免半空冻结/第三条下落路径；拖动是唯一立即中断（ADR 0034 D4） |
-| **坐姿片段的"身体平移"**：`CH0335_my_event088_pastmemory_01` 11.2–13.5s 把身体搬到长椅上（cx≈-0.0035、minY≈+0.0058 单位），而 `HaloRoot` 不是骨骼、任何片段都不驱动它 | 直接播：她悬在窗口左上角、光环留在窗口中间（实测截图，第一版就是这样） | render 侧两处修正：加载期采样坐姿身体包围盒 → 每帧把"身体中心→窗口中线、最低点→窗口底边"；光环每帧挂到头骨（`updateHalo`）。诊断 `sit.offsetPx` 可见补偿值（实测 x≈+218、y≈-323） |
-| **坐姿片段的最后一帧是闭眼放松姿态** | 观感偏"打盹" | 美术事实，不修改资产；换模型/换窗口需重新标定 `clip-bank` 的 `startSeconds/maxSeconds` |
+| **坐姿片段的"身体平移"**：`CH0335_my_event088_pastmemory_01` 的坐姿窗口把身体搬到长椅上（cx/minY 与站姿差一万分之几单位），而 `HaloRoot` 不是骨骼、任何片段都不驱动它 | 直接播：她悬在窗口左上角、光环留在窗口中间（实测截图，第一版就是这样） | render 侧两处修正：加载期按**停帧那一帧**（`holdSeek`）采样坐姿身体包围盒 → 每帧把"身体中心→窗口中线、最低点→窗口底边"，**并按坐姿片段权重缩放**（ADR 0043 D3，否则落座瞬间会瞬移 390px）；光环每帧挂到头骨（`updateHalo`）。诊断 `sit.rawOffsetPx`（原始补偿，实测 x≈+257、y≈-287）与 `sit.offsetPx`（实际施加 = raw × blend） |
+| **坐姿片段的最后一帧曾是闭眼放松姿态** | 观感偏"打盹" | **已修（ADR 0042 D3 → ADR 0043 D2）**：窗口换到 14.5–14.92s 并**循环**（"睁眼、手放膝上"那一段），不再停帧；换模型/换窗口需重新标定 `clip-bank` 的 `startSeconds/maxSeconds` 并重跑 `holdSeek` 标定 |
 | **掩膜随姿态变化**：坐姿轮廓与站姿完全不同，加载时算出的 body 探针点会落到空气里 | 按下被 D-2 门槛拒绝（"not-interactive"），自检点不中她 | 自检用 `findCurrentHitPoint()` 在当前掩膜上扫描；生产路径无需处理（掩膜本来就是当前姿态） |
-| **坐姿片段播放中（2.3s）身体一直在动**，掩膜逐帧变化 | "扫描命中"与"按下"之间该点可能已经变透明 → 按下被拒（本轮踩到两次） | 自检等 `sit.done === true`（姿态静止）后再采样点击点 |
+| **坐姿是活的**（ADR 0043：片段循环 + 呼吸 + 重心偏移），身体逐帧移动 1–3px | 掩膜逐帧变化，"扫描命中"与"按下"之间该点可能变透明 → 按下被拒（自检踩到过） | 自检的 `findCurrentHitPoint()` 现在只接受"实心点"（周围 8px 四邻至少 3 个也命中）且优先从骨盆高度扫；`sit.done` 已废弃（恒为 null） |
 | **`koffi` 是 optionalDependency**：`build.mjs` 必须把它标成 `external`，且 `@koromix/koffi-win32-x64`（1.0MB `.node`）要随包带上 | 忘记 external 会打包失败；忘带平台包 → 启动期 `require` 失败（功能降级为贴工作区，不崩溃） | `build.mjs` 的 main bundle `external: ['electron','better-sqlite3','koffi']`；启动日志的 `吸附配置` 行会打印 `supported/effectiveMode` |
 | **曾经的怀疑：`desktopCapturer` 抓透明置顶窗会拿到"另一帧"** | 修 ADR 0029 之前，桌面合成图里的姿势确实会和窗口截图不一致（"背对镜头"），当时误以为是抓帧问题 | **已澄清**：那是头骨在漂移（1.5s 转半圈）。修好后两张图一致；断言"截图后 `animation.current.time` 仍为 2.3s"也一直是通过的（它只证明片段没重播，不能证明骨骼没漂——所以另加了 `headQuat` 断言） |
 | Windows 上 `setIgnoreMouseEvents(true, {forward:true})` 的 `forward` 无效，穿透后渲染进程收不到 `mousemove` | 无法用"光标回到模型上"的事件自动恢复交互 | 主进程 ~16ms 轮询光标 + `cmd:probe` 回判（ADR 0002，契约 §3.3 R-6） |
@@ -229,6 +235,45 @@
 ## 模块：render
 
 ### 已完成
+- **坐姿上半身照抄站立姿态（2026-11-05，ADR 0048）**：
+  ① **D1 直接覆盖**——纯待机帧记录 **胸 `Spine1` / 颈 / 头** 三根骨骼的局部四元数（`idleUpperLocals`），坐姿停帧后每帧 `slerp(片段姿态, 站立值, sitGain)` 经 `BoneArbiter.overrideBase()` **直接覆盖**为旋转基底；不叠差值、不做欧拉分解、无固定偏移。呼吸/张望/眼球基底仍叠在其上（"头真的在动""呼吸平缓"两条自检仍通过）。
+  ② **D2 键盘微调**——`setSitHeadTune(rad)` + `window.diagnostics.headTune(rad)` + 键盘 ↑/↓（Shift 大步 0.1 / 普通 0.02）；扫描取证 `face-tune-{m20,m10,p0,p10,p20}.png` 与拼图 `logs/evidence/face-tune-sweep.png`；**定档 `SIT_HEAD_TUNE_RAD = 0`**（完全照抄站立：再往下 0.10/0.20 明显低头、眼型变窄、刘海压眼）。
+  ③ **删掉的旧机制**——`captureSitHeadLevel()` / `measureEyePitch()` / `SIT_HEAD_AIM_DOWN_RAD` / `SIT_HEAD_LEVEL_MAX_RAD` 的运行时使用 / `sit.headRawPitch`、`headLevelPitch`、`eyeRawPitch`、`idleHeadPitch`、`headWorldPitch` 全部移除；`sit.idleUpperCaptured`、`sit.headTune` 新增。
+  ④ 自检：171 条全绿（改写"上半身照抄站立"1 条、新增"微调扫描产出"1 条、删除 2 条数值型头部/眼球断言）。
+- **脸部特写取证 + 头部基准改口径（2026-11-05，ADR 0047）**：
+  ① **取证相机**（D1）——`setFaceZoom(size)`：正交视锥缩到 `size×size` 并每帧跟随头骨（只动相机）；`setEyeProbe(enabled)`：在 `EyeMouth` 贴图上叠准星（绿=眼区矩形、品红=眼区 UV 中心、青=嘴底板），关闭时**整张还原**再重绘（描边压在脏矩形外，局部还原擦不掉——踩过，绿框会永久留在脸上）。两个接口只挂 `window.diagnostics`。
+  ② **头部基准换成"站立姿态"**（D2）——`idleHeadPitch` 在纯待机帧采一次（世界 pitch，实测 **-0.032rad**），坐姿补偿 = 基准 − 片段世界 pitch（实测 **-0.120 − (-0.032) → +0.087rad**，旧实现是 **-0.248rad**）**再加固定低头 `SIT_HEAD_AIM_DOWN_RAD = 0.10`**（头骨朝向相同 ≠ 脸卡朝向相同），**只补 pitch**，yaw/roll 为 0。根因：旧口径拿绑定姿态（T-pose）当平视基准，0.262rad 里大半是参照系误差，补偿把脸抬过头 → 虹膜顶到眼眶上沿（"翻白眼/死鱼眼"）。
+  ③ **不新增 `lookAt` 通道**（D3）——脸部特写 A/B 证明：眼骨 ±0.35rad 对虹膜位置几乎无影响（`face-idle-eye-{down,up}.png` 与 `face-idle.png` 几乎一致），因为 `CH0335_EyeMouth` 是近平面卡片、虹膜画在贴图上；视线由头骨朝向决定。保留 ADR 0046 D1 的"基底=绑定 + 张望×0.35"。
+  ④ **诊断口径统一**（D3 附带）——`sit.headOrientation` 改为**世界（扣微侧身）**、`sit.eyeOrientation` 改为**相对头骨**；新增 `sit.idleHeadPitch`。贴图指纹每次变化打一条日志（`面部贴图 …`），基线指纹也打（`面部基线指纹 …`）。
+  ⑤ **自检**：主链路新增 3 条（脸部特写产出 / 站姿+眼骨 A/B 产出 / 坐姿头部俯仰 A/B 产出）与 2 条改写（头部补偿公式、眼球与头同向）；**修掉 3 条既有的时序抖动**——"说话时被摸头"改成先等上一次反应播完再轮询、"落地下蹲"改成轮询冲击峰值、"眼睛对齐"改用眼相对头的口径（不再是"相对绑定姿态"）。
+- **真机截图三问：死鱼眼 / 翻白眼 / 嘴型与侧坐（2026-11-05，ADR 0046）**：
+  ① **眼球接管**（D1）——停帧后眼骨不再被 Mixer 驱动，片段自带的"向下看"（实测 **+0.262rad**）会永久保留。新增 `BoneArbiter.overrideBase(bone, q)`：坐姿把眼骨的**旋转基底**换成绑定姿态（`eyeBindLocal`，加载时采），再叠 `张望 × 0.35`；零偏移时也写（否则要等第一个非零张望才生效）。实测接管后眼球俯仰均值 **-0.14rad**、与头骨朝向差 <0.2rad。
+  ② **删除全部手写眨眼**（D2）——`bone-arbiter` 删除 `addPosition()` 与整条位置偏移通道；`sit-motion` 删除 `blinkEnvelope`/排期/`blinkNow`；`render-module` 删除 `debugBlink()` 与眼皮骨分支；`main.ts`/`globals.d.ts` 删除 `forceBlink`。**停帧下不再眨眼**（站姿眨眼仍由官方 `Cafe_Idle` 动画提供）。
+  ③ **微侧身**（D3.1）——`SIT_BODY_YAW_RAD = 0.15` 加在 `animationRoot.rotation.y`，按 `sitGain` 淡入；头部基准用 `removeBodyYaw()` 在**未侧身**坐标系里量（否则补偿会把侧身转回去）。
+  ④ **嘴型**（D3.2）——`MOUTH_FRAME_CLOSED` 7 → **0**（平直细线），`staticFrameIndex = 0`，`mouthWidthRatio 0.24 → 0.32`；表情嘴型重映射 `smile=7 / frown=8 / small=0 / open=2`（原来 `small=9` 是**大圆张口**，正是"常驻微张"的元凶）。
+  单测：`bone-arbiter` 6 条（基底覆写 2 条 + 删除位置偏移 3 条）、`sit-motion` 9 条（删眨眼 2 条、加"无眨眼字段" 1 条）、`speech` 5 条、`facial-texture` 1 条；主链路自检 169 条（新增眼球/侧身/无眼皮位移/停帧嘴型取证）。
+- **真机四问：开局转圈 / 坐姿低头 / 上半身僵硬 / 嘴型（2026-11-04，ADR 0045）**：
+  ① **删除转圈**（D1）——`fidget.ts` 只剩排期，`render-module.updateFidget()` 只尝试 `playOnce('fidget.shy')`，片段缺失**什么都不做**（不回退程序化）；诊断 `fidget.kind` 收窄为 `'shy'`。
+  ② **头部基准重置**（D2.1）——新增 `sit-head.ts`（`sitHeadLevelCorrection` / `removeHeadOffset` / `headWorldPitch` / `headWorldYaw`）：`playHold('sit')` 权重 ≥0.95 的第一帧量一次头骨**世界** pitch（先减掉上一帧自己叠的 `yaw·pitch`），之后每帧 `+(-pitch)×包络` 抵消；夹取 ±0.6rad；离开坐姿不硬清零（跟着 500ms 包络淡出）。诊断 `sit.headRawPitch` / `sit.headOrientation`。
+  ③ **张望改干脆**（D2.2）——每 2.2–4.2s 换目标、水平 ±0.36rad、**72% 抬头**（-0.06…-0.22）/28% 往下（+0…0.06），固定时长 `easeInOutCubic` 220–420ms 走完（废止指数阻尼）。
+  ④ **肩膀呼吸**（D2.3）——锁骨与上臂各 ±0.02rad，上臂相位领先 90°。
+  ⑤ **晃腿加大且不对称**（D3）——大腿 0.17rad / 小腿 0.136rad（×0.8），左腿速度 ×1.05、右 ×0.95，幅度 0.9，包络幂次 0.66/0.82，膝盖滞后 0.32rad（膝盖只往"折"的方向走，脚不会低于静止姿态）。
+  ⑥ **嘴型**（D4）——`MOUTH_FRAME_CLOSED` 0 → **7**（小弧线），`drawAtlasFrame` 静态帧必须传真实帧数（新增纯函数 `atlasFrameIndex()`）；口型改**四档元音**（7 / 6·14 / 1·3 / 2·9）+ 档内 180ms 轮换。
+  ⑦ **顺带修掉一个 NaN 传播**：`sit-motion` 的随机源全部走 `sampleUnit()`（NaN/∞/越界钳到安全值），否则注入式随机源会把 `gazeYaw` 变成 NaN 一路传到头骨四元数。
+  单测新增 `sit-head.test.ts`（3 条）、`sit-motion` 扩到 10 条、`speech` 口型 5 条、`facial-texture` 静态帧 1 条；主链路/语音自检各加 4 条真机断言（头部基准 / 头真的在转 / 晃腿幅度与不对称 / 闭嘴帧 / 多帧口型）
+- **坐姿回到停帧 + 全程序化微动（2026-11-04，ADR 0044）**：0.42s 循环被真机判为"抽搐"，本轮**废止**（`clip-bank.sit` → `loop:false`、14.5–14.7s、`playHold` 停帧）。停帧后 Mixer 只给静态姿态，四件事全部程序化重建，参数集中在 `shared/constants.ts` 的「坐姿活体微动」段：① **呼吸**——单根 3.6s 正弦，整体高低 ±0.9px（旧 2.4px + 0.5% 躯干缩放已删，那是"心跳感"）+ 脊柱/脊柱1/颈 ±0.006/0.004/−0.0025rad；② **自主张望**——坐姿期间**不调用 `gaze.update()`**（光标视线关闭），新调度器每 3–6s 随机 ±0.3/±0.15rad，`1-exp(-3.2·dt)` 阻尼缓动；③ **眨眼**——每 2.5–5s，`bone_eye_D_L/R.translation.x` 平移 **0.00028**（实机标定：0.00017 只闭 60%，0.00028 闭 91%），110/50/180ms 平滑包络；④ **悬空晃腿**——左右交替、`0.5−0.5cos` 单峰（只往抬的方向，避免脚甩出窗口底边），大腿 ±0.08rad / 小腿 0.06rad，600ms 软启动 + 500ms 总包络。新增 `sit-motion.ts`（纯数值，10 个单测）与 `bone-arbiter.addPosition()`（位置偏移与旋转共用"检测 mixer 重写"逻辑，防止眨眼位移累积）。**注意：其中 D3 的张望参数（3–6s / ±0.3 / 阻尼）与 D5 的晃腿幅度（0.08/0.06）已被 ADR 0045 调整；D4 的眨眼（含 `addPosition()`）已被 ADR 0046 D2 整体删除**
+- **`roleWeight` 的"暂停=没播"bug（2026-11-04，ADR 0044 排查）**：`clampWhenFinished` 把 action 置为 `paused`，`isRunning()` 变 false，旧 `roleWeight()` 据此过滤 → 停帧 0.42s 后坐姿权重掉到 0 → **身体平移补偿整块消失**（截图里她被推到窗口左边、只剩半个身子）。改为维护"已激活角色表"，只认 `enabled + 权重`。新增 `role-weight.test.ts`（停帧后仍报 1 / 未播放恒为 0）
+- **坐姿取帧改为"睁眼基线"（2026-11-04，ADR 0044 D1）**：窗口 14.5–14.92s → **14.5–14.7s**。14.8s 之后她开始眯眼（14.92s 眼皮 x 已 0.000314），基线半闭会让程序化眨眼看不出来。
+- **取证接口（内部，不进 `RenderState`）**：`sitMotionDiagnostics()`（极轻的微动快照——`getDiagnostics()` 单次约 300ms，采不到瞬态）、`debugBlink(holdMs)`（**ADR 0046 D2 已删除**：停帧不眨眼）。新增 `tools/measure-blink.py`（虹膜像素占比判"闭没闭上"）与 `tools/compose-sit-alive.py`（微动联系表）
+- **启动冷却：开局不再转圈（2026-11-04，ADR 0043 D1）**：三个根因一起堵死——① `fidgetAt` 初值 `0` → **`+Infinity`**（"安全冷却"而不是"立即到期"）；② `updateFidget()` 在模型未就绪（`ready=false` / 无 animations）时直接 return（旧实现会在"首帧→加载完成"的空窗里命中"条件全满足"，于是在加载期间转了一圈）；③ 排期改用纯函数 `nextFidgetAtMs(now, startedAt)` = `max(now + 45–95s, startedAt + 45s)`，以渲染模块构造时刻为基准，**启动后前 45 秒绝对不可能触发**。实测：06:31:17 启动 → 06:32:06 首次 `spin`（49s）。单测新增 3 条（排期边界 / 晚排期 / 非法输入）
+- **坐姿不再是假人（2026-11-04，ADR 0043 D2/D4）**：`clip-bank.sit` 从"13.4–15.6s 停帧"改为**循环 14.5–14.92s**（0.42s，普查确认 14.5→14.9 的骨骼差在 1–2px 量级，接缝几乎看不见）——片段自带的呼吸/头发/手指微动回来了。`animation-controller` 三处配套：**循环角色也按窗口裁剪**（旧实现 `selection.loop ? base : trimClip()` 会静默忽略窗口，把 38s 过场整段绑上）、`playRole(role, fade, slot|null)`（坐姿不是 Base 槽位）、`roleWeight(role)`（未播放的 action 默认权重是 1，不能直接读）。另叠一层程序化微动：`bobPx` ±2.4px、`breathScale` ±0.5%（根节点 scale.y，从脚底向上伸缩、脚不离地）、`swayPx` ±1.6px/5.2s。单测新增 4 条
+- **落座不再乱平移（2026-11-04，ADR 0043 D3）**：根因是 `sitOffsetPx()`（实测 x≈+265 / y≈-287）被**常量硬套**——`snap_applied` 那一帧 `animationRoot.position` 直接加满，模型瞬移近 390px；更早的 `snap_approach_started`（接近阶段 `sitting` 已为 true）也在带着这个偏移走路。修法：新增 `updateSitGain()`，用**片段混合权重**当唯一插值因子（`sitGain = roleWeight('sit')`，程序化降级退回指数包络），**所有**坐姿量（补偿、下沉、过渡抬升、呼吸、重心、后倾、弯腿）都乘它；`sitPoseActive` 闩锁保证"标定期不算在坐"。实测逐帧：`blend` 0→0.26→0.56→0.81 时 `offsetX` 0→66.7→143→209.5（= raw 257.3 × blend），`headWorld.x` 相邻帧最大跳变 **4.9px**。自检新增 3 条（补偿=raw×blend / 落座连续 / 循环播放）
+- **拖拽统一官方悬空片段 + 删除全部程序化姿态（2026-11-03，ADR 0041 D1）**：`clip-bank` 删除 `held.limp`（`Carrier_Idle` 其实是普通站姿，正是"拖头不触发官方动画"的根因），`held` 只剩 `CH0335_Formation_Pickup`，**从第 0 秒起播**（0–1.2s 就是"被拎起来"的屈膝起势，每次抓起都有官方起势）。抓取带（head/body/foot）此后**只**决定 `DRAG_PENDULUM` 的摆长/阻尼/限幅/挣扎，不决定播什么。**删除**：`drag-motion.ts` 的 `dragBoneOffsets()`（12 根骨、三态手写姿态）、`DRAG_PENDULUM[*].liftPx`、render 第 4.2 步的骨骼叠加与第 6 步的 `dragLift`。保留：受迫单摆 + `pivotCompensation`（整身绕抓取点旋转）+ `struggleOffset`（作为单摆角度的一部分）。自检新增 2 条（抓头拖拽仍播 `Formation_Pickup` + 窗口跟随），单测把"三态姿态"换成"三态物理参数、字段里不得出现姿态项"
+- **摸头收尾不再被切断（2026-11-03，ADR 0041 D2）**：根因有两个——① `animation-controller` 的 `finished` 固定回 `returnTo` **槽位**，而待机姿态会轮换（抱臂站姿被淡入成普通站姿）；② 裁剪窗口 0.3–2.4s 含片段自己 0.2s 的快速抬头，后面又接 0.25s 淡出。修法：`playOnce` 记住 `oneShotReturnAction`（播出前正在播的那个 action）并在播完淡回它；`ClipRule` 新增 `fadeInSeconds/fadeOutSeconds`；摸头窗口改 **0.3–2.05s + 淡出 0.45s**（停在保持段末尾，抬头/放手交给交叉淡入）。**没有**加"最后 0.2s 骨骼回正插值"（ADR 0039 D2 禁止为摸头写骨骼偏移）。单测新增"播完回到演出前的动作"1 条
+- **片段利用率：13 个语义角色 + 4 段待机 + 空闲小动作（2026-11-03，ADR 0041 D3/D4）**：新增 `idle.alt2`（`Carrier_Idle`）、`idle.alt3`（`Victory_End_Random`）、`nod`（`Cafe_Reaction` **8.7–9.9s** 的鞠躬，≤1.2s）、`fidget.shy`（`Cafe_Reaction` 3.2–4.9s 的掩面缩身）；`INTENT_CLIP` 扩到 `{greet, nod, happy_hop}`，`happy_hop` 在官方片段之上保留 22px 根跳（§4.4 要求"有位移的小跳"）。待机轮换池 2 → 4 段；新增 45–95s 一次的空闲小动作：`spin`（纯根节点偏航 1.7s，梯形速度曲线，0→2π）与 `shy`（官方片段）。fidget **不是**新状态：Base 仍 `idle`、`overlay` 仍 `null`，只进内部诊断 `RenderDiagnostics.fidget`
+- **坐下过渡（2026-11-03，ADR 0042 D1）**：`snap_applied` 之后 240ms 内叠加一次性"半蹲"——`transitionLiftPx` 从 +14px 落到 0、`thighBend` 0.22rad → 0、`lean` 0.05rad → 0（`sit-pose.ts` 的 `sitPose()`），与 0.45s 的片段淡入同时发生；只在**首次落座**时出现（改吸另一扇窗不重播）。程序化降级路径不叠这次抬升
+- **坐姿窗口换成"坐正、手放膝上"（2026-11-03，ADR 0042 D3）**：`clip-bank.sit` 由 11.2–13.5s（手撑脸、闭眼、前塌）改为 **13.4–15.6s**（撑起身子 → 手放膝上、睁眼、大腿水平、小腿垂下），`playHold` 停在 15.6s。`calibrateSitPose()` 改为 `playHold` → **`holdSeek(片段末尾)`** → 采包围盒（旧实现量的是片段第一帧，补偿量偏）；`ModelAnimations` 因此新增 `holdSeek(seconds)`。桌面合成截图证据：`dist/selftest/window-sitting-desktop.png`
+- **自检还要修的一个假失败**：`头部区：光环上的点 hit=true 但 head=false` 只探**中线**（x=W/2），而光环在角色右上方——该行是否命中取决于当帧头发/光环摆到哪儿，实测约 50% 假失败。改为"每一行沿 x 扫 8px 步长找第一个命中点"，断言终于稳定（2026-11-03）
 - **背面法描边（2026-11-02，ADR 0038）**：新增 `outline.ts`（`applyOutline(mesh)` + `OutlineSet`）。做法 = `mesh.clone(false)`（`SkinnedMesh.copy()` **共享同一 `Skeleton`** 与绑定矩阵）→ `ShaderMaterial{ side: BackSide }` → 顶点着色器里 `#include <skinning_*>` 全链拿到**蒙皮后的法线与位置**，再按 `mvPosition.xy += viewNormal.xy * smoothstep(0.02,0.30,len) * width` 外扩 → 纯色输出。**宽度单位是屏幕像素**（正交相机下 1 视空间单位 = 1 CSS px）：身体/脸 **1.5px**、头发 **0.8px**、颜色 `0x2a1b1a`、深度偏移 0.6px + `polygonOffset`。范围：`Body`/`Hair`/`Face`（3 个描边壳，共享 2 个材质实例）；`EyeMouth`/`Eyebrow*`/`Halo`/已隐藏配件**不描**。**没有后处理、没有新 RenderTarget、没有第二套动画状态**。实测：draw call **7 → 10**、三角形 9,926 → 19,130（同一几何再画一遍）、帧时间 EMA **16.7 → 16.7ms**（vsync 封顶）；描边壳与源网格**世界矩阵逐元素一致（`matrixDelta = 0`）**，所以呼吸/眨眼/拖拽/坐姿全程不穿模、不滞后。**两个实测坑**：① 归一化 `viewNormal.xy` 会把"正对镜头"的浮点噪声放大成随机方向 → 脸皮/头发卡片上出现楔形黑块（暗像素占比 16.1%→23.3%），改 `smoothstep` 后收敛到 +4.2pp；② 头发是**重叠卡片**，每张卡的描边会叠线，1.2px 档最厚处 12 设备像素（6 CSS px），单独降到 0.8px 后收敛到 2–3px。A/B 截图（`PET_OUTLINE_DIAG=1`，连拍 6 对取 16×16 缩略图差最小的一对）：整身暗像素占比 24.8%→28.7%、头部 16.0%→20.2%、外套 29.7%→33.2%。主链路自检新增 5 条结构级断言（含 `matrixDelta`）
 - **光环受光定论（2026-11-02，ADR 0038 D6）**：`PET_HALO_DIAG=1` 同姿态对照 `MeshBasicMaterial` vs `MeshToonMaterial`——区域亮度 198.2 → 193.0、暗像素占比 13.2% → 16.7%，观感从"均匀发光的粉色符号"变成"右半侧暗玫瑰 + 顶部高光被吃掉"的脏塑料片。**定论：光环保持无光照 `MeshBasicMaterial`，不吃光、不描边**。`window.diagnostics.setHaloToon(true)` 只留作一次性对照（沿 ADR 0026 的惯例），不进生产路径
 - **全局光照 + Toon（2026-11-02，ADR 0037）**：先做**资产审查**再动材质。新工具 `tools/audit-glb-assets.mjs`（只读、自带 PNG 解码）遍历 GLB：**8 张贴图全是 RGBA8 颜色贴图、10 个材质只有 `baseColorTexture` 一个槽、没有 Mask/Ramp/多通道打包图、没有第二套 UV**——本资产是"纯色平涂 + 一张颜色图"的移动端 NPR 资产，阴影信息不在贴图里。`COLOR_0`：**RGB 全为常量**（要么全 1，要么整块一个常量色），**alpha 才是真数据**（0/0.102/0.2/0.251/0.349/0.502/0.745/1，即 8 bit 量化的 26/51/64/89/128/190/255），按骨骼分布与飘带/躯干相关，**疑似描边遮罩而非阴影 ramp**；`Eyebrow`/`EyeMouth` 的 alpha 恒为 0，所以 alpha **绝不能**接进 `alphaTest`/`transparent`。实现：新增 `toon-shading.ts`（`ToonShading` 类）——主方向光（强度 2.6、方向 `(-0.38,0.72,0.58)` = 斜上方偏左前）+ 极低环境光（0.55，占受光面 17.5%），**`ambient + directional = π`** 使受光面 = 贴图原色（白外套不被压灰）；代码生成 **3 阶** `DataTexture` 色阶（32×1、`NearestFilter`、`NoColorSpace`，断点 `dot≤0.12→0.58 / ≤0.38→0.80 / >0.38→1.00`）→ 硬边二分；**只把 `CH0335_Body` 与 `CH0335_Hair`** 换成 `MeshToonMaterial`（保留 map/color/alphaTest/side/depthWrite，显式 `vertexColors:false`）。**面部死守**：`Face`/`EyeMouth`/`Eyebrow*` 由正则双重排除，永不参与。**ADR 0036 的手部顶点色烘焙整体废止**（删 `skin-shading.ts` 及其单测/诊断接口），手部改由真光照产生明暗。A/B（`PET_TOON_DIAG=1`，同表情同帧，连拍 5 对取脸部统计最接近的一对）：外套近白占比 **38.6% → 30.6%**、左手 **35.1% → 19.3%**、全身亮度只降 4.2%（受光面不变）；截图 `toon-00-before.png` / `toon-01-after.png` + 5 张局部裁剪。主链路自检 **131/131**（4 条材质级断言替换原"手部烘焙"1 条）；单测新增 `toon-shading` 6 条、删除 `skin-shading` 6 条；`tsc --noEmit` 0 错
@@ -280,8 +325,10 @@
 - 掩膜采集与 `cmd:probe` 应答（128×72、20Hz、垂直翻转、cold/stale/矩形退路）、`cmd:drag` 上行、R-8 暂停链路保持上一轮实现，未回退。
 
 ### 未完成
-- 坐姿片段的时间窗（11.2–13.5s）是**本资产**的标定值，换模型要在 `clip-bank.ts` 重新量；换掉之后"身体平移补偿"仍会自动生效（它是运行期测的），但"坐得像不像"要人眼复核
-- `sitting` 期间没有专门的坐姿表情（沿用当前 `emotion`；片段自带闭眼，遮住了部分表情效果）
+- 坐姿片段的时间窗（14.5–14.92s 循环）是**本资产**的标定值，换模型要在 `clip-bank.ts` 重新量（还要确认循环接缝 < 2px）；换掉之后"身体平移补偿"仍会自动生效（它是加载期按停帧测的），但"坐得像不像"要人眼复核
+- **抓头与抓脚"上半身表现"一致**（都播 `Formation_Pickup`），只有单摆物理不同；要恢复部位特有的悬空姿态，需要第二段"悬空"素材（`Victory_End_interaction_01` 是唯一候选，但根骨偏左 128px、悬空 73px，要先做中心/落地补偿）
+- 空闲小动作是**概率性**的（45–95s、50% 转圈 / 50% 害羞），自检无法稳定命中；只有纯函数单测 + 日志可证
+- `sitting` 期间没有专门的坐姿表情（沿用当前 `emotion`；片段自带"手放膝上"的姿态，表情效果比旧窗口明显）
 - **官方表情差分尚未获取**：`ZM-Kimu/Blue-Asset-Downloader` 在本机卡在三处环境问题（uv 对 PyPI 的 TLS 证书不受信、缺 .NET 10 SDK、未走到 BA CDN），详见 ADR 0026 D6.4。当前 `data/expressions/` 为空，表情走"只变嘴型"降级；`data/expressions.fixtures/` 是非官方 fixture，仅用于自检自证
 - 眉毛类表情（§4.5 的"眉内侧下压""眉下压"）：本资产眉毛/眼线是几何体 + 1 texel 纯色块，贴图改不了形状。若官方差分里带眉毛则可直接接入（协议白名单加文件名即可），否则需要"眉毛贴片"（等于改模型）
 - `angry` 与 `sleepy` 共用 `half` 眼型、嘴型差异小，视觉区分度一般（可继续调参或加眉毛贴片）
@@ -319,13 +366,13 @@
 |---|---|
 | `speech_started` | Overlay=`speaking`；`applyFacial(force)` 立刻把嘴层交还 `lip-sync`（§5.2 口型通道最高优先级）；之后口型由渲染侧播放器按包络驱动（ADR 0015 D4） |
 | `speech_ended` | Overlay 退出 `speaking`；嘴型 `resetMouthFrame()` 回闭嘴帧（任何 reason） |
-| `drag_started` | Physics=`dragged`；**先 `cancelOneShot()` 收走在播的摸头片段**，再 crossFade 到 `Carrier_Idle` 并抬升/摇摆；R-8 暂停掩膜采集；清除摸头表情投影（ADR 0039 D5） |
+| `drag_started` | Physics=`dragged`；**先 `cancelOneShot()` 收走在播的摸头片段**，再 crossFade 到官方悬空片段 `CH0335_Formation_Pickup`（**任何抓取带都一样**，ADR 0041 D1）；R-8 暂停掩膜采集；清除摸头表情投影（ADR 0039 D5） |
 | `drag_released` | Physics=`settling`（同时清空 reaction）；R-8 从此刻起等 500ms 再恢复采集；crossFade 回 Idle |
 | `head_patted` | Overlay=`reacting`；**只有 Base=`idle`、无 Physics、不在说话时**才播官方 `pat` 片段（其余场景只有 `shy` 表情）；`dragged`/`settling` 期间直接拒绝并记日志（ADR 0039 D4/D5） |
 | `intent_resolved` | 只取 `emotion`（不触发动作）；摸头期间投影为 `shy`；该值驱动**面部贴图合成**（眼型/嘴型/红晕，ADR 0026） |
 | `motion_ended` | ADR 0024：`kind:'walk'` → Base 回 `idle` 并重新排期；`kind:'settle'` → Physics 退出、加落地缓冲 |
-| `snap_applied` | ADR 0028：Physics=`sitting`、收步、播官方坐姿片段并停在最后一帧（缺片则程序化降级）；期间不做行走调度 |
-| `snap_released` | ADR 0028：只在仍是 `sitting` 时退出 → 淡回 `idle` 并重新排期行走（`dragged` 优先，不会被回滚） |
+| `snap_applied` | ADR 0028 / ADR 0042 / ADR 0043：Physics=`sitting`、收步、240ms 半蹲过渡 + **循环**官方坐姿片段（14.5–14.92s），补偿按片段混合权重缩放（缺片则程序化降级 + 指数包络）；期间不做行走调度 |
+| `snap_released` | ADR 0028 / ADR 0042：只在仍是 `sitting` 时退出 → 按 reason 播 `startle`、淡回 `idle` 并重新排期行走（`dragged` 优先，不会被回滚）；`window-gone`/`fullscreen` 之后由 shell 把她落回桌面 |
 
 > 生产侧（既有）：`model_ready` 由 render 经 `evt:broadcast` 上行（§6.3 事件，未新增）。
 
@@ -333,6 +380,10 @@
 
 | 现象 | 影响 | 规避 |
 |---|---|---|
+| **眼骨的旋转对画面几乎无效**（ADR 0047 排查 2）：`CH0335_EyeMouth` 是近平面卡片（z 厚 1.4mm），虹膜画在贴图上 | 眼骨 ±0.35rad（20°）的 A/B 在 260px 特写下只挪 2–3px；"让眼球看向相机"这种需求**改骨头没用** | 视线由**头骨朝向**决定：头部基准对齐站立姿态（D2）。真要改瞳孔位置只能改贴图（UV 偏移/正视眼型图） |
+| **眼区 UV 标定只覆盖单眼内角一小块**（`eyeSurfaces` 两个矩形 UV 完全相同，准星探针可见），嘴底板准星也偏在嘴下方 | 官方 `eyes_*.png` 差分图层**无处可画**（表情的眼型一直是 `missing` 降级） | 已知缺陷，不做半吊子修补：要用差分眼型必须先重做"按 UV 分眼"的标定，并逐张目视核对 |
+| **`eyeProbe` 关闭时不能只走 `repaint()`**：准星描边压在脏矩形边界上，局部还原擦不掉 | 关掉探针后绿框永久留在脸上 | `debugProbe(false)` 先整张 `drawImage(base)` 还原再重绘（ADR 0047 D1 已修） |
+| **世界欧拉角在 y≈±90° 附近退化**：`headWorldYaw` 在坐姿下读到 1.474rad 附近，张望 0.24rad 只让 yaw 变化 0.017rad | 用世界 yaw 量"头在不在转"会误判成"头不动"（自检当场报红） | 判"在动"用 `sit.headOrientation`（相对绑定姿态，范围稳定）；判"对齐站立"用 `sit.headWorldPitch`（世界 pitch，与 `idleHeadPitch` 同口径） |
 | **描边外扩不能对 `viewNormal.xy` 归一化**：正对镜头的面 `|xy|→0`，归一化会把浮点噪声放大成一个随机方向，仍按满宽外扩 | 脸皮与头发卡片上出现**楔形/条状黑块**（同帧 A/B 的暗像素占比 16.1%→23.3%），看起来像贴图坏了 | 乘 `smoothstep(0.02, 0.30, len)`：轮廓处（len≈1）满宽、正对镜头的面平滑归零（ADR 0038 D2.1）；改后增量收敛到 +4pp 以内，楔形消失 |
 | **头发是"重叠的卡片"**：每张卡片的轮廓都会各外扩一圈，几层投影重合处线宽叠加 | 1.2px 档在侧发重叠处叠出 **12 设备像素（6 CSS px）**，像贴纸黑边 | 头发单独一档 **0.8px**（`OUTLINE_HAIR_WIDTH`），重叠区收敛到 2–3px；单层发梢仍是清晰一条线（ADR 0038 D4）。要根治只能合并外壳或走后处理，两条都被"不做后处理"否掉 |
 | **`Face` 是开口曲面**：`BackSide` 对正对镜头的三角形全部剔除 | 脸皮的描边**几乎看不见**（"装了但没有像素"）；下巴/颈部那条线其实来自 Body 与 Hair | 这是资产事实，不是 bug；`Face` 仍按需求接入（换成封闭脸皮的模型才会显现）。**不要**为了"看得见"改用 `DoubleSide`——那会把描边糊在脸上（ADR 0038 D5） |
@@ -391,21 +442,44 @@
 | **向上甩手再落下的拖拽不会触发落地压缩**（ADR 0040 D3 的推论）：`drag_released.vy < 0` → `releaseDownVelocity = 0` | "把她往上一抛"的玩法没有落地反馈 | 刻意的：冲击只看"松手瞬间有没有向下送"。若将来要按"落下高度"分级，需另立 ADR 从窗口轨迹反推 |
 | **`HEAD_PAT_RADIUS_RATIO = 0.125` 与四个落地阈值都是本资产/本机标定值** | 换模型（身高比例不同）或改窗口高度后，圆可能盖住胸口或盖不到下巴 | 自检的 `头部区几何` 会打印 `headBoneCss / headRadiusPx / bandBottomCssY`；换资产先跑一遍再定比例 |
 | **`head = null` 的三层降级只在"骨骼+掩膜都不可用"时出现**（占位胶囊体、掩膜 cold 且无模型） | 此时点哪都不算摸头（保守丢弃） | 符合 ADR 0004 D1.6；日志里 `blockedBy="head-rejected"`、`headRejectedBecause="mask-unavailable"` 可确认 |
-| **坐姿片段末帧闭眼**：视线/表情在最后 0.5s 不易读 | 坐姿"看着用户"的观感被闭眼削弱 | 已在 11.2–13.5s 内尝试标定；接受资产事实，保持头部 yaw 可读；换模型要重新选窗口 |
+| **坐姿片段末帧闭眼**：视线/表情在最后 0.5s 不易读 | 坐姿"看着用户"的观感被闭眼削弱 | **已解决（ADR 0042 D3 → ADR 0043 D2）**：坐姿窗口换成 14.5–14.92s 循环（睁眼、手放膝上）；旧窗口 11.2–13.5s 的闭眼问题不再存在 |
 | **窗口移动期间的轻点都不算摸头**（回弹 / 行走 / 吸附跟随）：`movedWindow` 判据会把它压掉并记日志 | 想摸正在走路的她，可能"点不动" | 已知取舍（ADR 0039 D5）：移动中的目标无法与"拖拽后的抬手"区分。要修必须让 D-3 的距离排除窗口自身位移（`cmd:drag` 加窗口位移或把 motion 状态喂给判定），属契约变更，暂不做 |
 | **抓取点用骨骼最近点分类**：点到光环/武器（已隐藏）或发梢可能落到 head/body 的边界 | 极端点位可能选错支点 | 骨骼缺失/不可信时退回掩膜 bbox 三段带；点到光环的概率低，且光环不是可拖拽语义 |
 | **6 个 `*_interaction_*` / `Victory_*_Random` 片段的可用性只有目视结论**：`Victory_Start_interaction_01` 首帧是腾空翻滚的过场（带根位移/镜头感），`Victory_End_interaction_01` 是原地小动作 | 直接拿来当"互动反应"会穿帮（她先飞起来再落地） | 片段表里只接 `Victory_Start_Random`（正面、站姿起、闭环回正）；过场片段在 `clip-bank` 不登记，换资产要重新用 `tools/clip-preview` 过一遍 |
 | **摸头反应在"说话 / 走路 / 坐着"时只有表情**（§5.3 / ADR 0039 D4）：身体通道一动不动 | 观感比"整身片段"安静，容易被误判成"没反应" | 这是"删掉程序化姿态"后的唯一诚实实现；表情仍是官方 `shy` 差分投影。要身体反应就必须允许整身片段接管，那与 §5.3 冲突 |
-| **摸头片段 2.1s 长于 800ms 冷却**：冷却期内再点会重启片段（`playOnce` 重置） | 连续摸头看起来像"一直在缩着" | 符合 §4.1"被同类型新反应替换"；若要"冷却期内忽略"需要改 D-4，属于契约变更 |
-| **`pat` 的裁剪窗口（0.3–2.4s）与 `sit` 的（11.2–13.5s）都是本资产标定值** | 换模型/换动作集后可能剪到半个动作 | 换资产必须用 `tools/clip-preview/census.cjs` + `filmstrip.cjs` 重新标定（ADR 0039 D1） |
+| **摸头片段 1.75s 长于 800ms 冷却**：冷却期内再点会重启片段（`playOnce` 重置） | 连续摸头看起来像"一直在缩着" | 符合 §4.1"被同类型新反应替换"；若要"冷却期内忽略"需要改 D-4，属于契约变更 |
+| **`pat` 的裁剪窗口（0.3–2.05s / 淡出 0.45s）与 `sit` 的循环窗口（14.5–14.92s）都是本资产标定值** | 换模型/换动作集后可能剪到半个动作，或收尾又变生硬 | 换资产必须用 `tools/clip-preview/census.cjs` + `filmstrip.cjs` 重新标定（ADR 0039 D1 / ADR 0041 D2 / ADR 0042 D3） |
 | 嘴型"shy"帧（索引 4）曾是**资产相关标定** | ADR 0039 起摸头不再单独切这一帧，改为 `emotion=shy` 的官方差分；该常量已随 `pat-react.ts` 删除 | 若将来又要"只换嘴型不改眼型"，重新看图集选帧并写回本坑位 |
 | **口型的 8 级映射是未标定假设**：图集 8×8=64 帧没有语义标注，实现假定 `0..7` 是"闭口→逐步张口"，帧 0 一定闭嘴 | 换图集/换角色时帧序可能完全不同，嘴型会"跳帧"或不对应音素 | 映射只在 `shared/constants.ts`（`MOUTH_LEVELS`）与 `mouth-mapping.ts`；帧 0 被 `resetMouthFrame` 强制回闭嘴。实测本资产帧 7 是明显张口，截图可辨 |
 | `speech_ended` 会立刻 `resetMouthFrame()` | 若把"说完后的余韵"当成表现需求，会被这行抵消 | §5.2 口型通道最高优先级；宁可闭嘴也不要"说完张着嘴"。摸头的 `shy` 表情由 `applyFacial` 的状态指纹重画，不依赖嘴型帧 |
 | **`capturePage()` 返回的是物理像素**（本机 844×1440），而诊断点位是 CSS px（422×720） | 自检像素差一开始全 0（裁到了左上角透明区）；肉眼截图明明有变化 | 自检按 `image.width / contentBounds.width` 缩放区域；任何截图比对都必须先算 DPR |
 | 44 段 clip 全部建 action（`mixer.clipAction`），只有 2 段在跑 | 初始化多一点开销与内存；无按次成本 | 这是 three 的常规做法，切片段时才需要 action 已存在；如后续片段数暴涨再评估懒加载 |
 | `dragging` / `lastPatActive` / `dragPoseGain` 是**内部标志位**，不是 §4.1 的状态名 | 读代码/日志时容易误以为新增了状态 | 只会出现在 render 内部；对外状态仍只有 `base/overlay/physics` 三个字段（§4.1 集合未变）。`reaction.kind` 里的 `head_patted` 是"触发来源"，不是状态名 |
+| **`Carrier2_Idle` / `Carrier2_Walk` 与 `Cafe_Idle` / `Cafe_Walk` 是同一份数据**（普查逐项相同：缩身 0.001、手到脸 0.007、yaw 1.553） | 误把它俩当"额外待机/走路"接线，会得到两个一模一样的姿势 | 只作模式降级候选，不进待机池（ADR 0041 的资产普查）。换资产要重新比对 |
+| **`*_interaction_*` / `*_Interaction_*` 四段是过场，根骨被搬到镜头外**：`Victory_End_interaction_01` 偏左 128px 且悬空 73px、`Victory_Start_Interaction_02` 与 `Victory_End_Interaction_02` 各偏左 190px | 接进 422px 宽的窗口她半个身子在窗外（"举手打招呼""开心"看似可用，实际不能用） | `clip-bank` 不接线；要用必须先做"身体中心 → 窗口中线"的**按片段**补偿（目前只有 `sit` 有这套：`holdSeek` + 停帧包围盒） |
+| **资产里没有"挥手"，也没有"伸懒腰/原地转圈"**：正面家族没有任何片段把手抬到肩以上（唯一"双手举过头"是侧身的 `Vital_Retreat` / `Vital_Death`） | "打招呼挥手""伸懒腰"这类需求不能靠官方片段满足 | `greet` 用 `Cafe_Reaction` 0.15–2.2s 的"抬手摊开"（最接近）；"原地转圈"已于 **ADR 0045 D1 整体删除**（无位移的根偏航读作"贴图在转"），**不做**手写伸懒腰/歪头（ADR 0039 D2 的同一理由） |
+| **`Formation_Pickup` 是 14s 循环片段**：拖拽超过 14s 会循环回"从地上被拎起"的屈膝起势 | 极长拖拽会看到她"又被拎起来一次" | 接受（拖拽通常 < 10s）；要根治得把窗口裁到 1.4–14s，但那样就失去"每次抓起都有官方起势"的效果（ADR 0041 D1 的取舍） |
+| **空闲小动作是概率性的**：45–95s 一次，且**只剩官方害羞片段**（ADR 0045 D1 删除转圈） | 自检无法稳定命中它，几分钟内也可能一次都不出现 | 只对 `fidget.ts` 的纯函数做单测（间隔边界、45s 冷却）；真机看 `空闲小动作` 日志确认 |
+| **自检里两个"时间窗"假失败（2026-11-03 各复现 1–2 次；2026-11-04 又复现一次，已彻底修）**：① `头部区：光环上的点…` 只探中线（x=W/2），而光环在角色右上方；② `落地：向下快速松手 → 轻微下蹲` 在回弹收敛那一拍直接读 `drag.landingImpact`，而落地缓冲只活 220ms | 主链路自检偶发 1 条失败（exit 1），看起来像功能坏了 | ① 每一行沿 x 以 8px 步长找第一个命中点；② **不要用 `waitFor` 去撞 220ms 的窗口**（`getDiagnostics()` 单次就 ~300ms）——render 侧改成留存 `drag.lastLandingImpact / lastLandingSquash / landingCount`，自检断言"计数 +1 且 impact>0 且 squash ≤3%"，与采样时机无关。**教训：任何"只读一次"的短时间窗诊断都该改成"读留存值"或"轮询一个窗口"** |
+| **`clampWhenFinished` 会把 action 置为 `paused`**，此时 `isRunning() === false` 但权重仍是 1、姿态仍在生效 | 任何"用 `isRunning()` 判断这个角色在不在播"的代码都会在停帧后误判为"没播"：`roleWeight()` 曾因此把坐姿权重读成 0，**整块平移补偿消失**（她被推到窗口左边、只剩半个身子） | `animation-controller` 维护"已激活角色表"，`roleWeight` 只看 `activated + enabled + weight`；单测 `role-weight.test.ts` 锁死"停帧后仍报 1" |
+| **停帧下用 `bone_eye_D_*` 的平移做眨眼 = 翻白眼（2026-11-05 真机，ADR 0046 D2）**：站姿眨眼靠 `Cafe_Idle` 整段动画（眼皮平移 + 上下眼皮子骨旋转 + 混合）；停帧后只剩我们这一条平移通道，下眼皮子骨被本地 x 推上去 | 闭眼瞬间"下眼皮硬拉上去"，极其惊悚；调幅度只会更糟（0.00028 已是畸形） | **整套手写眨眼删除**：`BoneArbiter.addPosition()` 与位置通道、`sit-motion` 的 blink、`debugBlink`/`forceBlink` 全部移除；坐姿不眨眼。**教训：停帧状态不要试图复刻"需要整段动画联动"的动作** |
+| **眼球也有自己的"低头"**（ADR 0046 D1）：坐姿片段里眼骨自带向下旋转（实测 +0.262rad），ADR 0045 只接管了头骨 | 头抬起来了、瞳孔还压在下面 → "死鱼眼" | 眼骨也用**旋转基底覆写**（`overrideBase(eye, 绑定姿态)`）+ 张望 ×0.35；单测锁死"覆写后回到绑定姿态、取消后回到动画姿态" |
+| **`EMOTION_MOUTH_FRAMES.small = 9` 是"大圆张口"**（ADR 0046 D3.2）：`shy`/`angry`/`sleepy` 都用 `small`，且表情嘴型按 0.62 底板宽绘制 | 真机"嘴巴还是微张（一个小圆）"就是这个；换成 7 号弧线在 0.62 尺寸下也像小圆 | 逐帧目视核对后重映射：`smile=7 / frown=8 / small=0 / open=2`，静态闭嘴 0 号平直细线；`mouthWidthRatio 0.24→0.32` 保证线可见 |
+| **晃腿不能往下摆**：坐姿把最低点钉在窗口底边，靴底正贴下沿 | 纯正弦的负半周会把脚甩出窗口（被裁掉），破坏吸附锚点 | 用 `0.5-0.5cos` 单峰包络，只往"抬"的方向摆；幅度 0.17rad、左右**不对称**（速度 1.05/0.95、幅度 0.9、包络幂次 0.66/0.82、膝盖滞后 0.32rad，ADR 0045 D3）；单测断言 `thigh ≤ 0`、`calf ≥ 0` 全程成立 |
+| **坐姿头骨的"低头"藏在整条骨链里**（骨盆后坐 + 脊柱前倾 + 颈前伸），不是头骨本地旋转 | 只抵消 `head.quaternion` 会剩下一半低头，"四处张望"仍然在看地面 | 量**世界** pitch（`sit-head.ts` 的 `headWorldPitch`），每帧以 `-值 × 包络` 抵消；夹取 ±0.6rad，超限不修（ADR 0045 D2.1） |
+| **停帧后 `getWorldQuaternion()` 读到的是上一帧的最终值**（含我们自己叠的张望） | 标定时直接拿它当基线，会把"张望"也当成"片段低头"一起抵消，抵消量越跑越偏 | 读 `BoneArbiter.animationBase()`（本帧动画基底，不含我们的偏移）再合成世界朝向；`sit-head.test.ts` 锁死"delta 减完必须精确回到绑定姿态" |
+| **`drawAtlasFrame(frame, 1)` 会把任何帧号夹成 0**（`min(frameIndex, count-1)`） | 静态闭嘴写的是"7 号帧"却画成 0 号帧，缩小后几乎不可见（真机读作"没有嘴"） | 帧数参数必须传**图集真实帧数**（`columns × rows`）；新增纯函数 `atlasFrameIndex()` 作为回归点（ADR 0045 D4.1） |
+| **连续量化 `round(level·7)` 在稳定电平下永远停在同一帧**（本机 TTS 的 RMS 很平） | 说话时只有一张嘴，长句像"定格" | 改成**四档元音**（0 / 6·14 / 1·3 / 2·9）+ 档内每 180ms 轮换；`speech.test.ts` 用"响→轻→静"的合成包络断言 ≥3 种帧（ADR 0045 D4.2） |
+| **`getDiagnostics()` 单次约 300ms**（面部贴图摘要占大头） | 用它做逐帧采样必然错过短事件（落地 220ms、张望过渡 300ms） | 取证走极轻的 `window.diagnostics.sitMotion()`（~16ms 采样）与 render 侧留存值（`lastLanding*`）；`getDiagnostics` 只用于状态断言 |
+| **开局转圈（2026-11-04 真机，ADR 0043 D1；动作本身已于 ADR 0045 D1 删除）**：`fidgetAt` 初值 `0` 表示"已到期"，而首帧→模型加载完成之间 `base=idle`/`physics=null`/不说话，`updateFidget` 的条件"全部满足" | 模型还没出现，转圈就已经开始 → 每次打开应用都看到她先转一圈；极易被误判成"随机行为"或"动画串了" | 初值改 `+Infinity`（安全冷却）+ 模型未就绪直接 return + 排期 `nextFidgetAtMs()` 以模块构造时刻为基准（启动前 45s 硬冷却）。ADR 0045 D1 更进一步：**`spin` 整体删除**，空闲小动作只剩官方 `shy`。**教训：任何"绝对时刻"字段的初值都不能是 0** |
+| **`capturePage` 抓不连贯的过渡帧**：截图本身 60–80ms，但 `getDiagnostics()` 单次约 300ms（含面部贴图摘要） | 把诊断读进逐帧循环会把采样间隔拉到 ~400ms，240ms 的半蹲根本抓不到；更早一版还把窗口移动叠进去，图里出现"疑似瞬移"的假象（其实是头发摆动 + 抓帧滞后） | 取证分两遍：**图一遍**（只 `capturePage`，~100ms/帧）+ **数字一遍**（只读诊断，~300ms/次）。判断"有没有瞬移"只认 `sit.headWorld.x` 的逐帧轨迹，不认截图包围盒 |
 
 ### TODO
+- [ ] **坐姿眼神略显向下**（2026-11-05 封版时确认，ADR 0048 D3）：受限于 **2D 贴图与躯干倾斜**。
+      眼骨/头骨都已试过——`CH0335_EyeMouth` 是近平面卡片、虹膜是画上去的，转骨头不会让瞳孔在
+      眼眶里移动（眼骨 ±0.35rad 的 A/B 特写几乎无差别）。**若未来要彻底解决，需移动虹膜 UV
+      或做正视差分图**（贴花覆盖），不要再动骨骼。证据：`logs/evidence/face-tune-sweep.png`、
+      `face-idle-vs-sit.png`；现场微调入口 `window.diagnostics.headTune(rad)`（正式运行不挂键盘）。
 - [x] 资产审查（贴图/通道/Mask-Ramp/顶点色）：`tools/audit-glb-assets.mjs`（ADR 0037）
 - [x] 全局光照 + 身体/头发 Toon（3 阶硬边色阶）+ 面部死守；手部发白由真光照解决（ADR 0037）
 - [x] **描边（Inverted Hull）**：Body/Hair/Face，屏幕像素宽度（1.5 / 头发 0.8），共享几何与骨骼（ADR 0038）
@@ -423,8 +497,17 @@
 - [x] HFSM 三层壳（Base/Overlay/Physics）+ 自带动画接入 + 骨骼仲裁（ADR 0014）
 - [x] `head_patted` → 官方 `pat` 片段 + `emotion=shy` 投影（ADR 0039；程序化通道已删除）
 - [x] 拖拽 / 回弹与摸头严格互斥（HFSM 清 reaction + render 拒绝 + shell `patArmed`/`movedWindow`，ADR 0039 D5）
-- [x] 拖拽悬空姿态（`Carrier_Idle` + 抬升 + 摇摆）与松手回 Idle
+- [x] 拖拽统一官方悬空片段 `Formation_Pickup` + 删除按部位手写的骨骼姿态（ADR 0041 D1）
+- [x] 摸头收尾：停在保持段 + 0.45s 淡出 + 回到演出前的动作（ADR 0041 D2）
+- [x] 片段利用率：4 段待机轮换 / `nod` 官方鞠躬 / 空闲小动作（转圈 + 官方害羞片段，ADR 0041 D3/D4）
+- [x] 坐下 240ms 半蹲过渡 + 按停帧标定补偿（ADR 0042 D1/D3）→ 坐姿循环 14.5–14.92s + 补偿按混合权重插值（ADR 0043 D2/D3）
 - [x] 拖拽抓取点分类 / 绕支点旋转 / 受迫单摆 / 松手惯性（ADR 0035）
+- [x] 吸附跟随追赶模式（变化后 220ms 内每拍重算，ADR 0042 D2）
+- [x] 解除吸附（`window-gone`/`fullscreen`）后落回桌面（ADR 0042 D4）
+- [ ] 坐姿循环接缝 1–2px：若要更顺，可做"进入段一次性（13.7–14.5s）+ 平稳段循环"两段式（会多一个一次性角色，ADR 0043 D2 的取舍）
+- [ ] 空闲小动作只有"转圈 + 官方害羞"两种：资产没有伸懒腰/转圈片段，要更多花样只能等新素材
+- [ ] 坐姿微动参数仍是"一次标定"（呼吸 0.9px / 张望 ±0.3 / 晃腿 ±0.08）：真机上若嫌幅度大可只改 `shared/constants.ts`，但需要重跑取证脚本
+- [ ] 张望没有"看回用户"的语义（纯随机）：若要"偶尔对视"，需要把光标方向作为低权重目标混合进来（会破坏"完全不看光标"的现行口径，需先改契约）
 - [x] 落地冲击分级下蹲（`vDownMax` → impact → `scale.y` + 脊柱/膝辅助，ADR 0035 D4）
 - [x] 吸附接近（`snap_approach_started` → walk/leap → `snap_applied` 落座，ADR 0034）
 - [x] 坐姿视线不锁死 + 解除时按 reason 惊跳起身（ADR 0034 D5）
@@ -753,3 +836,8 @@
 | 2026-11-02 | shell、render、全局 | **拖拽生命感 + 吸附接近**（ADR 0034 / ADR 0035）：① 拖拽：渲染侧 `noteGrabPoint` 按骨骼最近点分类 head/body/foot（缺失退回掩膜 bbox），`drag-motion.ts` 受迫单摆（窗口 `screenX/Y` 两级 EMA 求加速度）+ 绕抓取点 `pivotCompensation` + 松手 θ/ω 衰减；落地按 `vDownMax` 分级做 `scale.y` + 脊柱/膝/臂下蹲，脚底不穿窗口。② 吸附：新增 `snap_approach_started`（契约 §6.3），`sitting` 扩展为"接近 + 落座"生命周期；`approach.ts` 纯函数（walk/leap、300–900ms），倒计时挂在既有 16ms `snap.tick`，`t>=1` 才 `commit` + `snap_applied`；只有拖拽能立即中断，其余解除延迟到到达。③ 坐姿：`snap_applied` 才 `playHold('sit')`，视线继续跟随；`snap_released` 按 clicked/command/window-gone/fullscreen 播惊跳。④ 骨骼标定：`window.diagnostics` + `PET_CALIBRATE=1` 13 张截图，确认 spine/neck pitch>0=低头、upperArm roll<0=抬手、thigh pitch<0=前抬、calf pitch>0=后摆；`ModelBones` 6→21 根。⑤ 落地标定：`PET_LANDING_CALIBRATE=1` 10px/300px 两张截图（impact 0.00/1.00，squash 0/0.078）。契约 **1.13.0**；单测全绿、四套自检 **127 / 29 / 30 / 4** 全 exit 0；`tsc` 0 错；0 新依赖 / 0 新定时器 / 0 新 IPC 通道 | 1.13.0 |
 | 2026-11-03 | shell、render、全局 | **摸头改官方片段 + 拖拽/摸头严格互斥**（ADR 0039）：① **全量普查 44 段动画**——新增 `tools/clip-preview/census.cjs`（按 0.2s 采样头/骨盆/双手/双脚世界坐标 + 头骨欧拉角，输出 `shots/census.json`）与 `inspect-census.cjs`（逐帧表格）、`list-clips.cjs`（只读 GLB 列出 44 段），并用 `filmstrip.cjs`（改为 `FILM_JOBS`/`FILM_CLIP` 环境变量驱动）目视复核。结论：`Cafe_Reaction` 3.2–6.4s 只有"缩下去"没有回正（剪到哪都停在含胸姿态）；`Victory_Start_interaction_01` 首帧是腾空翻滚过场；**唯一闭环**是 `Victory_Start_Random` 0.4–2.2s（站姿 → 缩身抱手低头 → 保持 → 抬头回正）。② `clip-bank.pat` 改绑 `CH0335_Victory_Start_Random` 0.3–2.4s，`Cafe_Reaction` 只留 `greet`。③ **删除 `pat-react.ts` + 其单测**（build.mjs / package.json 同步），render 里的摸头头部 pitch/roll、身体前倾、`'pat'` 嘴层归属全部移除——摸头不再有任何程序化姿态或 `scale`；`nod` 也从"整身压扁 6%"改为"头骨低头 0.26rad"。④ 表情改为 `effective emotion = shy`（官方差分），`MouthOwner` 收敛为 口型 > 表情 > 静态。⑤ **严格互斥三层**：HFSM 在 `dragStarted/dragReleased` 清 `reaction` 且 `dragged` 也拒绝 `head_patted`/`intent`；render 在 `drag_started` 先 `cancelOneShot()` 并拒绝 settling 期事件；shell 新增 `patArmed`（一次拖拽解除到下次 pointerdown）与 `movedWindow`（按下期间窗口被搬过就不判摸头、且不伪造拖拽）+ 轮询器沉降窗口丢弃。⑥ §5.3 三行改为"身体通道不动、只表情"。契约 **1.16.0**（§3.4 D-2/D-3、§4.4 `pat_react`、§5.3 三行、§7.3 摸头规则、§11 降级行）。验证：`tsc` 0 错、单测 **433**（含新增 6 条互斥用例，删除 `pat-react` 4 条）、四套自检 **140 / 29 / 30 / 4** 全 exit 0、截图 `window-pat.png`（缩身害羞）/`window-drag.png`（被拎起）；证据 `dist/selftest/evidence-{pat,drag}-adr0039.png` | 1.16.0 |
 | 2026-11-03 | shell、render、全局 | **头部判定换基准 + 落地收平**（ADR 0040）：① **排查打点**：shell 侧 `[drag-gesture] pointerdown/pointerup/emit head_patted?`、render 侧 `收到 head_patted + HFSM 状态`、`摸头片段回报（weight/paused/hold）`、`probe … boneY/radius/dist`、`回弹触地反跳 {vyBefore,vyAfter}`；新增 `tools/diag/log-shot.py` 把日志渲染成图（UTF-16LE 的 Tee 输出也能读）。② **根因 1**：`cmd:interactive.head` 用"掩膜 bbox 顶部 22%"，光环把 bbox 顶到 y≈90–120 → 头部带只有 **y≈120–275**（光环+发顶），脸在 **y≈340–420**，实测点脸 `blockedBy=head-not-in-band`、一轮运行 0 次触发。改为**头骨半径**（`0.125×720=90px`，圆心=头骨 CSS 位置），光环落在圆外，骨骼/掩膜缺失时退回 bbox 22%，都不可用才 `head=null`。③ **根因 2**：落地 `impact=(vDown−150)/1000` 用 settling 峰值 → 自由落体必然饱和（实测 1500–1716px/s）→ 每次拖拽压满 8%，再叠 `restitution 0.28` 的窗口反跳（948→−169、2137→−491），看起来就是"弹一下/被截断的摸头"。改为冲击只看 `drag_released.vy`、门槛 700、上限 3%、时长 220ms、恢复系数 0.15。④ 自检点位改"头骨 + 1%"，新增 3 条口径断言 + 3 条验收（点脸触发/点光环不触发/轻放不缩）+ 2 张落地帧截图。契约 **1.17.0**（R-10、D-1、`cmd:interactive`、§7.3 落地缓冲规则）。验证：单测 **433**、四套自检 **147 / 29 / 30 / 4** 全 exit 0、`tsc` 0 错 | 1.17.0 |
+| 2026-11-03 | shell、render、全局 | **表现力四问：拖拽一致 / 摸头衔接 / 片段利用率 / 坐姿吸附**（ADR 0041 / ADR 0042）：① **拖拽解耦**——`clip-bank` 删除 `held.limp`（`Carrier_Idle` 是普通站姿，正是"拖头不触发官方动画"的根因），任何抓取带都播官方悬空片段 `Formation_Pickup`（从第 0 秒起，每次抓起都有"被拎起"的起势）；抓取带只决定单摆物理。**删除** `dragBoneOffsets()`（12 根骨的三态手写姿态）、`DRAG_PENDULUM[*].liftPx`、render 的骨骼叠加与 `dragLift`。② **摸头收尾**——根因是 `finished` 固定回 `idle` 槽位（待机姿态会轮换 → 抱臂被淡成普通站姿），改为回到 `oneShotReturnAction`；窗口 0.3–2.4s → **0.3–2.05s**、淡出 0.25s → **0.45s**。③ **片段利用率**——语义角色 13 个：新增 `idle.alt2`(`Carrier_Idle`) / `idle.alt3`(`Victory_End_Random`) / `nod`(`Cafe_Reaction` 8.7–9.9s 鞠躬) / `fidget.shy`(3.2–4.9s 掩面)，待机轮换 2→4 段，新增 45–95s 一次的空闲小动作（纯根节点转圈 1.7s / 官方害羞片段），fidget 不进 `RenderState`、不是新状态。**资产事实**：`Carrier2_*` 与 `Cafe_*` 是同一份数据、四段 `*_interaction_*` 根骨偏 128–190px、没有挥手/伸懒腰片段。④ **坐姿吸附**——`snap_applied` 后 240ms 半蹲过渡（+14px→0、大腿 0.22rad→0）；坐姿窗口 11.2–13.5s → **13.4–15.6s**（睁眼、手放膝上）并按 `holdSeek` 停帧标定补偿；`snap.tick` 跟随加**追赶模式**（目标一变就每拍重算 220ms）；`window-gone`/`fullscreen` 后用回弹弹簧落回桌面（不伪造冲击速度）。⑤ **自检**：修掉"光环命中点只探中线"的 50% 假失败；主链路 147→**156**、单测 433→**446**、四套 selftest 全绿 |
+| 2026-11-04 | render、全局 | **真机三问：开局转圈 / 坐姿假人 / 落座乱平移**（ADR 0043）：① **启动冷却** —— `fidgetAt` 初值 0 → `+Infinity`（安全冷却），`updateFidget` 在模型未就绪时直接 return，排期改成纯函数 `nextFidgetAtMs(now, startedAt) = max(now + 45–95s, startedAt + 45s)`；实测冷启动 49s 才出现第一次小动作。② **坐姿活体化** —— `clip-bank.sit` 由 13.4–15.6s 停帧改为**循环 14.5–14.92s**（普查确认接缝 1–2px）；`animation-controller` 支持循环角色裁窗口 + `playRole(slot=null)` + `roleWeight()`；再叠 ±2.4px 呼吸浮动、±0.5% 躯干缩放、±1.6px 重心偏移。③ **补偿平滑** —— 新增 `updateSitGain()`：补偿/下沉/呼吸/重心全部乘"坐姿片段混合权重"，落座瞬间不再硬套 265px；接近阶段不再应用补偿。逐帧实测 `headWorld.x` 最大跳变 4.9px、`offsetX = raw × blend`。④ 自检新增 4 条（循环播放 / 补偿缩放 / 呼吸微动 / 落座连续）+ 落座逐帧取证 12 帧；单测 446→**451**、主链路 156→**160** |
+| 2026-11-04 | render、全局 | **坐姿活体化：停帧 + 全程序化微动**（ADR 0044）：① **停帧**——`clip-bank.sit` 14.5–14.7s、`loop:false`、`playHold`（0.42s 循环真机判"抽搐"，ADR 0043 D2 废止）；② **呼吸**——3.6s 正弦，整体 ±0.9px + 脊柱/颈 ±0.006rad（旧的 2.4px 浮动与 0.5% 躯干缩放全删）；③ **自主张望**——坐姿期间关闭 `gaze.update()`，3–6s 随机 ±0.3/±0.15rad，阻尼缓动；④ **眨眼**——2.5–5s，`bone_eye_D_L/R.translation.x` = 0.00028（虹膜覆盖 2.8%→0.26%），110/50/180ms 包络，新增 `bone-arbiter.addPosition()`（与旋转同一套"检测 mixer 重写"，防位移累积）；⑤ **晃腿**——左右交替、只往抬的方向（`0.5-0.5cos`），±0.08rad，600ms 软启动；⑥ **顺带修** `roleWeight` 的"暂停=没播"bug（否则补偿消失、人被推出窗口）；⑦ 新增 `sit-motion.ts`（10 单测）+ `role-weight.test.ts`（2 条）+ 主链路 6 条自检 + 3 个取证工具（`measure-blink.py` / `compose-sit-alive.py` / `compose-sit-sheet.py`）。单测 446→**463**、主链路 160→**165** | ADR 0044 |
+| 2026-11-04 | render、voice、全局 | **真机四问：开局转圈 / 坐姿低头 / 上半身僵硬 / 嘴型**（ADR 0045）：① **删转圈**——`fidget` 只剩官方 `shy` 片段与排期，片段缺失时什么都不做（`spin` 整体删除，诊断 `kind` 收窄为 `'shy'`）。② **头部基准**——新增 `sit-head.ts`（相对**绑定姿态**的旋转差 → YXZ 抵消量 / 世界朝向分解），`playHold` 权重 ≥0.95 时用 `BoneArbiter.animationBase()` 量一次，之后每帧 `+delta⁻¹ × 包络`；实测片段自带低头 **+0.263rad**、抵消 **-0.250rad**，抵消后头骨均值从"低头 15°"回到 **-0.03rad（平视）**。张望改 **2.2–4.2s / ±0.36rad / 72% 抬头 / easeInOutCubic 220–420ms**（废止指数阻尼）。③ **上半身与腿**——锁骨/上臂 ±0.02rad（相位差 90°）；晃腿 0.17rad、小腿 0.136rad（×0.8），左腿速度 ×1.05、右 ×0.95、幅度 0.9、包络幂次 0.66/0.82、膝盖滞后 0.32rad。④ **嘴型**——`MOUTH_FRAME_CLOSED` 0 → **7**，`drawAtlasFrame` 静态帧必须传真实帧数（新增纯函数 `atlasFrameIndex()`），口型改**四档元音**（7 / 6·14 / 1·3 / 2·9）+ 档内 180ms 轮换；自检实测说话中嘴型序列 `7→1→3→2→9`。⑤ 顺带修 `sit-motion` 的 NaN 传播（随机源统一 `sampleUnit()`）。契约 **1.21.0**；单测 **495 / 0 失败**（新增 `sit-head.test.ts` 4 条、`sit-motion` 扩到 10 条、`speech` 口型 5 条、`facial-texture` 静态帧 1 条）；四套自检 **168 / 29 / 33 / 4** 全 exit 0；`tsc` 0 错；0 新依赖 / 0 新定时器 / 0 新 IPC 通道 | 1.21.0 |
+| 2026-11-05 | render、voice、全局 | **真机截图三问：死鱼眼 / 翻白眼 / 嘴型与侧坐**（ADR 0046）：① **眼球接管**——片段里眼骨自带向下看（实测 **+0.262rad**），停帧后永不消失。新增 `BoneArbiter.overrideBase()`：坐姿把眼骨旋转基底换成**绑定姿态**再叠张望 ×0.35；实测接管后眼球俯仰均值 **-0.14rad**、与头骨朝向差 <0.2rad（不再死盯地面）。② **删除手写眨眼**——`addPosition()` 与整条位置通道、`sit-motion` 的 blink、`debugBlink`/`forceBlink` 全部移除（停帧下推下眼皮 = 翻白眼）；**坐姿不眨眼**，站姿仍用官方 `Cafe_Idle`。③ **微侧身**——`SIT_BODY_YAW_RAD=0.15` 加在根节点，头部基准用 `removeBodyYaw()` 在未侧身坐标系里量。④ **嘴型**——`MOUTH_FRAME_CLOSED` 7 → **0**（平直细线）、`staticFrameIndex=0`、`mouthWidthRatio 0.24→0.32`；表情帧重映射 `smile=7 / frown=8 / small=0 / open=2`（`small=9` 是大圆张口，正是"常驻微张"）。契约 **1.22.0**；单测 **493 / 0 失败**（bone-arbiter 6、sit-motion 9、speech 5、facial 29）；四套自检 **169 / 29 / 33 / 4** 全 exit 0；`tsc` 0 错；0 新依赖 / 0 新定时器 / 0 新 IPC 通道 | 1.22.0 |

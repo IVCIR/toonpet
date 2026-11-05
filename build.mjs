@@ -132,8 +132,48 @@ const bundles = [
     target: 'node20',
   },
   {
+    // ADR 0044：停帧 hold 的权重（否则坐姿补偿会整块消失）
+    entry: 'src/renderer/render/role-weight.test.ts',
+    outfile: 'dist/tests/role-weight.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0044：坐姿活体微动（呼吸 / 自主张望 / 眨眼 / 悬空晃腿）
+    entry: 'src/renderer/render/sit-motion.test.ts',
+    outfile: 'dist/tests/sit-motion.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0045 D2.1：坐姿头部基准（抬头补偿 / 世界朝向分解）
+    entry: 'src/renderer/render/sit-head.test.ts',
+    outfile: 'dist/tests/sit-head.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
     entry: 'src/renderer/render/drag-motion.test.ts',
     outfile: 'dist/tests/drag-motion.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0041：片段表（裁剪窗口/悬空片段唯一性/待机池）与"播完回到原动作"
+    entry: 'src/renderer/render/animation-controller.test.ts',
+    outfile: 'dist/tests/animation-controller.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0041 D4：空闲小动作（间隔边界 + 转圈角度曲线）
+    entry: 'src/renderer/render/fidget.test.ts',
+    outfile: 'dist/tests/fidget.test.mjs',
     platform: 'node',
     format: 'esm',
     target: 'node20',

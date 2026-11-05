@@ -239,6 +239,38 @@ test('跟随：目标窗口移动后窗口跟着走（节流 120ms）', () => {
   assert.equal(h.positions.length, 2);
 });
 
+test('跟随（ADR 0042 D2）：目标在动时每个 tick 都追，停下后回落到 120ms 节流', () => {
+  const h = makeHarness();
+  const snap = createSnapController(h.deps, CONFIG);
+  snap.snapNow();
+  finishApproach(snap); // 落座：positions 1
+  snap.tick(2100); // 校准节流起点
+  assert.equal(h.positions.length, 1);
+
+  // 第一次检测到位移（120ms 之后）：进入追赶模式
+  h.setHandle(windowInfo({}, { left: 300, top: 240, right: 1200, bottom: 840 }));
+  snap.tick(2300);
+  assert.equal(h.positions.length, 2);
+  assert.equal(snap.diagnostics().catchUp, true, '目标刚动过 → 处于追赶模式');
+
+  // 目标继续动：20ms 后就再次重算（若还是 120ms 节流，这里是不会写位置的）
+  h.setHandle(windowInfo({}, { left: 310, top: 240, right: 1210, bottom: 840 }));
+  snap.tick(2320);
+  assert.equal(h.positions.length, 3);
+  h.setHandle(windowInfo({}, { left: 320, top: 240, right: 1220, bottom: 840 }));
+  snap.tick(2340);
+  assert.equal(h.positions.length, 4);
+  assert.ok(snap.diagnostics().catchUpTicks >= 2, `catchUpTicks=${snap.diagnostics().catchUpTicks}`);
+
+  // 目标停下：追赶窗口结束，回到常规节流（不再写位置）
+  snap.tick(2600);
+  assert.equal(h.positions.length, 4);
+  assert.equal(snap.diagnostics().catchUp, false);
+  h.setHandle(windowInfo({}, { left: 320, top: 240, right: 1220, bottom: 840 }));
+  snap.tick(2650);
+  assert.equal(h.positions.length, 4, '目标没变 → 不写位置');
+});
+
 test('跟随：目标窗口消失 / 变成全屏 → 立即解除吸附并发出 snap_released', () => {
   const gone = makeHarness();
   const snapGone = createSnapController(gone.deps, CONFIG);

@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   createDragPendulum,
-  dragBoneOffsets,
   pendulumConfigFor,
   pivotCompensation,
   stepDragPendulum,
@@ -112,20 +111,24 @@ test('支点补偿：θ=0 无补偿；绕头旋转时头不动、脚甩出去', 
   assert.ok(Number.isFinite(bad.x) && Number.isFinite(bad.y));
 });
 
-test('三态姿态：抓头/身/脚返回不同骨骼组合，全部有限', () => {
-  const head = dragBoneOffsets('head', 0);
-  const body = dragBoneOffsets('body', 0);
-  const foot = dragBoneOffsets('foot', 0);
+test('三态物理参数：抓头/身/脚各不相同，且都不含"按部位写姿态"的字段（ADR 0041 D1）', () => {
+  const head = pendulumConfigFor('head');
+  const body = pendulumConfigFor('body');
+  const foot = pendulumConfigFor('foot');
 
-  for (const offsets of [head, body, foot]) {
-    assert.ok(offsets.length >= 10);
-    for (const item of offsets) {
-      assert.ok(Number.isFinite(item.yaw) && Number.isFinite(item.pitch) && Number.isFinite(item.roll));
+  assert.notDeepEqual(head, body);
+  assert.notDeepEqual(body, foot);
+  // 抓取带只允许影响单摆物理；姿态字段（旧 liftPx）已删除，出现即回归
+  for (const config of [head, body, foot]) {
+    assert.deepEqual(Object.keys(config).sort(), [
+      'angleLimitRad',
+      'damping',
+      'lengthPx',
+      'struggleHz',
+      'struggleRad',
+    ]);
+    for (const value of Object.values(config)) {
+      assert.ok(Number.isFinite(value) && value >= 0);
     }
   }
-  const footArm = foot.find((item) => item.bone === 'upperArmL');
-  assert.ok(footArm && footArm.roll < -1, '抓脚应举臂挣扎（负 roll = 抬手）');
-  const headArm = head.find((item) => item.bone === 'upperArmL');
-  assert.ok(headArm && Math.abs(headArm.roll) < 0.3, '抓头应自然下垂，不举臂');
-  assert.notDeepEqual(head, body);
 });

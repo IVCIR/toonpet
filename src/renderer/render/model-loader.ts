@@ -1,4 +1,4 @@
-/**
+﻿/**
  * GLB 加载管线（渲染侧，ADR 0009 D1/D3/D5/D6）。
  *
  * - 字节来自只读 `pet-asset://asset/model`（fetch → ArrayBuffer → GLTFLoader.parse），
@@ -44,6 +44,12 @@ const CALF_L_BONE = 'Bip001 L Calf';
 const CALF_R_BONE = 'Bip001 R Calf';
 const FOOT_L_BONE = 'Bip001 L Foot';
 const FOOT_R_BONE = 'Bip001 R Foot';
+/**
+ * 眼皮骨（ADR 0044 D4）：本资产的眨眼是**骨骼平移**（`translation.x`）做的，
+ * 不是 blendshape。幅度标定见 `SIT_BLINK_TRANSLATION_X`。
+ */
+const EYELID_L_BONE = 'Bip001 bone_eye_D_L';
+const EYELID_R_BONE = 'Bip001 bone_eye_D_R';
 
 /**
  * GLTFLoader 会对节点名做 `sanitizeNodeName`（空格→下划线、去掉保留字符），
@@ -76,6 +82,8 @@ const BONE_TARGETS = {
   calfR: normalizeBoneName(CALF_R_BONE),
   footL: normalizeBoneName(FOOT_L_BONE),
   footR: normalizeBoneName(FOOT_R_BONE),
+  eyelidL: normalizeBoneName(EYELID_L_BONE),
+  eyelidR: normalizeBoneName(EYELID_R_BONE),
 } as const;
 
 export interface ModelBones {
@@ -102,6 +110,9 @@ export interface ModelBones {
   calfR: THREE.Bone | null;
   footL: THREE.Bone | null;
   footR: THREE.Bone | null;
+  /** 眼皮（`bone_eye_D_L/R`）：眨眼靠它的本地 x 平移（ADR 0044 D4） */
+  eyelidL: THREE.Bone | null;
+  eyelidR: THREE.Bone | null;
 }
 
 export interface LoadedModel {
@@ -389,6 +400,8 @@ export async function loadModel(options: LoadModelOptions): Promise<LoadedModel>
     calfR: null,
     footL: null,
     footR: null,
+    eyelidL: null,
+    eyelidR: null,
   };
   const materialNames = new Set<string>();
   let triangleCount = 0;
@@ -421,6 +434,8 @@ export async function loadModel(options: LoadModelOptions): Promise<LoadedModel>
       else if (normalized === BONE_TARGETS.calfR) bones.calfR = bone;
       else if (normalized === BONE_TARGETS.footL) bones.footL = bone;
       else if (normalized === BONE_TARGETS.footR) bones.footR = bone;
+      else if (normalized === BONE_TARGETS.eyelidL) bones.eyelidL = bone;
+      else if (normalized === BONE_TARGETS.eyelidR) bones.eyelidR = bone;
     }
     // `HaloRoot` 是光环的枢轴（`CH0335_Halo` 的父节点）：它是普通 Object3D，
     // 不在骨骼层级里，也不会被任何片段驱动 —— 角色一移动，光环就留在原地。

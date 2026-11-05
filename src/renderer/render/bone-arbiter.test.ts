@@ -5,13 +5,18 @@ import { createBoneArbiter } from './bone-arbiter';
 
 /**
  * 极简假骨骼：仲裁器只用到 `quaternion` / `parent` / `name`。
- * `parent = null` 时 endFrame 用单位四元数做父空间（等价于"世界轴 = 局部轴"）。
+ * `parent = null` 时 endFrame 用单位四元数当父空间（等价于"世界轴 = 局部轴"）。
  */
 function fakeBone(name = 'Bip001_Head'): THREE.Bone {
-  return { name, quaternion: new THREE.Quaternion(), parent: null } as unknown as THREE.Bone;
+  return {
+    name,
+    quaternion: new THREE.Quaternion(),
+    position: new THREE.Vector3(),
+    parent: null,
+  } as unknown as THREE.Bone;
 }
 
-/** 两个四元数之间的夹角（rad）。 */
+/** 两个四元数之间的夹角（rad） */
 function angleBetween(a: THREE.Quaternion, b: THREE.Quaternion): number {
   const dot = Math.min(1, Math.abs(a.dot(b)));
   return 2 * Math.acos(dot);
@@ -22,7 +27,7 @@ function angleBetween(a: THREE.Quaternion, b: THREE.Quaternion): number {
  * 与上一个 accu 相同的写入）时，仲裁器必须沿用缓存的动画基底，
  * 不能把我们上一帧写出的偏移当成新基底 —— 那会让偏移逐帧累积（"头在打转"）。
  */
-test('mixer 停写时：偏移不得逐帧累积（100 帧后仍停留在一次偏移的量级）', () => {
+test('mixer 停写时：偏移不得逐帧累积（100 帧后仍停在一次偏移的量级）', () => {
   const arbiter = createBoneArbiter();
   const bone = fakeBone();
   arbiter.register(bone);
@@ -40,7 +45,6 @@ test('mixer 停写时：偏移不得逐帧累积（100 帧后仍停留在一次�
 
   const state = arbiter.snapshot()[0];
   assert.equal(state?.baseFrom, 'cache', '没有动画写入时必须走缓存基底');
-  // 基准：一帧偏移本身的量级（≈0.17 rad）；累积的话 100 帧会到 17 rad（转好几圈）
   const applied = angleBetween(new THREE.Quaternion(), bone.quaternion);
   assert.ok(applied < 0.4, `100 帧后偏移应停在一次的量级，实际 ${applied.toFixed(3)} rad`);
   assert.ok(applied > 0.05, '偏移仍然要被应用（不是被吞掉）');
@@ -109,4 +113,63 @@ test('零偏移帧不写骨骼（written=false），随后恢复偏移仍然稳�
   }
   const applied = angleBetween(new THREE.Quaternion(), bone.quaternion);
   assert.ok(applied < 0.5, `偏移不得累积，实际 ${applied.toFixed(3)} rad`);
+});
+
+/**
+ * 基底覆写（ADR 0046 D1：坐姿眼球回到"绑定姿态"，再叠张望）。
+ *
+ * 停帧后 Mixer 不再写眼骨，片段里那份"向下看"会永远留着。`overrideBase()` 让
+ * `endFrame()` 从这个固定基底开始合成，而不是从动画基底开始。
+ */
+test('基底覆写：合成起点换成绑定姿态，且不影响"mixer 有没有重写"的判定', () => {
+  const arbiter = createBoneArbiter();
+  const bone = fakeBone('Bip001_eye_L');
+  const sitLocal = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), 0.25);
+  const bindLocal = new THREE.Quaternion();
+  bone.quaternion.copy(sitLocal);
+  arbiter.register(bone);
+  arbiter.overrideBase(bone, bindLocal);
+
+  // 停帧：mixer 不写；覆写基底 = 单位四元数（平视）
+  for (let frame = 0; frame < 50; frame += 1) {
+    arbiter.capture();
+    arbiter.beginFrame();
+    arbiter.endFrame();
+  }
+  assert.ok(angleBetween(bone.quaternion, bindLocal) < 1e-9, '必须回到绑定姿态');
+  const state = arbiter.snapshot().find((item) => item.bone === 'Bip001_eye_L');
+  assert.equal(state?.overridden, true);
+  assert.equal(state?.baseFrom, 'cache');
+
+  // 叠一个张望偏移：在绑定基底之上转，而不是在片段姿态之上转
+  arbiter.capture();
+  arbiter.beginFrame();
+  arbiter.add(bone, 0.2, 0);
+  arbiter.endFrame();
+  const expected = new THREE.Quaternion()
+    .setFromAxisAngle(new THREE.Vector3(0, 1, 0), 0.2)
+    .multiply(bindLocal);
+  assert.ok(angleBetween(bone.quaternion, expected) < 1e-6);
+
+  // 取消覆写 → 回到动画基底（片段里的 0.25rad 低头）
+  arbiter.overrideBase(bone, null);
+  arbiter.capture();
+  arbiter.beginFrame();
+  arbiter.add(bone, 0.2, 0);
+  arbiter.endFrame();
+  const expectedFromAnimation = new THREE.Quaternion()
+    .setFromAxisAngle(new THREE.Vector3(0, 1, 0), 0.2)
+    .multiply(sitLocal);
+  assert.ok(
+    angleBetween(bone.quaternion, expectedFromAnimation) < 1e-6,
+    '取消覆写后回到动画姿态',
+  );
+});
+
+test('基底覆写：未登记骨骼会被登记；override 传 null 不报错', () => {
+  const arbiter = createBoneArbiter();
+  const bone = fakeBone('Bip001_eye_R');
+  arbiter.overrideBase(bone, null);
+  assert.equal(arbiter.size, 1);
+  assert.equal(arbiter.snapshot()[0]?.overridden, false);
 });

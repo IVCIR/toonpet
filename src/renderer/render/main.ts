@@ -77,7 +77,37 @@ window.diagnostics = {
   setHaloToon: (enabled) => module.setHaloToon(enabled),
   resetMaterials: () => module.resetMaterialDiagnostics(),
   handScreenPoints: () => module.handScreenPoints(),
+  // ADR 0046 D2：停帧不再眨眼，`forceBlink` 已删除（眼骨位移通道整套移除）
+  // ADR 0044：极轻的坐姿微动快照（自检以 16ms 间隔采样张望/晃腿用）
+  sitMotion: () => module.sitMotionDiagnostics(),
+  // ADR 0047 取证：EyeMouth 贴图上叠绿色准星，用来分辨"瞳孔画低了"还是"卡片被挪走了"
+  eyeProbe: (enabled: boolean) => module.setEyeProbe(enabled),
+  // ADR 0047 取证：脸部特写相机（正交视锥收到脸上，不改模型/姿态）
+  faceZoom: (size: number) => module.setFaceZoom(size),
+  // ADR 0048 D2：坐姿头部微调（键盘 ↑/↓ 与自检共用）
+  headTune: (rad: number) => module.setSitHeadTune(rad),
 };
+
+// --- ADR 0048 D2：键盘 ↑/↓ 现场微调坐姿头部（**默认关闭**，只在 `?tune=1` 时挂载） ---
+// 为什么默认不挂：桌宠窗口 `focusable: false`（§3.2），平时根本收不到键盘事件；留着监听
+// 只会让"按方向键"这件事在别的调试场景里互相干扰。正式运行**不注册任何键盘监听**。
+// 用法：`dsh web`/开发态给窗口地址加 `?tune=1`，或直接调 `window.diagnostics.headTune(rad)`
+// （自检走的就是这条，所以"调出来的数"和"截图里的数"是同一个）。
+function installHeadTuneKeys(): void {
+  const HEAD_TUNE_STEP = 0.02;
+  let headTuneValue = 0;
+  window.addEventListener('keydown', (event) => {
+    if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+    // Shift + ↑/↓ 走大步（0.1rad），方便快速找到大致范围
+    const step = event.shiftKey ? 0.1 : HEAD_TUNE_STEP;
+    headTuneValue += event.key === 'ArrowDown' ? step : -step;
+    headTuneValue = module.setSitHeadTune(headTuneValue);
+    console.log(`[render] ↑/↓ 微调：${headTuneValue.toFixed(2)}rad（ADR 0048 D2）`);
+  });
+  console.log('[render] 键盘微调已挂载（?tune=1；ADR 0048 D2）');
+}
+
+if (new URLSearchParams(window.location.search).has('tune')) installHeadTuneKeys();
 
 // --- 字幕气泡（§8.3：TTS/LLM 不可用时的纯文本降级；§3.2 R-1 允许的唯一 DOM） ---
 // 时序不在这一层决定：`intent_resolved` 只登记，`speech_started` 才显示（ADR 0021）。

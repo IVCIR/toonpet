@@ -71,11 +71,11 @@ export interface HoldStatus extends OneShotStatus {
 }
 
 export interface OneShotOptions {
-  /** 淡入秒数（默认 0.18） */
+  /** 淡入秒数（缺省取 `clip-bank` 的 `fadeInSeconds`，再缺省 0.18） */
   fadeIn?: number;
-  /** 播完淡回常驻槽位的秒数（默认 0.25） */
+  /** 播完淡出的秒数（缺省取 `clip-bank` 的 `fadeOutSeconds`，再缺省 0.25） */
   fadeOut?: number;
-  /** 播完回到哪个槽位（默认 idle） */
+  /** 没有"上一个动作"可回时，回到哪个槽位（默认 idle） */
   returnTo?: AnimationSlot;
 }
 
@@ -87,8 +87,8 @@ export interface ModelAnimations {
   /** 切到某常驻槽位；片段缺失时返回 false（调用方保持现状，不抛异常） */
   play(slot: AnimationSlot, fadeSeconds: number): boolean;
   /**
-   * 播某语义角色的循环片段，并把它当作指定槽位（默认 idle）。
-   * 用于换待机姿态（`idle.alt1` / `idle.alt2`）。
+   * 播某语义角色的**循环**片段，并把它当作指定槽位（默认 idle）。
+   * 用于换待机姿态（`idle.alt1` / `idle.alt2`）。坐姿不再用它——ADR 0044 起走 `playHold`。
    */
   playRole(role: ClipRole, fadeSeconds: number, slot?: AnimationSlot): boolean;
   /** 播一次性演出；片段缺失返回 false，调用方自行降级 */
@@ -99,6 +99,14 @@ export interface ModelAnimations {
    * 用于 `sitting`：她坐在那里，姿势不能自己变回站姿。
    */
   playHold(role: ClipRole, fadeSeconds: number): boolean;
+  /**
+   * 把**当前停住姿态**定位到片段的第 N 秒（ADR 0042 D3.2）。
+   *
+   * 为什么需要：坐姿的"身体平移补偿"必须按**停帧那一帧**来量，而不是片段第一帧。
+   * 交叉淡入仍在进行时不能量（量到的是站姿与坐姿的混合），所以加载期用
+   * `playHold` + `holdSeek(片段末尾)` + `mixer.update(0)` 一次性取到终帧。
+   */
+  holdSeek(seconds: number): boolean;
   /** 淡出当前停住的姿态（离开 `sitting` 时用）；幂等 */
   clearHold(fadeSeconds: number): void;
   /** 停住姿态的进行态（诊断用）；没有时返回 null */
@@ -106,6 +114,14 @@ export interface ModelAnimations {
   /** 打断正在播的一次性演出（淡出），不改变常驻槽位 */
   cancelOneShot(fadeSeconds: number): void;
   oneShot(): OneShotStatus | null;
+  /**
+   * 某个语义角色此刻的**有效权重**（0..1，ADR 0043 D3）。
+   *
+   * 用途：坐姿的身体平移补偿必须与"片段混合权重"同步 —— 权重 0（站姿）时补偿必须是 0，
+   * 权重 1（完全坐姿）时补偿是满值。用动作自己的权重当插值因子，进场/退场都不会硬切。
+   * 没在跑的角色返回 0（three 未播放的 action 默认权重是 1，不能直接读）。
+   */
+  roleWeight(role: ClipRole): number;
   update(dtSeconds: number): void;
   current(): AnimationStatus;
   /** 权重 > 0 的 action（诊断用） */
@@ -167,8 +183,10 @@ export function createModelAnimations(
     const base = all.find((clip) => clip.name === selection.name);
     if (!base) continue;
     const rule = CLIP_RULES[role];
+    // ADR 0043 D2：**循环角色同样允许裁窗口**。坐姿就是一个"只循环 0.42s 平稳段"的循环角色，
+    // 旧实现把 `loop: true` 的角色直接绑到整段片段（38s 的过场），窗口被无声忽略。
     const clip =
-      selection.loop || (!rule.maxSeconds && !rule.startSeconds)
+      rule.maxSeconds === undefined && rule.startSeconds === undefined
         ? base
         : trimClip(base, rule.startSeconds ?? 0, rule.maxSeconds);
     roleActions.set(role, mixer.clipAction(clip));
@@ -185,8 +203,27 @@ export function createModelAnimations(
   let oneShotAction: THREE.AnimationAction | null = null;
   let oneShotRole: ClipRole | null = null;
   let oneShotReturn: AnimationSlot = 'idle';
+  /**
+   * 一次性演出开始**之前**在播的那个 action（ADR 0041 D2）。
+   *
+   * 为什么需要：`returnTo` 只是槽位名，回到槽位会重新选 `idle` 角色的片段。
+   * 但待机姿态是会轮换的（`idle` / `idle.alt1` / `idle.alt2` / `idle.alt3`）——
+   * 摸头时她在抱臂站姿里，回来却变成普通站姿，就是一次"被切断"的姿态跳变。
+   * 记下那个 action，播完直接淡回它，姿势才连续。
+   */
+  let oneShotReturnAction: THREE.AnimationAction | null = null;
+  let oneShotFadeOut = ONE_SHOT_FADE_OUT;
   let holdAction: THREE.AnimationAction | null = null;
   let holdRole: ClipRole | null = null;
+  /**
+   * 已经被播放过的语义角色（ADR 0044 修正）。
+   *
+   * 为什么需要：three 的 `AnimationAction` 默认 `enabled = true`、权重 1，
+   * 所以"没播过的角色"和"正在播的角色"从权重上分不出来；而 `playHold` 停帧后
+   * `isRunning()` 又会变成 false。用一张"激活表"把两者都绕开：
+   * 只有真正被 `playOnce/playRole/playHold` 播放过的角色才报告权重（含淡出中的 0→1→0）。
+   */
+  const activatedRoles = new Set<ClipRole>();
 
   function fadeTo(action: THREE.AnimationAction, fadeSeconds: number): void {
     const previous = currentAction;
@@ -211,6 +248,7 @@ export function createModelAnimations(
     oneShotAction.fadeOut(Math.max(0, fadeSeconds));
     oneShotAction = null;
     oneShotRole = null;
+    oneShotReturnAction = null;
   }
 
   function fadeOutHold(fadeSeconds: number): void {
@@ -239,10 +277,25 @@ export function createModelAnimations(
   mixer.addEventListener('finished', (event) => {
     const finished = (event as unknown as { action?: THREE.AnimationAction }).action;
     if (!oneShotAction || finished !== oneShotAction) return;
-    const back = oneShotReturn;
+    const back = oneShotReturnAction;
+    const fadeOut = oneShotFadeOut;
+    const slot = oneShotReturn;
     oneShotAction = null;
     oneShotRole = null;
-    playSlot(back, ONE_SHOT_FADE_OUT);
+    oneShotReturnAction = null;
+    // ADR 0041 D2：能回到"演出前那个 action"就回去（姿势连续），否则退回槽位
+    if (back && back !== finished) {
+      back.enabled = true;
+      back.setEffectiveTimeScale(1);
+      back.play();
+      // crossFadeFrom 会把 back 的权重从 0 拉到 1（fadeIn 内部从 0 开始）
+      back.crossFadeFrom(finished as THREE.AnimationAction, Math.max(0, fadeOut), false);
+      currentAction = back;
+      // 槽位也要还原：否则诊断里会显示"有一个动作在播、但没有槽位"
+      currentSlot = slot;
+      return;
+    }
+    playSlot(slot, fadeOut);
   });
 
   return {
@@ -257,6 +310,7 @@ export function createModelAnimations(
     playRole(role: ClipRole, fadeSeconds: number, slot: AnimationSlot = 'idle'): boolean {
       const next = roleActions.get(role);
       if (!next || !roleSelections[role].name) return false;
+      activatedRoles.add(role);
       if (next === currentAction && oneShotAction === null && holdAction === null) {
         currentSlot = slot;
         return true;
@@ -270,9 +324,22 @@ export function createModelAnimations(
       return true;
     },
 
+    roleWeight(role: ClipRole): number {
+      const action = roleActions.get(role);
+      // **不能只看 `isRunning()`**：`playHold` 的 `clampWhenFinished` 会把 action 置为
+      // `paused = true`，此时 `isRunning()` 返回 false，但它的权重仍然是 1、姿态仍然生效。
+      // 旧实现按 `isRunning()` 过滤，导致坐姿停帧后权重读成 0 → 身体平移补偿整块消失
+      // （真机/自检截图：她被推到窗口左边，只剩半个身子）。
+      if (!action || !activatedRoles.has(role) || !action.enabled) return 0;
+      const weight = action.getEffectiveWeight();
+      if (!Number.isFinite(weight)) return 0;
+      return Math.min(1, Math.max(0, weight));
+    },
+
     playHold(role: ClipRole, fadeSeconds: number): boolean {
       const next = roleActions.get(role);
       if (!next || !roleSelections[role].name) return false;
+      activatedRoles.add(role);
       if (next === currentAction && holdAction === next) return true;
       clearOneShot(fadeSeconds);
       next.setLoop(THREE.LoopOnce, 1);
@@ -296,6 +363,17 @@ export function createModelAnimations(
       fadeOutHold(fadeSeconds);
     },
 
+    holdSeek(seconds: number): boolean {
+      if (!holdAction) return false;
+      const clip = holdAction.getClip();
+      const target = Math.max(0, Math.min(clip.duration, Number.isFinite(seconds) ? seconds : 0));
+      holdAction.time = target;
+      holdAction.paused = false;
+      // 只结算权重/时间，不推进时间轴（ADR 0014 D1：同一帧只允许在渲染循环里 update）
+      mixer.update(0);
+      return true;
+    },
+
     hold(): HoldStatus | null {
       if (!holdAction || !holdRole) return null;
       const clip = holdAction.getClip();
@@ -314,15 +392,28 @@ export function createModelAnimations(
     playOnce(role: ClipRole, options: OneShotOptions = {}): boolean {
       const next = roleActions.get(role);
       if (!next || !roleSelections[role].name) return false;
-      const fadeIn = options.fadeIn ?? ONE_SHOT_FADE_IN;
+      activatedRoles.add(role);
+      const rule = CLIP_RULES[role];
+      const fadeIn = options.fadeIn ?? rule.fadeInSeconds ?? ONE_SHOT_FADE_IN;
+      const fadeOut = options.fadeOut ?? rule.fadeOutSeconds ?? ONE_SHOT_FADE_OUT;
       const returnTo = options.returnTo ?? 'idle';
 
+      // "回到哪儿"要在切换之前定：若已有一次性演出在播，它记的底才是真正的底
+      // （`currentAction` 此刻指向那个一次性演出，不能拿它当初底）
+      const returnAction =
+        oneShotReturnAction !== null
+          ? oneShotReturnAction
+          : currentAction && currentAction !== next
+            ? currentAction
+            : null;
       if (oneShotAction && oneShotAction !== next) clearOneShot(fadeIn);
       // 一次性演出要接管身体：停住的姿态必须让位（否则两份权重叠在一起）
       fadeOutHold(fadeIn);
       oneShotAction = next;
       oneShotRole = role;
       oneShotReturn = returnTo;
+      oneShotReturnAction = returnAction;
+      oneShotFadeOut = fadeOut;
 
       next.setLoop(THREE.LoopOnce, 1);
       next.clampWhenFinished = true;

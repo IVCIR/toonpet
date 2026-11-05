@@ -75,10 +75,29 @@ export const CH0335_MOUTH_LAYOUT: MouthAtlasLayout = {
   frameUv: { x: 0, y: 0, w: 1, h: 1 },
   plateUv: { x: 0.0089, y: 0.7926, w: 0.2322, h: 0.1645 },
   cropToAlpha: true,
-  mouthWidthRatio: 0.24,
+  mouthWidthRatio: 0.32,
   mouthCenterYRatio: 0.38,
+  // ADR 0046 D3.2：0 号帧是平直细线（抿嘴），一眼就是"闭着"；7 号弧线在情绪尺寸下像小圆
   staticFrameIndex: 0,
 };
+
+/**
+ * 图集帧号 → 实际下标（**纯函数**，ADR 0045 D4.1 的回归点）。
+ *
+ * `frameCount` 必须传**图集真实的帧数**，不能传 1：旧实现用 `drawAtlasFrame(staticFrameIndex, 1)`
+ * 表达"只画静态帧"，而夹取 `min(frameIndex, count-1)` 会把任何帧号都压成 0
+ * （0 号帧是一根极细的横线，缩小后几乎不可见 → "常驻没有嘴"）。
+ */
+export function atlasFrameIndex(
+  frameIndex: number,
+  frameCount: number,
+  columns: number,
+  rows: number,
+): number {
+  const total = Math.max(1, Math.min(Math.floor(columns) * Math.floor(rows), Math.floor(frameCount)));
+  const index = Number.isFinite(frameIndex) ? Math.round(frameIndex) : 0;
+  return Math.max(0, Math.min(index, total - 1));
+}
 
 /** 表情嘴型占嘴部底板的比例（比图集口型宽，才看得出"上扬/下垂"）。 */
 const EMOTION_MOUTH_WIDTH_RATIO = 0.62;
@@ -131,7 +150,7 @@ export interface FacialTargetOptions {
   atlas?: CanvasImageSource | null;
 }
 
-interface Rect {
+export interface Rect {
   x: number;
   y: number;
   width: number;
@@ -163,6 +182,11 @@ export interface FacialChannelDiagnostics {
   mouthPixels: number;
   lastPaintMs: number | null;
   lastPaintPixels: number;
+  /**
+   * 最近一次画嘴用的**图集帧与目标矩形**（ADR 0045 D4.1 的取证口径）。
+   * `box` 是图集里该帧的 alpha 裁边，`target` 是它被画到贴图上的尺寸。
+   */
+  mouth: { kind: MouthLayer['kind']; frame: number | null; box: Rect | null; target: Rect | null } | null;
   eyes: EyeAnchor[];
   /**
    * 贴图内容指纹（每次重绘后更新）。
@@ -194,6 +218,14 @@ export interface FacialChannel {
   repaint(): number;
   /** 回到"原贴图 + 肤色底板 + 静态闭嘴" */
   clearEmotion(): void;
+  /**
+   * 诊断/取证（ADR 0047）：在当前贴图上画**十字准星**。
+   *
+   * 用来分辨"瞳孔看着下方"到底是**贴图**画低了，还是**眼骨/蒙皮**把眼球卡片挪下去了：
+   * 准星画在每个眼区矩形的中心（贴图空间）。若准星在眼眶正中而瞳孔偏下 → 贴图问题；
+   * 若准星本身也偏下 → 骨骼/蒙皮问题。
+   */
+  debugProbe(enabled: boolean): { eyeRects: Rect[]; texture: { width: number; height: number } } | null;
   /** 回到模型自带贴图 */
   reset(): void;
   dispose(): void;
@@ -936,6 +968,13 @@ export function createFacialChannel(options: FacialTargetOptions): FacialChannel
   let warned = false;
   let lastPaintMs: number | null = null;
   let lastPaintPixels = 0;
+  /** ADR 0047 诊断：十字准星（画在每个眼区矩形中心，判断"瞳孔偏下"是贴图还是骨骼） */
+  let probeEnabled = false;
+  /** 上一次打过日志的贴图指纹（只在变化时打，ADR 0047 取证） */
+  let loggedDigest = '';
+  /** ADR 0045 D4.1 取证：最近一次画嘴用的图集帧 / alpha 裁边 / 目标矩形 */
+  let lastMouthDraw: { kind: MouthLayer['kind']; frame: number | null; box: Rect | null; target: Rect | null } | null =
+    null;
   let digestScratch: HTMLCanvasElement | null = null;
   let textureDigest: string | null = null;
   /** 首次绘制后的缩略图（基线）：faceDistance 的参照 */
@@ -1087,7 +1126,7 @@ export function createFacialChannel(options: FacialTargetOptions): FacialChannel
       h: layout.plateUv.h * height,
     };
     const count = Math.max(1, Math.min(frameCount, layout.columns * layout.rows));
-    const index = Math.max(0, Math.min(frameIndex, count - 1));
+    const index = atlasFrameIndex(frameIndex, count, layout.columns, layout.rows);
     const column = index % layout.columns;
     const row = Math.floor(index / layout.columns);
     const cellW = (layout.frameUv.w * atlas.width) / layout.columns;
@@ -1104,6 +1143,79 @@ export function createFacialChannel(options: FacialTargetOptions): FacialChannel
     const targetX = plate.x + (plate.w - targetW) / 2;
     const targetY = plate.y + plate.h * layout.mouthCenterYRatio - targetH / 2;
     pair.liveContext.drawImage(atlas, box.x, box.y, box.w, box.h, targetX, targetY, targetW, targetH);
+    lastMouthDraw = {
+      kind: 'atlas',
+      frame: index,
+      box: { x: box.x, y: box.y, width: box.w, height: box.h },
+      target: { x: targetX, y: targetY, width: targetW, height: targetH },
+    };
+  }
+
+  /**
+   * 诊断（ADR 0047）：在每个眼区矩形上画"矩形 + 十字准星"。
+   *
+   * 判据：准星中心 = 我们标定出来的眼区几何中心。截图里
+   * - 准星落在眼眶正中、瞳孔偏下 → **贴图/UV** 问题（瞳孔画低了）；
+   * - 准星自己就偏下/偏出眼眶 → **骨骼/蒙皮**问题（眼球卡片被挪走）。
+   */
+  function drawProbe(): void {
+    if (!pair) return;
+    const context = pair.liveContext;
+    const width = pair.live.width;
+    const height = pair.live.height;
+    context.save();
+    context.strokeStyle = '#00ff00';
+    context.lineWidth = Math.max(2, Math.round(width / 256));
+    for (const surface of eyeSurfaces) {
+      const { x, y, width: w, height: h } = surface.rect;
+      context.strokeRect(x + 0.5, y + 0.5, Math.max(1, w - 1), Math.max(1, h - 1));
+      context.beginPath();
+      context.moveTo(x, y + h / 2);
+      context.lineTo(x + w, y + h / 2);
+      context.moveTo(x + w / 2, y);
+      context.lineTo(x + w / 2, y + h);
+      context.stroke();
+    }
+    // 眼区 UV 的**几何中心**（所有眼三角形的 UV 均值）：这才是"贴图上眼睛应该在哪"。
+    // 它跟画出来的瞳孔对不上，就说明视线是画在贴图上的、不在骨头里。
+    if (eyeTriangles.length > 0) {
+      let su = 0;
+      let sv = 0;
+      for (const triangle of eyeTriangles) {
+        su += triangle.au + triangle.bu + triangle.cu;
+        sv += triangle.av + triangle.bv + triangle.cv;
+      }
+      const count = eyeTriangles.length * 3;
+      const u = su / count;
+      const v = sv / count;
+      const cx = u * width;
+      const cy = (pair.texture.flipY ? 1 - v : v) * height;
+      const arm = Math.max(12, Math.round(width / 24));
+      context.strokeStyle = '#ff00ff';
+      context.lineWidth = Math.max(2, Math.round(width / 256));
+      context.beginPath();
+      context.moveTo(cx - arm, cy);
+      context.lineTo(cx + arm, cy);
+      context.moveTo(cx, cy - arm);
+      context.lineTo(cx, cy + arm);
+      context.stroke();
+      context.beginPath();
+      context.arc(cx, cy, arm * 0.5, 0, Math.PI * 2);
+      context.stroke();
+    }
+    if (plateRect) {
+      const { x, y, width: w, height: h } = plateRect;
+      context.strokeStyle = '#00ffff';
+      context.strokeRect(x + 0.5, y + 0.5, Math.max(1, w - 1), Math.max(1, h - 1));
+      context.beginPath();
+      context.moveTo(x, y + h / 2);
+      context.lineTo(x + w, y + h / 2);
+      context.moveTo(x + w / 2, y);
+      context.lineTo(x + w / 2, y + h);
+      context.stroke();
+    }
+    context.restore();
+    pair.texture.needsUpdate = true;
   }
 
   /**
@@ -1159,8 +1271,14 @@ export function createFacialChannel(options: FacialTargetOptions): FacialChannel
         );
       }
     } else {
-      drawAtlasFrame(layout.staticFrameIndex, 1);
+      // ADR 0045 D4.1：这里原来写的是 `drawAtlasFrame(layout.staticFrameIndex, 1)`。
+      // `drawAtlasFrame` 内部会 `index = min(frameIndex, count - 1)` 夹取，
+      // 于是 frameCount=1 把**任何** staticFrameIndex 都夹成了 0 ——
+      // 而 0 号帧是一根极细的横线，缩小后几乎不可见（"常驻没有嘴"）。
+      // 必须传真实帧数，静态闭嘴才能真正落到 `staticFrameIndex`（= 7，小弧线）。
+      drawAtlasFrame(layout.staticFrameIndex, layout.columns * layout.rows);
     }
+    if (lastMouthDraw) lastMouthDraw.kind = mouthLayer.kind;
 
     // 3) 眼型：官方差分 → 眼睛层缓存 → 按 alpha 合成（淡入每一步都是毫秒级）
     if (eyeCalibrated && eyeImage && eyeAlpha > 0.001) {
@@ -1197,14 +1315,32 @@ export function createFacialChannel(options: FacialTargetOptions): FacialChannel
       eyeLayerKey = null;
     }
 
+    // 探针层永远画在最上面：正常重绘后补一次，否则一帧表情就把准星擦掉了
+    if (probeEnabled) drawProbe();
+
     pair.texture.needsUpdate = true;
     lastPaintPixels = painted;
     lastPaintMs = performance.now() - startedAt;
     digestScratch = digestScratch ?? createDigestScratch();
     const thumb = sampleThumbnail(pair.live, digestScratch);
     if (thumb) {
-      baselineThumb = baselineThumb ?? thumb.slice();
+      if (!baselineThumb) {
+        baselineThumb = thumb.slice();
+        // ADR 0047 取证：基线指纹必须能被日志读到——否则"贴图回不到基线"只能靠猜。
+        console.log(`[render] 面部基线指纹 ${digestOf(baselineThumb)}（ADR 0047 取证）`);
+      }
       textureDigest = digestOf(thumb);
+      if (textureDigest !== loggedDigest) {
+        loggedDigest = textureDigest;
+        // ADR 0047 取证：贴图每次**变化**都留一条指纹 + 当前图层，用来定位"回不到基线"。
+        console.log(
+          `[render] 面部贴图 ${textureDigest}（mouth=${mouthLayer.kind}` +
+            `${mouthLayer.kind === 'atlas' ? `:${mouthLayer.frame}` : ''}` +
+            `${mouthLayer.kind === 'glyph' ? `:${mouthLayer.shape}` : ''}` +
+            ` eyes=${eyeImage ? eyeMode : '-'} alpha=${eyeAlpha.toFixed(2)} ` +
+            `dist=${meanAbsDiff(thumb, baselineThumb).toFixed(4)}）`,
+        );
+      }
       faceDistance = meanAbsDiff(thumb, baselineThumb);
     }
     return painted;
@@ -1238,6 +1374,24 @@ export function createFacialChannel(options: FacialTargetOptions): FacialChannel
       eyeAlpha = 0;
       repaint();
     },
+    debugProbe(enabled: boolean): { eyeRects: Rect[]; texture: { width: number; height: number } } | null {
+      probeEnabled = enabled;
+      if (!pair) return null;
+      if (enabled) {
+        drawProbe();
+      } else {
+        // 准星画在脏矩形**外面**（描边压在边界上），只靠 repaint 的局部还原擦不掉，
+        // 会一直留在贴图上——必须先整张还原到底图再重画（ADR 0047 踩过）。
+        pair.liveContext.clearRect(0, 0, pair.live.width, pair.live.height);
+        pair.liveContext.drawImage(pair.base, 0, 0);
+        eyePainted = false;
+        repaint();
+      }
+      return {
+        eyeRects: eyeSurfaces.map((surface) => ({ ...surface.rect })),
+        texture: { width: pair.live.width, height: pair.live.height },
+      };
+    },
     reset(): void {
       if (!material) return;
       material.map = originalMap;
@@ -1264,6 +1418,7 @@ export function createFacialChannel(options: FacialTargetOptions): FacialChannel
         mouthPixels: mouthSurface?.count ?? 0,
         lastPaintMs,
         lastPaintPixels,
+        mouth: lastMouthDraw,
         eyes,
         textureDigest,
         faceDistance,
@@ -1436,6 +1591,7 @@ export function createBlushChannel(
         mouthPixels: surfaces.reduce((sum, s) => sum + s.count, 0),
         lastPaintMs,
         lastPaintPixels,
+        mouth: null,
         eyes: [],
         textureDigest,
         faceDistance,

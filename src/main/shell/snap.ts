@@ -11,7 +11,9 @@
  */
 import {
   SNAP_EDGE_DRAG_THRESHOLD_PX,
+  SNAP_FOLLOW_CATCHUP_INTERVAL_MS,
   SNAP_FOLLOW_INTERVAL_MS,
+  SNAP_FOLLOW_SETTLE_MS,
   SNAP_HOTKEY_DEFAULT,
   SNAP_HOTKEY_FALLBACK,
   SNAP_MIN_TARGET_HEIGHT_PX,
@@ -134,6 +136,10 @@ export interface SnapDiagnostics {
   lastOutcome: SnapOutcome | null;
   followChecks: number;
   lastFollowAt: number | null;
+  /** ADR 0042 D2：目标还在动 → 跟随处于"追赶模式"（每 tick 重算） */
+  catchUp: boolean;
+  /** 追赶模式下多做了多少次重算（诊断"跟随是不是真的在跟"） */
+  catchUpTicks: number;
 }
 
 export interface SnapController {
@@ -202,6 +208,17 @@ export function createSnapController(deps: SnapDeps, config: SnapConfig): SnapCo
   let lastOutcome: SnapOutcome | null = null;
   let followChecks = 0;
   let lastFollowAt: number | null = null;
+  /**
+   * ADR 0042 D2：跟随的"追赶窗口"。
+   *
+   * 常规节流是 `followIntervalMs`（默认 120ms）——目标窗口**静止**时够用。
+   * 但用户在拖另一个窗口时，目标每帧都在动，8Hz 的跟随会让桌宠一顿一顿地追。
+   * 检测到目标矩形变化后，把节流临时压到 `SNAP_FOLLOW_CATCHUP_INTERVAL_MS`（= 一个 tick），
+   * 目标停止变化 `SNAP_FOLLOW_SETTLE_MS` 之后自动退回常规节流。
+   * **没有新定时器**：仍然挂在既有 16ms 轮询器的 `tick` 上（契约 §12）。
+   */
+  let catchUpUntil = 0;
+  let catchUpTicks = 0;
 
   function refuse(reason: SnapRefusalReason, detail?: unknown): SnapOutcome {
     const hint = HINTS[reason] ?? null;
@@ -276,6 +293,7 @@ export function createSnapController(deps: SnapDeps, config: SnapConfig): SnapCo
     };
     approach = null;
     lastFollowAt = null;
+    catchUpUntil = 0;
     lastOutcome = {
       ok: true,
       edge: plan.edge,
@@ -448,6 +466,7 @@ export function createSnapController(deps: SnapDeps, config: SnapConfig): SnapCo
     const previous = applied;
     applied = null;
     lastFollowAt = null;
+    catchUpUntil = 0;
     deps.logInfo('吸附解除（ADR 0028 D9）', {
       reason,
       handle: previous.handle,
@@ -530,9 +549,15 @@ export function createSnapController(deps: SnapDeps, config: SnapConfig): SnapCo
         lastFollowAt = now;
         return;
       }
-      if (now - lastFollowAt < config.followIntervalMs) return;
+      // ADR 0042 D2：目标正在动的窗口内用"追赶"节流（每个 tick 都追），静止后回落到常规节流
+      const catchingUp = now < catchUpUntil;
+      const interval = catchingUp
+        ? Math.min(config.followIntervalMs, SNAP_FOLLOW_CATCHUP_INTERVAL_MS)
+        : config.followIntervalMs;
+      if (now - lastFollowAt < interval) return;
       lastFollowAt = now;
       followChecks += 1;
+      if (catchingUp) catchUpTicks += 1;
 
       // 工作区贴边没有"目标窗口"可跟随：屏幕变化由 display-metrics-changed 处理（未实现）
       if (applied.source === 'workarea' || applied.handle === null) return;
@@ -562,14 +587,20 @@ export function createSnapController(deps: SnapDeps, config: SnapConfig): SnapCo
       }
 
       const before = applied.rect;
-      if (
-        Math.abs(before.x - dip.x) < 1 &&
-        Math.abs(before.y - dip.y) < 1 &&
-        Math.abs(before.width - dip.width) < 1 &&
-        Math.abs(before.height - dip.height) < 1
-      ) {
+      const changed =
+        Math.abs(before.x - dip.x) >= 1 ||
+        Math.abs(before.y - dip.y) >= 1 ||
+        Math.abs(before.width - dip.width) >= 1 ||
+        Math.abs(before.height - dip.height) >= 1;
+      if (!changed) {
+        // 目标静止：把追赶窗口一次性收紧，下一拍起回到常规节流
+        catchUpUntil = 0;
         return;
       }
+      // 目标在动：接下来的 SNAP_FOLLOW_SETTLE_MS 内每个 tick 都重算（抓不住就没跟随感）
+      // 计数含"发现目标在动的那一拍"：它就是追赶模式的第一拍（诊断要能确定地读到 ≥1）。
+      if (!catchingUp) catchUpTicks += 1;
+      catchUpUntil = now + SNAP_FOLLOW_SETTLE_MS;
 
       const pet = deps.getPetBounds();
       const result = computeSnapTarget({
@@ -585,13 +616,17 @@ export function createSnapController(deps: SnapDeps, config: SnapConfig): SnapCo
       }
       applied.rect = dip;
       deps.setPetPosition(result.x, result.y);
-      deps.logInfo('吸附跟随目标窗口（ADR 0028 D6）', {
-        handle: applied.handle,
-        from: { x: before.x, y: before.y, width: before.width, height: before.height },
-        to: { x: dip.x, y: dip.y, width: dip.width, height: dip.height },
-        window: { x: result.x, y: result.y },
-        clamped: result.clamped,
-      });
+      // 只在"追赶开始"那一拍打完整日志：目标持续移动时每 16ms 一条会把日志刷满
+      if (!catchingUp) {
+        deps.logInfo('吸附跟随目标窗口（ADR 0028 D6 / ADR 0042 D2 追赶模式）', {
+          handle: applied.handle,
+          from: { x: before.x, y: before.y, width: before.width, height: before.height },
+          to: { x: dip.x, y: dip.y, width: dip.width, height: dip.height },
+          window: { x: result.x, y: result.y },
+          clamped: result.clamped,
+          catchUp: true,
+        });
+      }
     },
 
     trySnapOnRelease(): SnapOutcome | null {
@@ -652,6 +687,8 @@ export function createSnapController(deps: SnapDeps, config: SnapConfig): SnapCo
         lastOutcome,
         followChecks,
         lastFollowAt,
+        catchUp: lastFollowAt !== null && lastFollowAt < catchUpUntil,
+        catchUpTicks,
       };
     },
   };

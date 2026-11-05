@@ -61,6 +61,14 @@ declare global {
         left: { x: number; y: number } | null;
         right: { x: number; y: number } | null;
       } | null;
+      /** ADR 0044：极轻的坐姿微动快照（张望/晃腿等；不触发面部贴图诊断） */
+      sitMotion(): import('./sit-motion').SitMotionFrame | null;
+      /** ADR 0047 取证：在 EyeMouth 贴图上叠绿色准星（true 开 / false 关） */
+      eyeProbe(enabled: boolean): ReturnType<RenderModule['setEyeProbe']>;
+      /** ADR 0047 取证：正交相机缩到脸上拍特写（0 = 关闭） */
+      faceZoom(size: number): ReturnType<RenderModule['setFaceZoom']>;
+      /** ADR 0048 D2：坐姿头部微调（rad，正 = 低头）。键盘 ↑/↓ 也走这里 */
+      headTune(rad: number): number;
     };
   }
 }
