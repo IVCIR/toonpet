@@ -166,6 +166,24 @@ test('pat_react intent 不得重启或截短已在播的摸头反应（ADR 0039 
   assert.equal(fresh.snapshot().reaction?.intent, 'pat_react');
 });
 
+test('到期的反应不得挡住新的 pat_react（"清空晚一帧"的边界，真机自检复现）', () => {
+  // reaction 要等下一帧 tick() 才清空；在"刚到期的这一帧"里它仍在快照里。
+  // 旧实现只看 isPatReaction(reaction) → 把新反应挡掉，真机表现为
+  // "说话时被摸头"偶发无反应（pat.active=false 但 reaction 非空）。
+  const hfsm = make();
+  hfsm.headPatted(0, 100);
+  assert.equal(hfsm.snapshot().reaction?.kind, 'head_patted');
+  // 150ms 时已过期，但还没 tick
+  assert.equal(hfsm.intent(150, 'pat_react', 300), true, '过期反应不得挡住新 pat_react');
+  assert.equal(hfsm.snapshot().reaction?.intent, 'pat_react');
+  assert.equal(hfsm.snapshot().reaction?.durationMs, 300);
+
+  // 仍在播时必须拒绝
+  const live = make();
+  live.headPatted(0, 100);
+  assert.equal(live.intent(50, 'pat_react', 300), false, '未到期的反应仍不得被截短');
+});
+
 test('拖拽期间：声音继续，摸头被拒（ADR 0039 D5）', () => {
   const hfsm = make();
   hfsm.speechStarted(0, 'u-3');

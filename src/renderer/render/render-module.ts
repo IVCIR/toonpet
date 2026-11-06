@@ -24,14 +24,37 @@ import {
   DRAG_SUPPORT_ACCEL_MAX,
   DRAG_SUPPORT_VELOCITY_EMA_MS,
   HEAD_PAT_RADIUS_RATIO,
+  IDLE_MICRO_POOL,
+  IDLE_TILT_HEAD_ROLL_RAD,
+  IDLE_TILT_HEAD_YAW_RAD,
+  IDLE_TILT_NECK_SHARE,
+  IDLE_VARIATION_FADE_SECONDS,
   LANDING_DURATION_MS,
   LANDING_MAX_SQUASH,
   MASK_HEIGHT,
+  MICRO_POOL_MAX_MS,
+  MICRO_POOL_MIN_MS,
+  MICRO_POOL_TRANSITION_RATE,
   MOUTH_FRAME_CLOSED,
   REBOUND_SETTLE_MS,
   SIT_BODY_YAW_RAD,
+  SIT_CLIP_HOLD_SECONDS,
+  SIT_CLIP_START_SECONDS,
+  SIT_GAZE_EYE_EXTRA,
   SIT_HEAD_TUNE_RAD,
+  SIT_PHASE_A_HEAD_TUNE_RAD,
+  SIT_SPINE_OVERLAY_WEIGHT,
+  SIT_MICRO_FAR_HEAD_PITCH_RAD,
+  SIT_MICRO_FAR_HEAD_YAW_RAD,
+  SIT_MICRO_FAR_LEG_SCALE,
+  SIT_MICRO_FAR_SPINE_PITCH_RAD,
+  SIT_MICRO_HANDS_HEAD_PITCH_RAD,
+  SIT_MICRO_HANDS_HEAD_YAW_RAD,
+  SIT_MICRO_HANDS_LEG_SCALE,
+  SIT_MICRO_HANDS_SPINE_PITCH_RAD,
+  SIT_MICRO_POOL,
 } from '../../shared/constants';
+import type { IdleMicroKind, SitMicroKind } from '../../shared/constants';
 import type { BroadcastEvent } from '../../shared/events';
 import { isIntent } from '../../shared/intents';
 import { cssToMask, grabBandAt, headBandBottomRow } from '../../shared/mask';
@@ -45,7 +68,6 @@ import type { BoneArbiter } from './bone-arbiter';
 import type { ClipRole } from './clip-bank';
 import { createDragPendulum, pivotCompensation, stepDragPendulum, struggleOffset } from './drag-motion';
 import type { DragBand, DragPendulumState } from './drag-motion';
-import { nextFidgetAtMs } from './fidget';
 import { approach, walkYawFor, EMOTION_FACE, EMOTION_FADE_MS, fadeProgress, resolveMouthOwner } from './emotion-face';
 import type { BlushLevel, EmotionFace, EyeAssetKey, MouthOwner, MouthShape } from './emotion-face';
 import { loadExpressionAssets } from './expression-assets';
@@ -67,6 +89,8 @@ import { createGazeController } from './gaze';
 import type { GazeController, GazeState } from './gaze';
 import { createHfsm, isPatReaction } from './hfsm';
 import type { Hfsm, HfsmSnapshot, WalkPlan } from './hfsm';
+import { createIdleVariation } from './idle-variation';
+import type { IdleVariationSnapshot } from './idle-variation';
 import { impactFromDownVelocity, landingPose } from './landing';
 import { createMaskCapture } from './mask-capture';
 import type { MaskCapture } from './mask-capture';
@@ -79,10 +103,14 @@ import {
 import type { MeshMaterialFacts } from './material-diagnostics';
 import { loadModel, measureAnimatedMinY, measureAnimatedBounds, placeModel } from './model-loader';
 import type { LoadedModel, ModelBones } from './model-loader';
+import { createMicroPool } from './micro-pool';
+import type { MicroPoolSnapshot } from './micro-pool';
 import { createCapsulePlaceholder, PLACEHOLDER_BOTTOM_MARGIN_PX } from './placeholder';
 import type { PlaceholderModel } from './placeholder';
 import { createSitMotion } from './sit-motion';
 import type { SitMotionFrame } from './sit-motion';
+import { createSitDrop } from './sit-drop';
+import { sitStageBBlend, sitStageBLocalSeconds } from './sit-sequence';
 import { headTiltFromBind, headWorldPitch, headWorldYaw } from './sit-head';
 import { sitPose } from './sit-pose';
 import { startleDurationMs, startlePose } from './startle';
@@ -108,12 +136,6 @@ const SIT_IN_FADE_SECONDS = 0.45;
 const SIT_OUT_FADE_SECONDS = 0.35;
 /** 加载期"临时切到坐姿采样"用的淡入（不能是 0：three 的权重插值需要正时长） */
 const CALIBRATION_FADE_SECONDS = 0.001;
-
-/** 待机姿态轮换（ADR 0023 D5、ADR 0041 D4）：22–40s 在四个正面待机片段之间换。 */
-const IDLE_VARIANT_ROLES: readonly ClipRole[] = ['idle', 'idle.alt1', 'idle.alt2', 'idle.alt3'];
-const IDLE_VARIANT_MIN_MS = 22_000;
-const IDLE_VARIANT_MAX_MS = 40_000;
-const IDLE_VARIANT_FADE_SECONDS = 0.8;
 
 /**
  * 官方片段接线表（ADR 0023 D2、ADR 0041 D3）：列出会用模型自带片段的 intent。
@@ -153,6 +175,12 @@ const REACTIONS: Record<Exclude<Intent, 'none' | 'pat_react'>, ReactionSpec> = {
   look_at_user: { durationMs: 600, look: 0.22 },
   happy_hop: { durationMs: 720, hopPx: 34 },
 };
+
+/** 0..1 夹取（微动作池权重用；NaN / 越界一律当 0/1，绝不把 NaN 送进四元数）。 */
+function unitWeight(value: number | undefined): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(1, Math.max(0, value as number));
+}
 
 /**
  * 摸头反应在**没有可用官方片段**时的表情窗口（毫秒）。
@@ -205,6 +233,49 @@ export interface PatDiagnostics {
   clip: string | null;
   /** 身体没接管的原因；null = 接管了，或压根没有摸头反应（ADR 0039 D4） */
   blockedBy: 'dragged' | 'settling' | 'sitting' | 'walking' | 'speaking' | 'missing' | null;
+}
+
+/**
+ * 视线三级阻尼的**骨骼级**诊断（ADR 0049 D2；真机问题一取证）。
+ *
+ * 控制器里的 `spineYaw` 只是"提交量"，不代表骨骼真的转了。这里从
+ * `BoneArbiter.animationBase(spine1)`（本帧动画基底）与 `spine1.quaternion`（本帧最终值）
+ * 反解出实际写进骨骼的旋转，并投影到**世界 Y 轴**上 —— 这就是"Spine1 的实时 rotation.y"。
+ */
+export interface GazeBoneDiagnostics {
+  /** 本帧 Spine1 实际被写入的偏航（rad，绕世界 Y 的分量） */
+  spineYawRad: number;
+  /** 同上，角度制（诊断面板直接看这个） */
+  spineYawDeg: number;
+  /** 旋转轴在世界 Y 上的分量（±1 附近 = 纯偏航；0 = 旋转在别的轴上） */
+  axisY: number;
+  /** 控制器本帧提交量（rad；与 `spineYawRad` 对照可判断"是不是被覆盖了"） */
+  submittedYawRad: number;
+}
+
+export interface GazeDiagnostics extends GazeState {
+  /** 骨骼真的转了多少；骨骼/仲裁器缺失时为 null */
+  spineBone: GazeBoneDiagnostics | null;
+}
+
+/**
+ * 微动作池的只读快照（ADR 0049 D1；内部诊断，不进 `RenderState`）。
+ *
+ * `weights` 是"每个条目当前淡入到多少"，调用方按它做交叉混合；`active` 是这一段时间
+ * 抽中的主打条目。`holdRemainingMs` 是非默认条目的自动回正倒计时（-1 = 默认/强制）。
+ * `forced` 只在自检取证时出现（生产路径恒为 null）。
+ */
+export interface MicroPoolDiag {
+  active: string;
+  weights: Record<string, number>;
+  nextSwitchInMs: number;
+  switches: number;
+  /** 非默认条目到时/上下文失效 → 回到默认条目的次数 */
+  releases: number;
+  activeForMs: number;
+  /** 距当前非默认条目自动回正还有多久（ms）；-1 = 默认条目 / 强制中 / 不设 hold */
+  holdRemainingMs: number;
+  forced: string | null;
 }
 
 /**
@@ -278,6 +349,33 @@ export interface FacialDiagnostics {
   };
 }
 
+/**
+ * 内部（ADR 0051）：极轻的坐姿两段式快照（自检 16ms 采样用，不含面部摘要）。
+ */
+export interface SitSequenceDiagnostics {
+  stage: 'a' | 'b';
+  /** 片段本地时间（秒；0 = 14.2s） */
+  holdTimeSeconds: number | null;
+  holdDurationSeconds: number | null;
+  /** 阶段 B 覆盖权重 0..1（0.3s 淡入） */
+  stageBBlend: number;
+  /** 距阶段 B 开始多久（ms）；未到为 null */
+  stageBInMs: number | null;
+  /** 下坐弹簧 0..1 */
+  sitDrop: number;
+  /** 实际施加到补偿/姿态上的增益 = sitGain × sitDrop */
+  sitPoseGain: number;
+  /** 实际施加到上半身覆盖上的权重 = stageBBlend × sitPoseGain */
+  upperOverride: number;
+  /** ADR 0051 D7：阶段 A 抬头补偿的实际施加值（rad） */
+  phaseAHeadAppliedRad: number;
+  /** ADR 0051 D7：下背覆盖的配置值 / 实际权重 */
+  spineOverlayWeight: number;
+  spineOverlayApplied: number;
+  headQuat: [number, number, number, number] | null;
+  headWorld: { x: number; y: number } | null;
+}
+
 export interface RenderDiagnostics {
   ready: boolean;
   loading: boolean;
@@ -300,7 +398,7 @@ export interface RenderDiagnostics {
     atlasLoaded: boolean;
     calibrated: boolean;
   };
-  gaze: { yaw: number; pitch: number; targetYaw: number; targetPitch: number; idle: boolean; submitted: boolean };
+  gaze: GazeDiagnostics;
   animation: AnimationDiagnostics | null;
   /** 面部贴图通道（ADR 0026）；null = 未启用 */
   facial: FacialDiagnostics | null;
@@ -358,6 +456,26 @@ export interface RenderDiagnostics {
     dropPx: number;
     /** ADR 0042：坐下过渡（半蹲）的进度 0..1；过渡结束后恒为 1 */
     transition: number;
+    /** ADR 0051：当前两段式阶段 */
+    stage: 'a' | 'b';
+    /** ADR 0051：阶段 B 上半身覆盖权重（0.3s 淡入） */
+    stageBBlend: number;
+    /** ADR 0051：下坐弹簧 0..1 */
+    sitDrop: number;
+    /** ADR 0051：实际施加到补偿/姿态上的增益（sitGain × sitDrop） */
+    sitPoseGain: number;
+    /** ADR 0051：实际施加到上半身覆盖上的权重（stageBBlend × sitPoseGain） */
+    upperOverride: number;
+    /** ADR 0051 D7：阶段 A 抬头补偿的配置值 / 实际施加值（rad） */
+    phaseAHeadTuneRad: number;
+    phaseAHeadAppliedRad: number;
+    /** ADR 0051 D7：下背覆盖权重配置值 / 实际施加值 */
+    spineOverlayWeight: number;
+    spineOverlayApplied: number;
+    /** ADR 0051：停帧基准（片段绝对秒，固定 16.2） */
+    holdAtSeconds: number;
+    /** ADR 0051：片段本地时间（秒；null = 没有 hold） */
+    holdTimeSeconds: number | null;
     /** ADR 0042：坐下过渡本帧抬高的像素（14 → 0） */
     transitionLiftPx: number;
     /** 身体平移补偿（px）：抵消片段把角色搬去长椅的偏移 */
@@ -387,7 +505,7 @@ export interface RenderDiagnostics {
     } | null;
     /** ADR 0048 D2：当前人工微调量（rad，正 = 低头） */
     headTune: number;
-    /** ADR 0048 D1：站立上半身姿态（胸/颈/头的局部四元数）是否已记录 */
+    /** ADR 0048 D1：站立上半身姿态（下背/胸/颈/头的局部四元数）是否已记录 */
     idleUpperCaptured: boolean;
     /** 头骨**当前**相对绑定姿态的 pitch / yaw（含张望；用来判断"头有没有在动"） */
     headOrientation: { pitch: number; yaw: number } | null;
@@ -402,15 +520,15 @@ export interface RenderDiagnostics {
   };
   pat: PatDiagnostics;
   /**
-   * ADR 0041 D4 / ADR 0045 D1：空闲小动作（内部诊断，不进 `RenderState`）。
-   * `kind` 只剩官方片段 `shy`——`spin`（原地转圈）已删除。
+   * ADR 0050：待机静态站姿轮换（内部诊断，不进 `RenderState`）。
+   * `Cafe_Reaction` 的一次性小动作已删除，这里只剩"当前站姿 / 下一次换姿势倒计时 / 次数"。
    */
-  fidget: {
-    kind: 'shy';
-    progress: number;
-    /** 保留字段：转圈删除后恒为 0（不破坏诊断形状） */
-    yaw: number;
-  } | null;
+  idleVariation: IdleVariationSnapshot;
+  /**
+   * ADR 0049 D1：微动作池（idle / sitting 各一个）。
+   * `weights` 是每个条目当前交叉淡入的比例；`active` 是这一段时间抽中的主打条目。
+   */
+  microPool: { idle: MicroPoolDiag | null; sit: MicroPoolDiag | null };
   speech: { frame: number; driven: boolean };
   /** ADR 0037：全局光照 + Toon 材质（内部诊断，不进 `RenderState`） */
   toon: ToonShadingDiagnostics;
@@ -523,6 +641,31 @@ export interface RenderModule {
    * `sit-motion` 的一帧数值，供自检以 ~16ms 间隔连续采样。
    */
   sitMotionDiagnostics(): SitMotionFrame | null;
+  /** 内部（ADR 0051）：极轻的坐姿两段式快照（阶段 / 弹簧 / 头骨） */
+  sitSequenceDiagnostics(): SitSequenceDiagnostics;
+  /** 内部（ADR 0051，自检取证）：立刻把张望目标切到 camera / wander */
+  forceSitGaze(kind: 'camera' | 'wander'): 'camera' | 'wander';
+  /**
+   * 内部（ADR 0049 D2）：**只读、极轻**的视线三级阻尼快照（不含面部贴图摘要）。
+   * 自检要以 16ms 间隔采样"眼球 / 头部 / 躯干"的时间差，`getDiagnostics()` 太慢。
+   * `spineBone` 是本帧 **Spine1 骨骼实际被写入**的偏航（真机问题一取证）。
+   */
+  gazeDiagnostics(): GazeDiagnostics | null;
+  /** 内部（ADR 0049 D1）：两个微动作池的只读快照（同样不走 `getDiagnostics` 的面部摘要） */
+  microPoolDiagnostics(): { idle: MicroPoolDiag | null; sit: MicroPoolDiag | null };
+  /**
+   * 内部（ADR 0049 D1，自检取证）：强制某个池的条目（`null` = 解除）。
+   * 非法条目名被忽略并返回 null；**不是**生产接口，不进 IPC。
+   */
+  forceMicroPool(pool: 'idle' | 'sit', kind: string | null): string | null;
+  /** 内部（ADR 0049 D1，自检压缩时序）：覆盖池的切换间隔（ms） */
+  setMicroPoolInterval(pool: 'idle' | 'sit', minIntervalMs: number, maxIntervalMs: number): void;
+  /** 内部（ADR 0050）：待机静态站姿轮换的只读快照 */
+  idleVariationDiagnostics(): IdleVariationSnapshot;
+  /** 内部（ADR 0050，自检取证）：强制下一个 tick 换到某个站姿（`null` = 解除） */
+  forceIdleVariation(role: ClipRole | null): ClipRole | null;
+  /** 内部（ADR 0050，自检压缩时序）：覆盖站姿轮换间隔（ms） */
+  setIdleVariationInterval(minIntervalMs: number, maxIntervalMs: number): void;
 }
 
 export interface RenderModuleOptions {
@@ -596,6 +739,30 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
    * 重心偏移、后倾、大腿弯曲）都乘它，所以进场/退场与片段的交叉淡入同步，不会硬切。
    */
   private sitGain = 0;
+  /**
+   * ADR 0051：下坐弹簧（0 → 1）。所有坐姿补偿/姿态/覆盖都乘它。
+   *
+   * 它和 `sitGain` 是两件事：`sitGain` 是片段交叉淡入的权重（站位↔坐姿），
+   * `sitDrop` 是"落座"本身（座面上方 → 座面）。两者相乘才是最终施加量。
+   */
+  private readonly sitDropSpring = createSitDrop();
+  /**
+   * ADR 0051：阶段 B 的开始时刻（`performance.now`）；null = 还在阶段 A。
+   *
+   * 片段本地 1.8s（绝对 16.0s）时置位；从这一刻起用 0.3s 淡入站立上半身覆盖
+   * 与程序化微动。片段继续播到本地 2.0s（绝对 16.2s）后 clamp 停帧。
+   */
+  private sitStageBStartedAt: number | null = null;
+  /** ADR 0051：阶段 B 覆盖权重 0..1（`sitStageBBlend` 的输出） */
+  private sitStageBGain = 0;
+  /** ADR 0051：本帧实际施加的坐姿增益（sitGain × sitDrop；诊断用） */
+  private sitPoseGain = 0;
+  /** ADR 0051：本帧实际施加的上半身覆盖权重（stageB × sitPoseGain；诊断用） */
+  private sitUpperOverride = 0;
+  /** ADR 0051 D7：阶段 A 抬头补偿的**实际施加量**（rad；已乘 phaseA 权重） */
+  private sitPhaseAHeadApplied = 0;
+  /** ADR 0051 D7：下背覆盖的**实际权重**（upperOverride × SIT_SPINE_OVERLAY_WEIGHT） */
+  private sitSpineOverlay = 0;
   /** 坐姿角色此刻的权重（诊断用；程序化降级时恒为 0） */
   private sitRoleWeight = 0;
   /** 程序化降级路径的替代包络（没有片段权重可用时） */
@@ -607,6 +774,28 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
    * 纯数值控制器，每帧产出一组"叠加量"，由 `applySitMotion()` 提交给骨骼仲裁器。
    */
   private readonly sitMotion = createSitMotion();
+  /**
+   * ADR 0049 D1：两个**微动作池**（纯调度器，不引用 three）。
+   *
+   * - idle 池：`browse`（现有待机）× 3 : `headTilt`（偶尔歪头）× 1；
+   * - sitting 池：`legs`（现有晃腿）× 3 : `hands`（低头看手）× 1 : `far`（抬头看远处）× 1。
+   *
+   * 池只负责"这一段时间主打哪个条目 + 每个条目淡入到多少"，具体姿态在
+   * `updateFrame`（idle 歪头）与 `applySitMotion`（坐姿变奏）里按权重相加。
+   * 换条目由池内的 15–30s 抽签驱动，过渡用同一套指数插值 —— 不新增状态。
+   */
+  private readonly idlePool = createMicroPool<IdleMicroKind>({
+    entries: IDLE_MICRO_POOL,
+    minIntervalMs: MICRO_POOL_MIN_MS,
+    maxIntervalMs: MICRO_POOL_MAX_MS,
+    transitionRatePerSecond: MICRO_POOL_TRANSITION_RATE,
+  });
+  private readonly sitPool = createMicroPool<SitMicroKind>({
+    entries: SIT_MICRO_POOL,
+    minIntervalMs: MICRO_POOL_MIN_MS,
+    maxIntervalMs: MICRO_POOL_MAX_MS,
+    transitionRatePerSecond: MICRO_POOL_TRANSITION_RATE,
+  });
   /**
    * 绑定姿态下头骨的世界朝向（模型加载时、`setupAnimations()` 之前采一次）。
    * 仅供 `headOrientation`（相对绑定，量"头有没有在动"）使用；**不再参与坐姿姿态补偿**。
@@ -621,12 +810,13 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
    */
   private eyeBindLocal: THREE.Quaternion | null = null;
   /**
-   * ADR 0048：**站立待机时上半身三根骨骼的局部四元数**（胸/颈/头）。
+   * ADR 0048 / ADR 0051：**站立待机时上半身四根骨骼的局部四元数**（下背 / 胸 / 颈 / 头）。
    *
    * 这是"平视的答案"——站姿是她看镜头的样子，玩家已经认可。
    * 坐姿停帧后直接把这三个值**覆盖**上去（不叠任何偏移），上半身的相对姿态就和站立一致。
    */
   private idleUpperLocals: {
+    spine: THREE.Quaternion | null;
     chest: THREE.Quaternion | null;
     neck: THREE.Quaternion | null;
     head: THREE.Quaternion | null;
@@ -728,20 +918,13 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
   private lastLandingSquash = 0;
   /** 落地次数（自检用来确认"这一次"真的落地了，而不是读到上一次的留存值） */
   private landingCount = 0;
-  private idleVariantAt = 0;
-  private idleVariantRole: ClipRole = 'idle';
   /**
-   * ADR 0041 D4 / ADR 0045 D1：空闲小动作，**只剩官方片段** `fidget.shy`。
-   * 原来的 `spin`（原地转 2π）已删除——真机反馈"像陀螺"。
-   * 它不是 §4.1 的状态：Base 仍是 `idle`，`RenderState` 不变。
+   * ADR 0050：待机**静态站姿轮换**调度器（纯逻辑在 `idle-variation.ts`）。
+   *
+   * 它只回答"现在该不该换、换成谁"；换姿势仍走 `animation-controller.playRole()`
+   * 的 0.8s 交叉淡入。不是新状态：`getState().base` 恒为 `idle`。
    */
-  private fidget: { kind: 'shy'; startedAt: number; durationMs: number } | null = null;
-  /**
-   * 下一次小动作的绝对时刻。**初值必须是 `+Infinity`，不是 0**（ADR 0043 D1）：
-   * 0 表示"已经到期"，而首帧到模型加载完成之间有几百毫秒到几秒的空窗，
-   * 旧实现就是在这个空窗里转了一圈。`+Infinity` = "安全冷却，等排期"。
-   */
-  private fidgetAt = Number.POSITIVE_INFINITY;
+  private readonly idleVariation = createIdleVariation();
   /** 语音口型（ADR 0015 D4）：帧号由播放器按包络推进 */
   private lipSyncFrame = MOUTH_FRAME_CLOSED;
   private lipSyncDriven = false;
@@ -938,9 +1121,7 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       console.warn('[render] Idle 片段缺失：Base 层没有动画驱动（ADR 0014 D3）');
       return;
     }
-    this.idleVariantRole = 'idle';
-    this.scheduleIdleVariant(performance.now());
-    this.scheduleFidget(performance.now());
+    this.idleVariation.reset(performance.now());
     // 让首帧动作权重生效，随后才能做地面校正的蒙皮采样
     animations.update(0);
     model.root.updateMatrixWorld(true);
@@ -950,6 +1131,11 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     if (!this.animations) return;
     const ok = this.animations.play(slot, fadeSeconds);
     const current = this.animations.current();
+    if (ok && slot === 'idle') {
+      // 槽位 idle 用的是 `CH0335_Cafe_Idle` 的 action；同步调度器的"当前站姿"，
+      // 避免下一次轮换抽到 `idle` 时又从片段 0s 重播一次同样的姿势（ADR 0050）。
+      this.idleVariation.noteCurrent('idle');
+    }
     if (ok) {
       console.log(`[render] 动作切换 ${reason} → ${slot}=${String(current.name)}（crossFade ${fadeSeconds}s）`);
     } else {
@@ -980,58 +1166,21 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     return one ? one.duration * 1000 : 0;
   }
 
-  /** ADR 0023 D5：排下一次待机姿态轮换。 */
-  private scheduleIdleVariant(now: number): void {
-    const span = IDLE_VARIANT_MAX_MS - IDLE_VARIANT_MIN_MS;
-    this.idleVariantAt = now + IDLE_VARIANT_MIN_MS + Math.random() * span;
-  }
-
-  /** ADR 0023 D5 / ADR 0041 D4：在四个正面待机姿态之间交叉淡入，避免长时间看出循环。 */
-  private rotateIdleVariant(now: number): void {
-    this.scheduleIdleVariant(now);
-    const animations = this.animations;
-    if (!animations || IDLE_VARIANT_ROLES.length < 2) return;
-    const candidates = IDLE_VARIANT_ROLES.filter(
-      (role) => role !== this.idleVariantRole && animations.roles[role].name !== null,
-    );
-    if (candidates.length === 0) return;
-    const role = candidates[Math.floor(Math.random() * candidates.length)];
-    if (animations.playRole(role, IDLE_VARIANT_FADE_SECONDS, 'idle')) {
-      this.idleVariantRole = role;
-      console.log(`[render] 待机姿态轮换 → ${role}=${String(animations.roles[role].name)}`);
-    }
-  }
-
-  /** ADR 0041 D4 / ADR 0043 D1：排下一次空闲小动作（含"启动后 45s 冷却"硬闸）。 */
-  private scheduleFidget(now: number): void {
-    this.fidgetAt = nextFidgetAtMs(now, this.startedAt);
-  }
-
   /**
-   * ADR 0041 D4 / ADR 0045 D1：空闲小动作的调度与推进（每帧）。
+   * ADR 0050：待机**静态站姿轮换**（每帧）。
    *
-   * 只在"站着待机、没有 Physics、不在说话、没有一次性演出、没有拖拽姿态"时开一次；
-   * 到点但条件不满足就**顺延**（不每帧重试）。
+   * 与旧实现的区别：
+   * - 不再有一次性小动作（`fidget.shy` / `Cafe_Reaction` 已整体删除）；
+   * - 候选池是 7 个**正面、静态、循环**的官方待机片段，每 20–45s 换一个；
+   * - 换姿势条件是"纯站立待机"：不能在拖拽 / 坐姿 / 行走 / 说话 / 一次性演出期间换。
+   *   到点但条件不满足时，调度器把排期顺延到恢复的那一刻（不会"忙完立刻换"）。
    *
-   * **ADR 0045 D1：`spin`（原地转圈）已删除**，这里只剩官方片段 `fidget.shy`
-   * （`Cafe_Reaction` 3.2–4.9s 的掩面缩身）。片段缺失时**什么都不做**——
-   * 不再回退到任何程序化动作（"没有合适片段就先关掉"）。
-   *
-   * **ADR 0043 D1 的两道闸**（修"打开时转一圈"）：
-   * 1. `fidgetAt` 初值是 `+Infinity`（"安全冷却"，不是 0 = 立即到期）；只有
-   *    `setupAnimations` 真正跑过 `scheduleFidget` 之后才会变成有限值；
-   * 2. 模型没就绪（`ready` 为假 / 没有 animations）时**一律不触发**。
+   * 呼吸与视线不在这里：呼吸由每个待机片段自己带，视线由 `gaze.ts` 每帧叠加在
+   * 动画姿态之上——换姿势只换"基底"，两条常驻通道照常工作。
    */
-  private updateFidget(now: number, snapshot: HfsmSnapshot, oneShotActive: boolean): void {
-    if (this.fidget) {
-      if (now - this.fidget.startedAt >= this.fidget.durationMs) this.fidget = null;
-      return;
-    }
+  private updateIdleVariation(now: number, snapshot: HfsmSnapshot, oneShotActive: boolean): void {
     if (!this.ready || !this.animations) return;
-    if (!Number.isFinite(this.fidgetAt)) return;
-    if (now < this.fidgetAt) return;
-
-    const idleOk =
+    const active =
       snapshot.base === 'idle' &&
       snapshot.physics === null &&
       snapshot.speakingUtteranceId === null &&
@@ -1039,22 +1188,23 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       !this.dragging &&
       this.dragPoseGain < 0.001 &&
       !this.sitting;
-    if (!idleOk) {
-      // 她正在忙：顺延一个完整间隔，避免"忙完立刻做小动作"的突兀
-      this.scheduleFidget(now);
-      return;
-    }
-    this.scheduleFidget(now);
-    // 只有官方片段这一条路；缺失就不做（ADR 0045 D1）
-    if (this.animations.playOnce('fidget.shy') === true) {
-      this.fidget = { kind: 'shy', startedAt: now, durationMs: this.oneShotDurationMs() };
+    const role = this.idleVariation.tick(
+      now,
+      active,
+      (candidate) => this.animations?.roles[candidate].name !== null,
+    );
+    if (role === null) return;
+    const animations = this.animations;
+    if (animations.playRole(role, IDLE_VARIATION_FADE_SECONDS, 'idle')) {
       console.log(
-        `[render] 空闲小动作 shy → ${String(this.animations.oneShot()?.name)}` +
-          `（${(this.oneShotDurationMs() / 1000).toFixed(2)}s）`,
+        `[render] 待机站姿轮换 → ${role}=${String(animations.roles[role].name)}` +
+          `（crossFade ${IDLE_VARIATION_FADE_SECONDS}s）`,
       );
-      return;
+    } else {
+      // 片段在加载期被判定缺失：调度器已经把它排除，正常不会走到这里
+      console.warn(`[render] 待机站姿轮换失败 → ${role}（片段缺失，保持当前站姿）`);
+      this.idleVariation.noteCurrent('idle');
     }
-    console.log('[render] 空闲小动作：没有可用的 fidget.shy 片段，本次不做（ADR 0045 D1）');
   }
 
   /**
@@ -1064,7 +1214,6 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
    */
   private beginWalk(plan: WalkPlan, now: number): void {
     this.walkingPlan = plan;
-    this.scheduleIdleVariant(now);
     this.walkYawTarget = walkYawFor(plan.direction);
     const played = this.animations?.playRole('walk', WALK_IN_FADE_SECONDS, 'walk') ?? false;
     this.options.onWalkRequest?.({
@@ -1477,8 +1626,9 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
    * 做法：临时切到坐姿片段（淡入 1ms），用 `holdSeek` 直接**定位到片段末尾**
    * （= `playHold` 停住的那一帧），采完立刻切回 Idle。
    *
-   * 为什么必须定位到末尾：坐姿窗口（13.4–15.6s）里她还在"撑起身子坐正"，
-   * 第一帧是前塌的、最后一帧才是真正的坐姿。按第一帧量补偿，身体会偏一两厘米。
+   * 为什么必须定位到末尾：ADR 0051 的进入窗口（14.2–16.2s）里，14.2–14.7 还在落位、
+   * 14.95 有一次转头；**16.2s 才是阶段 B 的停帧基准**（身体/头的姿态参考点）。
+   * 按第一帧量补偿，身体会偏一两厘米；按 16.2 量才是她真正坐住的姿态。
    * 为什么不在进入 `sitting` 时采：那一刻动作还在淡入（权重 0→1），采样到的是
    * "站姿与坐姿的混合"，补偿量会错；加载时 CPU 采样一次（约几毫秒）最干净。
    */
@@ -1493,8 +1643,9 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     }
     const liveHold = animations.hold();
     const duration = liveHold?.duration ?? 0;
-    // 定位到最后一帧（留 20ms 余量，避免越过 clamp 触发 finished 语义上的边界）
-    animations.holdSeek(Math.max(0, duration - 0.02));
+    // ADR 0051：停帧基准 = 片段末尾（本地 2.0s = 绝对 16.2s）。不再留 20ms 余量，
+    // 因为 `holdSeek` 自己会夹到 duration，且 16.2s 就是我们要的"身体/头姿态参考点"。
+    animations.holdSeek(duration);
     animations.update(0.016);
     model.root.updateMatrixWorld(true);
     this.sitBounds = measureAnimatedBounds(model.root, model.meshes, 4096);
@@ -1504,7 +1655,8 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     animations.update(0.016);
     model.root.updateMatrixWorld(true);
     console.log('[render] 坐姿标定', {
-      sampledAtSeconds: Number(Math.max(0, duration - 0.02).toFixed(2)),
+      sampledAtSeconds: Number(duration.toFixed(2)),
+      absoluteSeconds: Number((duration + SIT_CLIP_START_SECONDS).toFixed(2)),
       clipSeconds: Number(duration.toFixed(2)),
       bounds: this.sitBounds
         ? {
@@ -1548,7 +1700,38 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       this.sitPoseActive = false;
       this.sitGain = 0;
       this.sitFallbackGain = 0;
+      this.sitStageBStartedAt = null;
+      this.sitStageBGain = 0;
+      this.sitDropSpring.reset();
     }
+  }
+
+  /**
+   * ADR 0051：推进**下坐弹簧**与**两段式阶段**。
+   *
+   * 顺序：先算 `sitDrop`（落座本身），再看片段本地时间是否到 1.8s（绝对 16.0s）。
+   * 到点后阶段 B 的覆盖权重从 0 用 0.3s 升到 1；片段继续播到本地 2.0s（16.2s）后 clamp。
+   *
+   * 为什么用"首次观测到到点"的时刻而不是绝对片段时钟：帧率抖动/掉帧时，
+   * 片段可能一步跨过 1.8s；此时从这一帧开始 0.3s 淡入，仍然不会跳。
+   */
+  private updateSitStage(now: number, dtSeconds: number): void {
+    if (!this.sitting || !this.sitArrived) return;
+    this.sitDropSpring.update(dtSeconds, 1);
+
+    if (this.sitStageBStartedAt === null) {
+      const hold = this.animations?.hold() ?? null;
+      const localSeconds = hold?.time ?? 0;
+      const due = this.sitProcedural || (hold !== null && localSeconds >= sitStageBLocalSeconds());
+      if (!due) return;
+      this.sitStageBStartedAt = now;
+      console.log(
+        `[render] 坐姿阶段 B 开始（片段本地 ${localSeconds.toFixed(2)}s / 绝对 ` +
+          `${(localSeconds + SIT_CLIP_START_SECONDS).toFixed(2)}s；` +
+          `停留到 ${SIT_CLIP_HOLD_SECONDS.toFixed(1)}s 后停帧）`,
+      );
+    }
+    this.sitStageBGain = sitStageBBlend(now - this.sitStageBStartedAt);
   }
 
   /** 坐姿的像素补偿：身体中心 → 窗口中线，身体最低点 → 窗口底边。 */
@@ -1788,7 +1971,6 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
         // ADR 0041 D1：**播什么与抓取带无关** —— 抓头 / 抓身 / 抓脚统一播官方悬空片段
         // `Formation_Pickup`（`held`）。抓取带只影响单摆物理（摆长/阻尼/限幅/挣扎）。
         // 片段从第 0 秒起播，正好获得"被拎起来"的那一下；任何程序化骨骼姿态都已删除。
-        this.fidget = null;
         this.playAnimation('held', DRAG_IN_CROSSFADE_SECONDS, `drag_started（band=${this.dragBand}）`);
         break;
       }
@@ -1952,40 +2134,83 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
    * （本资产的眨眼是骨骼平移，不是 blendshape）。所有量已经由 `sit-motion` 乘过它的总包络，
    * 这里不再缩放，避免"包络套包络"。
    */
-  private applySitMotion(frame: SitMotionFrame): void {
+  private applySitMotion(frame: SitMotionFrame, poolWeights: Record<SitMicroKind, number>): void {
     const arbiter = this.arbiter;
     const model = this.model;
     if (!arbiter || !model) return;
-    if (frame.gain <= 0.0005) return;
+    /**
+     * ADR 0051：上半身覆盖用**阶段 B 的 0.3s 权重**，不是 `frame.gain` 的 0.5s 微动包络。
+     *
+     * 两者分开：头部必须在 16.2s 停帧后 0.3s 内回到站立姿态（慢了会读成"头还在飘"），
+     * 而呼吸/晃腿可以 0.5s 慢慢起来。再乘 `sitGain × sitDrop`，退场/落座都不会硬切。
+     */
+    const upperBlend = Math.min(
+      1,
+      Math.max(0, this.sitStageBGain * this.sitGain * this.sitDropSpring.value()),
+    );
+    if (frame.gain <= 0.0005 && upperBlend <= 0.0005) return;
     const bones = model.bones;
     const gain = frame.gain;
     /**
+     * ADR 0049 D1：**坐姿微动作池**的权重（`legs` / `hands` / `far`）。
+     *
+     * 三个条目不是三套动作，而是"同一套坐姿微动 + 不同的偏置"：
+     * - `legs`（晃腿）：当前行为，随机张望照常；
+     * - `hands`（低头看手）：晃腿停下、头/颈/眼低头并略偏向手，随机张望淡出；
+     * - `far`（抬头看远处）：晃腿放慢到三成，头/眼抬起并偏向一侧。
+     *
+     * 每个条目都有 0..1 的权重（池负责 15–30s 抽签与指数过渡），所以换条目时是
+     * 平滑交叉混合，不会"啪"地换一个姿势。全部量都再乘 `frame.gain`（坐姿总包络），
+     * 落座/起身时不会硬切。
+     */
+    const legsW = unitWeight(poolWeights.legs);
+    const handsW = unitWeight(poolWeights.hands);
+    const farW = unitWeight(poolWeights.far);
+    // 随机张望在 `legs` 条目下完全生效；hands/far 把它淡出，换成各自的固定朝向
+    const wander = legsW;
+    const gazeYaw =
+      frame.gazeYaw * wander +
+      gain * (handsW * SIT_MICRO_HANDS_HEAD_YAW_RAD + farW * SIT_MICRO_FAR_HEAD_YAW_RAD);
+    const gazePitch =
+      frame.gazePitch * wander +
+      gain * (handsW * SIT_MICRO_HANDS_HEAD_PITCH_RAD + farW * SIT_MICRO_FAR_HEAD_PITCH_RAD);
+    const legScale =
+      legsW + handsW * SIT_MICRO_HANDS_LEG_SCALE + farW * SIT_MICRO_FAR_LEG_SCALE;
+    const spineBias =
+      gain * (handsW * SIT_MICRO_HANDS_SPINE_PITCH_RAD + farW * SIT_MICRO_FAR_SPINE_PITCH_RAD);
+    /**
      * ADR 0048 D1：**上半身直接照抄站立姿态**。
      *
-     * 胸（`Spine1`）/颈/头三根骨骼的**局部四元数**在站立待机时采了一次，这里原样覆盖为
-     * 旋转基底 —— 不做任何"相对绑定姿态的差值"、不加任何偏移量。
-     * 为什么是这三根：坐姿片段的骨盆与脊柱把躯干摆成另一个角度，只改头会把脖子拧着；
-     * 三根一起覆盖，上半身的**相对姿态**就和玩家认可的站姿完全一致。
+     * 胸（`Spine1`）/颈/头**以及下背 `Spine`**的**局部四元数**在站立待机时采了一次，
+     * 这里原样覆盖为旋转基底 —— 不做任何"相对绑定姿态的差值"、不加任何偏移量。
+     * 为什么必须带下背：16.2s 的片段下背比 14.7s 更前倾，只覆盖后三根时整条上链会继承
+     * 这个前倾，头看起来仍然低（真机 A/B 实测）；四根一起覆盖，上半身才真正与站姿一致。
      *
-     * 用 `slerp(片段姿态 → 站立姿态, 包络)` 淡入，落座那 500ms 不会"啪"地跳一下。
+     * 用 `slerp(片段姿态 → 站立姿态, upperBlend)` 淡入；`upperBlend` 是阶段 B 的
+     * 0.3s 权重（不是微动的 0.5s 包络），所以 16.2s 停帧后头会在 0.3s 内回正。
      */
     const idle = this.idleUpperLocals;
     const upper = [
+      { bone: bones.spine, target: idle?.spine ?? null },
       { bone: bones.spine1, target: idle?.chest ?? null },
       { bone: bones.neck, target: idle?.neck ?? null },
       { bone: bones.head, target: idle?.head ?? null },
     ];
+    const spineWeight = Math.min(1, Math.max(0, SIT_SPINE_OVERLAY_WEIGHT));
     for (const { bone, target } of upper) {
       if (!bone) continue;
       if (!target) continue;
+      // ADR 0051 D7：下背可以单独放松（0.85 = 保留 15% 片段前倾），其余三根不变。
+      const blend = bone === bones.spine ? upperBlend * spineWeight : upperBlend;
+      if (blend <= 0.0005) continue;
       const base = arbiter.animationBase(bone) ?? bone.quaternion;
-      const blended = base.clone().slerp(target, gain);
+      const blended = base.clone().slerp(target, blend);
       // 基底被覆盖后，下面的 `add` 都是绕世界轴叠在这份"站立姿态"上的呼吸/张望
       arbiter.overrideBase(bone, blended);
     }
     // 呼吸：脊柱/颈的微小前屈（正 = 低头，ADR 0035 D5 的标定）
     if (bones.spine) arbiter.add(bones.spine, 0, frame.spinePitch);
-    if (bones.spine1) arbiter.add(bones.spine1, 0, frame.spine1Pitch);
+    if (bones.spine1) arbiter.add(bones.spine1, 0, frame.spine1Pitch + spineBias);
     if (bones.neck) arbiter.add(bones.neck, 0, frame.neckPitch);
     // 肩膀呼吸（ADR 0045 D2.3）：锁骨 + 上臂各 ±0.02rad，相位已由 sit-motion 错开。
     // 只给 pitch（世界 X）——roll 会变成"耸肩"，yaw 会让手臂前后甩。
@@ -1995,26 +2220,33 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     for (const arm of [bones.upperArmL, bones.upperArmR]) {
       if (arm) arbiter.add(arm, 0, frame.upperArmPitch);
     }
-    // 自主张望：头 + 眼球（坐姿期间光标视线已关闭，这里是唯一的视线来源）。
+    // 自主张望（或池条目的固定朝向）：头 + 眼球。
     // ADR 0048 D2：`sitHeadTune` 是键盘 ↑/↓ 现场调出来的固定微调（正 = 低头），
     // 一起按包络淡入；它和"张望"是两件事，后者每 2–4s 换方向。
     if (bones.head) {
-      arbiter.add(bones.head, frame.gazeYaw, frame.gazePitch + this.sitHeadTune * gain);
+      arbiter.add(bones.head, gazeYaw, gazePitch + this.sitHeadTune * upperBlend);
     }
     // ADR 0046 D1：**接管眼球**。停帧后 Mixer 不再写眼骨，片段里那份"向下看"会永远留着
     // （死鱼眼）。把眼球的旋转基底换成**绑定姿态**（平视），再叠张望的额外量 ——
     // 眼球从此跟着头一起转，不再呆滞看地。
     const eyeBase = this.eyeBindLocal;
+    const eyeYaw = gazeYaw * SIT_GAZE_EYE_EXTRA;
+    const eyePitch = gazePitch * SIT_GAZE_EYE_EXTRA;
     for (const eye of [bones.eyeL, bones.eyeR]) {
       if (!eye) continue;
-      if (eyeBase) arbiter.overrideBase(eye, eyeBase);
-      arbiter.add(eye, frame.eyeYaw, frame.eyePitch);
+      if (eyeBase && upperBlend > 0.0005) {
+        const clipBase = arbiter.animationBase(eye) ?? eye.quaternion;
+        // 从片段自带的眼位（阶段 A 的"四处张望"）平滑过渡到绑定姿态 + 张望
+        arbiter.overrideBase(eye, clipBase.clone().slerp(eyeBase, upperBlend));
+      }
+      arbiter.add(eye, eyeYaw, eyePitch);
     }
-    // 悬空晃腿：左右反相（相位差 π），大腿带小腿
-    if (bones.thighL) arbiter.add(bones.thighL, 0, frame.thighPitchL);
-    if (bones.thighR) arbiter.add(bones.thighR, 0, frame.thighPitchR);
-    if (bones.calfL) arbiter.add(bones.calfL, 0, frame.calfPitchL);
-    if (bones.calfR) arbiter.add(bones.calfR, 0, frame.calfPitchR);
+    // 悬空晃腿：左右反相（相位差 π），大腿带小腿。ADR 0049 D1：按池条目的 `legScale`
+    // 平滑停下/放慢（看手时完全停、看远处时剩三成），不是"啪"地停。
+    if (bones.thighL) arbiter.add(bones.thighL, 0, frame.thighPitchL * legScale);
+    if (bones.thighR) arbiter.add(bones.thighR, 0, frame.thighPitchR * legScale);
+    if (bones.calfL) arbiter.add(bones.calfL, 0, frame.calfPitchL * legScale);
+    if (bones.calfR) arbiter.add(bones.calfR, 0, frame.calfPitchR * legScale);
     // ADR 0046 D2：**停帧不再眨眼**。眼皮骨（`bone_eye_D_*`）的平移手写眨眼已整套删除：
     // 停帧时没有动画混合与联动，只推平移会把下眼皮硬拉上去（真机"翻白眼"）。
   }
@@ -2025,32 +2257,197 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
   }
 
   /**
-   * ADR 0048 D1：采一次**站立待机时上半身三根骨骼的局部四元数**（胸 `Spine1` / 颈 / 头）。
+   * 内部（ADR 0051）：极轻的坐姿两段式快照（自检 16ms 采样用）。
+   * 只读 `sitDrop` / 阶段 / 头骨，不触发面部摘要。
+   */
+  sitSequenceDiagnostics(): SitSequenceDiagnostics {
+    const hold = this.animations?.hold() ?? null;
+    const head = this.model?.bones.head ?? null;
+    let headQuat: [number, number, number, number] | null = null;
+    let headWorld: { x: number; y: number } | null = null;
+    if (head) {
+      headQuat = [
+        Number(head.quaternion.x.toFixed(5)),
+        Number(head.quaternion.y.toFixed(5)),
+        Number(head.quaternion.z.toFixed(5)),
+        Number(head.quaternion.w.toFixed(5)),
+      ];
+      const world = new THREE.Vector3();
+      head.getWorldPosition(world);
+      headWorld = { x: Number(world.x.toFixed(1)), y: Number(world.y.toFixed(1)) };
+    }
+    return {
+      stage: this.sitStageBStartedAt === null ? 'a' : 'b',
+      holdTimeSeconds: hold ? Number(hold.time.toFixed(3)) : null,
+      holdDurationSeconds: hold ? Number(hold.duration.toFixed(3)) : null,
+      stageBBlend: Number(this.sitStageBGain.toFixed(3)),
+      stageBInMs:
+        this.sitStageBStartedAt === null
+          ? null
+          : Math.max(0, Math.round(performance.now() - this.sitStageBStartedAt)),
+      sitDrop: Number(this.sitDropSpring.value().toFixed(3)),
+      sitPoseGain: Number(this.sitPoseGain.toFixed(3)),
+      upperOverride: Number(this.sitUpperOverride.toFixed(3)),
+      phaseAHeadAppliedRad: Number(this.sitPhaseAHeadApplied.toFixed(4)),
+      spineOverlayWeight: SIT_SPINE_OVERLAY_WEIGHT,
+      spineOverlayApplied: Number(this.sitSpineOverlay.toFixed(3)),
+      headQuat,
+      headWorld,
+    };
+  }
+
+  /**
+   * 内部（ADR 0051，自检取证）：立刻把坐姿张望目标切到 camera / wander。
+   * 生产路径不调用；下一次自然抽签仍按 1/3 概率。
+   */
+  forceSitGaze(kind: 'camera' | 'wander'): 'camera' | 'wander' {
+    this.sitMotion.forceGaze(kind, performance.now());
+    return kind;
+  }
+
+  /** 内部（ADR 0049 D2）：极轻的视线三级阻尼快照（自检 16ms 采样用）。 */
+  gazeDiagnostics(): GazeDiagnostics | null {
+    const state = this.gaze?.state();
+    if (!state) return null;
+    return { ...state, spineBone: this.spineBoneDiagnostics(state.spineYaw) };
+  }
+
+  /**
+   * ADR 0049 D2 取证：**Spine1 骨骼实际转了多少**（不是控制器提交量）。
+   *
+   * `final = q_roll · q_pitch · q_yaw · base`（`BoneArbiter.endFrame`），所以
+   * `delta = final · base⁻¹` 就是本帧仲裁器写进这根骨骼的旋转（父空间）；
+   * 再把 delta 的轴转到世界空间、取它在世界 Y 上的分量，就是"实时 rotation.y"。
+   */
+  private spineBoneDiagnostics(submittedYaw: number): GazeBoneDiagnostics | null {
+    /**
+     * 坐姿期间 Spine1 的基底被"照抄站立姿态"覆盖（ADR 0048 D1），此时的骨骼旋转增量
+     * 来自坐姿姿态而不是视线；返回 null，避免把坐姿姿态误读成"躯干跟随"。
+     */
+    if (this.sitPoseActive && this.sitGain > 0.01) return null;
+    const spine = this.model?.bones.spine1 ?? null;
+    const base = spine ? this.arbiter?.animationBase(spine) ?? null : null;
+    if (!spine || !base) return null;
+    const delta = spine.quaternion.clone().multiply(base.clone().invert());
+    const w = Math.min(1, Math.abs(delta.w));
+    const angle = 2 * Math.acos(w);
+    if (angle < 1e-7) {
+      return { spineYawRad: 0, spineYawDeg: 0, axisY: 0, submittedYawRad: Number(submittedYaw.toFixed(5)) };
+    }
+    const axis = new THREE.Vector3(delta.x, delta.y, delta.z);
+    if (axis.lengthSq() < 1e-12) {
+      return { spineYawRad: 0, spineYawDeg: 0, axisY: 0, submittedYawRad: Number(submittedYaw.toFixed(5)) };
+    }
+    axis.normalize();
+    const parentWorld = spine.parent
+      ? spine.parent.getWorldQuaternion(new THREE.Quaternion())
+      : new THREE.Quaternion();
+    axis.applyQuaternion(parentWorld).normalize();
+    // 我们的 yaw 是绕世界 Y 的纯旋转；投影到世界 Y 才不会被呼吸/动画的其它轴污染
+    const yawRad = angle * Math.sign(axis.y || 1) * Math.abs(axis.y);
+    return {
+      spineYawRad: Number(yawRad.toFixed(5)),
+      spineYawDeg: Number(THREE.MathUtils.radToDeg(yawRad).toFixed(2)),
+      axisY: Number(axis.y.toFixed(3)),
+      submittedYawRad: Number(submittedYaw.toFixed(5)),
+    };
+  }
+
+  /** 内部（ADR 0049 D1）：两个微动作池的只读快照。 */
+  microPoolDiagnostics(): { idle: MicroPoolDiag | null; sit: MicroPoolDiag | null } {
+    const toDiag = <K extends string>(snap: MicroPoolSnapshot<K> | null): MicroPoolDiag | null => {
+      if (!snap) return null;
+      const weights: Record<string, number> = {};
+      for (const [kind, value] of Object.entries(snap.weights)) {
+        weights[kind] = Number((value as number).toFixed(4));
+      }
+      return {
+        active: snap.active,
+        weights,
+        nextSwitchInMs: snap.nextSwitchInMs,
+        switches: snap.switches,
+        releases: snap.releases,
+        activeForMs: snap.activeForMs,
+        holdRemainingMs: snap.holdRemainingMs,
+        forced: snap.forced,
+      };
+    };
+    return { idle: toDiag(this.idlePool.snapshot()), sit: toDiag(this.sitPool.snapshot()) };
+  }
+
+  /** 内部（ADR 0049 D1，自检取证）：强制某个池的条目（`null` = 解除）。 */
+  forceMicroPool(pool: 'idle' | 'sit', kind: string | null): string | null {
+    return pool === 'idle' ? this.idlePool.force(kind) : this.sitPool.force(kind);
+  }
+
+  /** 内部（ADR 0049 D1，自检压缩时序）：覆盖池的切换间隔（ms）。 */
+  setMicroPoolInterval(pool: 'idle' | 'sit', minIntervalMs: number, maxIntervalMs: number): void {
+    if (pool === 'idle') this.idlePool.setInterval(minIntervalMs, maxIntervalMs);
+    else this.sitPool.setInterval(minIntervalMs, maxIntervalMs);
+  }
+
+  /** 内部（ADR 0050）：待机站姿轮换的只读快照（极轻，可 100ms 采样）。 */
+  idleVariationDiagnostics(): IdleVariationSnapshot {
+    return this.idleVariation.snapshot(
+      performance.now(),
+      (role) => this.animations?.roles[role].name !== null,
+    );
+  }
+
+  /**
+   * 内部（ADR 0050，自检取证）：强制下一个 tick 换到某个站姿（`null` = 解除）。
+   * 非法角色返回 null；**不是**生产接口，不进 IPC。
+   */
+  forceIdleVariation(role: ClipRole | null): ClipRole | null {
+    return this.idleVariation.force(role, performance.now());
+  }
+
+  /** 内部（ADR 0050，自检压缩时序）：覆盖站姿轮换间隔（ms）；生产路径不调用。 */
+  setIdleVariationInterval(minIntervalMs: number, maxIntervalMs: number): void {
+    this.idleVariation.setIdleInterval(minIntervalMs, maxIntervalMs, performance.now());
+  }
+
+  /**
+   * ADR 0048 D1 / ADR 0051：采一次**站立待机时上半身四根骨骼的局部四元数**
+   * （下背 `Spine` / 胸 `Spine1` / 颈 / 头）。
    *
    * 这就是"平视的答案"：站立待机是她看着镜头、玩家也认可的样子。坐姿停帧后直接把这三个
    * **局部**值覆盖上去，上半身的相对姿态即与站立一致——不做差值、不做欧拉分解。
    *
-   * 采的条件：纯待机的一帧（没有拖拽/坐姿/一次性演出/小动作、朝向回正、Idle 权重 ≥0.9）。
+   * 采的条件：纯待机的一帧（没有拖拽/坐姿/一次性演出、朝向回正、Idle 权重 ≥0.9）。
    * 采到就不再更新（她可能换待机变体，但"平视"只认第一次）。
    */
-  private captureIdleUpperPose(snapshot: HfsmSnapshot, oneShot: OneShotStatus | null): void {
+  private captureIdleUpperPose(
+    snapshot: HfsmSnapshot,
+    oneShot: OneShotStatus | null,
+    idleTiltWeight: number,
+  ): void {
     if (this.idleUpperLocals !== null) return;
     if (this.sitting || this.sitGain > 0.001 || this.dragging) return;
     if (snapshot.base !== 'idle' || snapshot.physics !== null || oneShot) return;
-    if (this.fidget || Math.abs(this.walkYaw) > 0.05) return;
+    if (Math.abs(this.walkYaw) > 0.05) return;
+    // ADR 0049 D1：歪头权重非零时采到的头骨带着 roll，不能拿它当"站立姿态"
+    if (Number.isFinite(idleTiltWeight) && idleTiltWeight > 0.001) return;
     const bones = this.model?.bones ?? null;
-    if (!bones?.head || !bones.neck || !bones.spine1) return;
+    if (!bones?.head || !bones.neck || !bones.spine1 || !bones.spine) return;
     const idleWeight = (this.animations?.actions() ?? [])
       .filter((action) => action.running)
       .reduce((max, action) => Math.max(max, action.weight), 0);
     if (idleWeight < 0.9) return;
     this.idleUpperLocals = {
-      chest: bones.spine1.quaternion.clone(),
-      neck: bones.neck.quaternion.clone(),
-      head: bones.head.quaternion.clone(),
+      // 必须取**动画基底**，不能取 `bone.quaternion`：后者含上一帧的视线偏移
+      // （启动时光标可能停在某个方向），会把"站立平视"采成一个歪头/低头的姿态。
+      // `animationBase()` 是 `beginFrame()` 判定的 mixer 产物，不含任何叠加量。
+      // 基底链：Spine（下背）→ Spine1（胸）→ Neck → Head。
+      // 只覆盖后三根不够：16.2s 的片段下背比 14.7s 更前倾，整条上链会继承这个前倾，
+      // 头看起来仍然低（真机 A/B 实测）。下背一起覆盖，上半身才真正"照抄站立"。
+      spine: (this.arbiter?.animationBase(bones.spine) ?? bones.spine.quaternion).clone(),
+      chest: (this.arbiter?.animationBase(bones.spine1) ?? bones.spine1.quaternion).clone(),
+      neck: (this.arbiter?.animationBase(bones.neck) ?? bones.neck.quaternion).clone(),
+      head: (this.arbiter?.animationBase(bones.head) ?? bones.head.quaternion).clone(),
     };
     console.log(
-      `[render] 站立上半身姿态已记录（胸/颈/头的局部四元数；ADR 0048 D1）`,
+      `[render] 站立上半身姿态已记录（下背/胸/颈/头的局部四元数；ADR 0048/0051）`,
     );
   }
 
@@ -2060,9 +2457,10 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
    * 顺序是刻意的：先收步（正在走的话立即停），再让 HFSM 进 Physics（这会清空行走排期），
    * 最后播坐姿——`sitting` 期间 Base 层不再有任何调度，她不会在窗口边缘上迈步。
    *
-   * ADR 0044 D1：坐姿回到 `playHold`——官方片段**停在最后一帧**（姿态基线），
-   * 片段自己的运动到此为止；呼吸 / 张望 / 眨眼 / 晃腿由 `sit-motion` 接管。
-   * 身体平移补偿仍由 `updateSitGain()` 按片段权重插值（ADR 0043 D3）。
+   * ADR 0051：坐姿是**两段式**——`playHold` 播放 14.2–16.2s（`LoopOnce`）：
+   * 阶段 A（14.2–16.0s）正常播放，让她自己演"坐下 + 第一次张望"；
+   * 阶段 B（16.0–16.2s）继续播到 16.2s 后 clamp，从 16.0s 起 0.3s 淡入站立上半身覆盖
+   * 与程序化微动。身体平移补偿仍由 `updateSitGain()` 按 `sitGain × sitDrop` 缩放。
    */
   private enterSit(now: number, edge: 'top' | 'bottom', source: string): void {
     const wasSitting = this.sitting;
@@ -2081,16 +2479,23 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     }
     const held = this.animations?.playHold('sit', SIT_IN_FADE_SECONDS) ?? false;
     this.sitProcedural = !held;
+    // ADR 0051：每次首次落座都从 0 开始压弹簧；阶段 A 从片段本地 0（绝对 14.2s）起播。
+    this.sitDropSpring.reset();
+    this.sitStageBStartedAt = null;
+    this.sitStageBGain = 0;
     if (!held) {
       // 降级：悬空姿态 + 下沉 24px + 大腿弯曲 0.45rad（用户原始建议的路径）
       this.playAnimation('held', SIT_IN_FADE_SECONDS, 'snap_applied（无坐姿片段 → 程序化降级）');
+      // 没有官方片段就没有阶段 A 可看：直接进阶段 B，让程序化微动立刻接管
+      this.sitStageBStartedAt = now;
     }
-    // 每次落座都从"刚刚坐好"开始：呼吸相位归零、晃腿/张望/眨眼重新排期（都带软启动）
+    // 每次落座都从"刚刚坐好"开始：呼吸相位归零、晃腿/张望重新排期（都带软启动）
     this.sitMotion.reset(now);
     console.log(
       `[render] sitting 开始 edge=${edge} source=${source} ` +
         `clip=${held ? String(this.analogSitClipName()) : '(缺失，程序化降级)'} ` +
-        `hold=true（ADR 0044 D1）+ 活体微动`,
+        `阶段A=${held ? `${SIT_CLIP_START_SECONDS.toFixed(1)}→16.0s（正放）` : '无'} ` +
+        `+ 阶段B 16.0→${SIT_CLIP_HOLD_SECONDS.toFixed(1)}s（0.3s 覆盖淡入）+ 活体微动（ADR 0051）`,
     );
   }
 
@@ -2493,13 +2898,19 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
         atlasLoaded: this.atlasLoaded,
         calibrated: this.facial?.calibrated ?? false,
       },
-      gaze: this.gaze?.state() ?? {
+      gaze: this.gazeDiagnostics() ?? {
         yaw: 0,
         pitch: 0,
         targetYaw: 0,
         targetPitch: 0,
         idle: true,
         submitted: false,
+        eyeYaw: 0,
+        eyePitch: 0,
+        spineYaw: 0,
+        phase: 'idle',
+        sinceCursorMs: Number.POSITIVE_INFINITY,
+        spineBone: null,
       },
       animation: this.animations
         ? {
@@ -2568,7 +2979,8 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       sit: (() => {
         const weight = this.sitRoleWeight;
         const held = this.animations?.hold() ?? null;
-        const pose = this.sitGain > 0.001 ? sitPose(now - this.sitStartedAt, this.sitProcedural) : null;
+        const sitDrop = this.sitDropSpring.value();
+        const pose = this.sitPoseGain > 0.001 ? sitPose(sitDrop, this.sitProcedural) : null;
         const shift = this.sitOffsetPx();
         return {
           sitting: this.sitting,
@@ -2594,12 +3006,24 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
           blend: Number(this.sitGain.toFixed(3)),
           /** 片段自身的权重（诊断用：与 `blend` 对照可看出降级路径） */
           clipWeight: Number(weight.toFixed(3)),
-          dropPx: Number(((pose?.dropPx ?? 0) * this.sitGain).toFixed(2)),
+          dropPx: Number(((pose?.dropPx ?? 0) * this.sitPoseGain).toFixed(2)),
           transition: Number((pose?.transition ?? 1).toFixed(3)),
-          transitionLiftPx: Number(((pose?.transitionLiftPx ?? 0) * this.sitGain).toFixed(2)),
+          /** ADR 0051：两段式与弹簧的状态（自检/真机取证） */
+          stage: this.sitStageBStartedAt === null ? 'a' : 'b',
+          stageBBlend: Number(this.sitStageBGain.toFixed(3)),
+          sitDrop: Number(sitDrop.toFixed(3)),
+          sitPoseGain: Number(this.sitPoseGain.toFixed(3)),
+          upperOverride: Number(this.sitUpperOverride.toFixed(3)),
+          phaseAHeadTuneRad: SIT_PHASE_A_HEAD_TUNE_RAD,
+          phaseAHeadAppliedRad: Number(this.sitPhaseAHeadApplied.toFixed(4)),
+          spineOverlayWeight: SIT_SPINE_OVERLAY_WEIGHT,
+          spineOverlayApplied: Number(this.sitSpineOverlay.toFixed(3)),
+          holdAtSeconds: SIT_CLIP_HOLD_SECONDS,
+          holdTimeSeconds: held ? Number(held.time.toFixed(3)) : null,
+          transitionLiftPx: Number(((pose?.transitionLiftPx ?? 0) * this.sitPoseGain).toFixed(2)),
           offsetPx: {
-            x: Number((shift.x * this.sitGain).toFixed(1)),
-            y: Number((shift.y * this.sitGain).toFixed(1)),
+            x: Number((shift.x * this.sitPoseGain).toFixed(1)),
+            y: Number((shift.y * this.sitPoseGain).toFixed(1)),
           },
           rawOffsetPx: { x: Number(shift.x.toFixed(1)), y: Number(shift.y.toFixed(1)) },
           /** ADR 0046 D3.1：当前微侧身偏航（rad） */
@@ -2619,6 +3043,7 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
                 pitch: Number(frame.gazePitch.toFixed(4)),
                 targetYaw: Number(frame.targetYaw.toFixed(4)),
                 targetPitch: Number(frame.targetPitch.toFixed(4)),
+                targetKind: frame.targetKind,
                 nextInMs: frame.nextGazeInMs,
               },
               eye: {
@@ -2636,7 +3061,7 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
           })(),
           /** ADR 0048 D2：当前人工微调量（rad，正 = 低头；键盘 ↑/↓ 现场调） */
           headTune: Number(this.sitHeadTune.toFixed(4)),
-          /** ADR 0048 D1：站立上半身姿态是否已记录（胸/颈/头三根） */
+          /** ADR 0048 D1 / ADR 0051：站立上半身姿态是否已记录（下背/胸/颈/头四根） */
           idleUpperCaptured: this.idleUpperLocals !== null,
           /**
            * 头骨**当前**相对绑定姿态的 pitch / yaw（含张望）。
@@ -2709,16 +3134,11 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
         };
       })(),
       pat,
-      fidget: this.fidget
-        ? {
-            kind: this.fidget.kind,
-            progress: Number(
-              Math.min(1, (now - this.fidget.startedAt) / Math.max(1, this.fidget.durationMs)).toFixed(3),
-            ),
-            yaw: 0,
-          }
-        : null,
+      /** ADR 0050：待机静态站姿轮换（当前角色 / 下一次倒计时 / 候选池） */
+      idleVariation: this.idleVariation.snapshot(now, (role) => this.animations?.roles[role].name !== null),
       speech: { frame: this.lipSyncFrame, driven: this.lipSyncDriven },
+      /** ADR 0049 D1：微动作池（idle / sitting）的只读快照 */
+      microPool: this.microPoolDiagnostics(),
       toon: this.toon.diagnostics(),
       outline: this.outline.diagnostics(),
       render: {
@@ -2845,25 +3265,33 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     const oneShot = this.animations?.oneShot() ?? null;
     const snapshot = this.hfsm.snapshot();
 
-    // ADR 0041 D4：空闲小动作（原地转圈 / 官方害羞片段），只在"站着待机"时发生
-    this.updateFidget(now, snapshot, oneShot !== null);
+    // ADR 0050：待机站姿轮换（20–45s，0.8s 交叉淡入）。旧的一次性小动作已删除。
+    this.updateIdleVariation(now, snapshot, oneShot !== null);
 
-    // ADR 0023 D5：空闲时轮换待机姿态（拖拽、行走、吸附、小动作与一次性演出期间不换）
-    if (
+    /**
+     * ADR 0049 D1：微动作池抽签（15–30s 一次，过渡用指数插值）。
+     *
+     * - idle 池只在"纯站立待机"时计时（拖拽 / 坐姿 / 行走 / 一次性演出 / 空闲小动作都不算），
+     *   不满足时权重平滑归零，回到待机再从 15–30s 重新计时；
+     * - sitting 池只在"已落座"时计时（接近阶段不算——那一段她还在走/跳）。
+     */
+    const idlePoolActive =
       !this.dragging &&
       !this.sitting &&
       !oneShot &&
-      !this.fidget &&
       snapshot.base === 'idle' &&
       snapshot.physics === null &&
-      now >= this.idleVariantAt
-    ) {
-      this.rotateIdleVariant(now);
-    }
+      // ADR 0049 D1：说话不属于"纯站立待机"（ADR 0050 顺手补上这条漏判）
+      snapshot.speakingUtteranceId === null;
+    const idlePool = this.idlePool.update(now, dt, idlePoolActive);
+    const sitPoolActive = this.sitting && this.sitArrived && !this.dragging;
+    const sitPool = this.sitPool.update(now, dt, sitPoolActive);
 
-    // ADR 0048 D1：**站立待机时把胸/颈/头的局部四元数记下来**（"平视的答案"）。
-    // 只在"纯待机"的一帧采一次：没有拖拽/坐姿/一次性演出、朝向已回到正面。
-    this.captureIdleUpperPose(snapshot, oneShot);
+    // ADR 0048 D1：站立待机时把下背/胸/颈/头的**动画基底**记下来（"平视的答案"）。
+    // 为什么放在 `beginFrame()` 之后：`animationBase()` 只有在这一步才是本帧 mixer 的产物；
+    // 放在 mixer 之前会读到绑定姿态/上一帧基底，坐姿覆盖就会把"T-pose 的头"抄过去。
+    // ADR 0049 D1：**歪头进行中不采**——否则坐姿会把"歪着的头"当成站立姿态照抄。
+    this.captureIdleUpperPose(snapshot, oneShot, idlePool.weights.headTilt ?? 0);
 
     // 0) 仲裁器在 mixer.update **之前**记下受控骨骼的四元数：第 2 步靠"这中间变没变"
     //    判断动画有没有重写该骨骼。three 的 `PropertyMixer.apply()` 在片段停帧后会
@@ -2880,8 +3308,12 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     // 2) 骨骼仲裁：抓取本帧动画基底并清零叠加量
     this.arbiter?.beginFrame();
 
-    // 2.1) ADR 0048 D1：坐姿时**直接用站立姿态的局部四元数覆盖**胸/颈/头，在
-    //      `applySitMotion()` 里按包络完成（那里才有 `frame.gain` 与骨骼表）。
+    // 2.0) ADR 0048 D1：站立待机的下背/胸/颈/头基底（必须在 `beginFrame()` 之后采，
+    //      才能拿到本帧 mixer 的干净产物；见 `captureIdleUpperPose()` 的注释）。
+    this.captureIdleUpperPose(snapshot, oneShot, idlePool.weights.headTilt ?? 0);
+
+    // 2.1) ADR 0048 D1 / ADR 0051：坐姿时**直接用站立姿态的局部四元数覆盖**
+    //      下背/胸/颈/头，在 `applySitMotion()` 里按阶段 B 的 0.3s 权重完成。
 
     // 3) 视线通道叠加（合成在动画姿态之上，而不是覆盖绑定姿态）
     //
@@ -2890,6 +3322,26 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     const sitMotionOn = this.sitPoseActive && this.sitGain > 0.01;
     if (this.gaze && this.arbiter && !sitMotionOn) {
       this.gaze.update(now, this.width, this.height, this.arbiter);
+    }
+
+    // 3.1) ADR 0049 D1：idle 池的「偶尔歪头」——叠加在视线之上的 roll 通道。
+    //      权重是池给的 0..1（换条目时指数交叉淡入淡出），所以歪头不会瞬切；
+    //      池不活跃时权重自然衰减到 0，进入坐姿/拖拽的过渡里也不会硬切。
+    const idleTilt = idlePool.weights.headTilt ?? 0;
+    if (idleTilt > 0.001 && this.arbiter) {
+      const head = this.model?.bones.head ?? null;
+      const neck = this.model?.bones.neck ?? null;
+      if (head) {
+        this.arbiter.add(
+          head,
+          IDLE_TILT_HEAD_YAW_RAD * idleTilt,
+          0,
+          IDLE_TILT_HEAD_ROLL_RAD * idleTilt,
+        );
+      }
+      if (neck) {
+        this.arbiter.add(neck, 0, 0, IDLE_TILT_HEAD_ROLL_RAD * IDLE_TILT_NECK_SHARE * idleTilt);
+      }
     }
 
     // 4) 反应通道叠加：摸头**没有**任何程序化姿态（ADR 0039 D2），
@@ -2904,23 +3356,43 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     // ADR 0043 D3：坐姿混合权重（片段权重当插值因子；程序化降级退回时间包络）。
     // 必须在 mixer.update 之后算：权重是这一帧混合结算后的结果。
     this.updateSitGain(dt);
-    // ADR 0046 D3.1：微侧身 —— 身体先侧 0.15rad（按 sitGain 淡入淡出），
+    // ADR 0051：下坐弹簧 + 两段式阶段（阶段 B 在片段本地 1.8s = 绝对 16.0s 触发）。
+    this.updateSitStage(now, dt);
+    const sitDrop = this.sitDropSpring.value();
+    this.sitPoseGain = this.sitGain * sitDrop;
+    this.sitUpperOverride = Math.min(1, this.sitStageBGain * this.sitPoseGain);
+    /**
+     * ADR 0051 D7：阶段 A 的抬头补偿。
+     *
+     * 只在阶段 A（stageBBlend=0）满额；阶段 B 的 0.3s 覆盖把它线性/缓动收到 0，
+     * 所以 16.0s 不会"啪"地抬头。它叠在片段姿态之上（`add`），不是覆盖基底；
+     * 阶段 B 时 `applySitMotion()` 的站立覆盖会接管头骨基底，二者相加过渡。
+     */
+    this.sitPhaseAHeadApplied =
+      SIT_PHASE_A_HEAD_TUNE_RAD * this.sitPoseGain * (1 - this.sitStageBGain);
+    if (Math.abs(this.sitPhaseAHeadApplied) > 1e-6 && this.arbiter) {
+      const head = this.model?.bones.head ?? null;
+      if (head) this.arbiter.add(head, 0, this.sitPhaseAHeadApplied);
+    }
+    this.sitSpineOverlay = this.sitUpperOverride * Math.min(1, Math.max(0, SIT_SPINE_OVERLAY_WEIGHT));
+    // ADR 0046 D3.1：微侧身 —— 身体先侧 0.15rad（按 sitPoseGain 淡入淡出），
     // 头部的基准在标定时已扣掉这个偏航，所以不会把侧身转回去。
-    this.sitBodyYaw = SIT_BODY_YAW_RAD * this.sitGain;
-    // ADR 0028 D8 / ADR 0043 D3：坐姿姿态只在**已落座且混合权重 > 0** 时参与，
-    // 且每一项都乘 `sitGain` —— 进场（权 0→1）与退场（1→0）都不会硬切。
-    const sit = this.sitGain > 0.001 ? sitPose(now - this.sitStartedAt, this.sitProcedural) : null;
+    this.sitBodyYaw = SIT_BODY_YAW_RAD * this.sitPoseGain;
+    // ADR 0028 D8 / ADR 0043 D3 / ADR 0051：坐姿姿态只在**已落座且增益 > 0** 时参与，
+    // 且每一项都乘 `sitGain × sitDrop` —— 进场（0→1）、弹簧下坐与退场（1→0）都不会硬切。
+    const sit = this.sitPoseGain > 0.001 ? sitPose(sitDrop, this.sitProcedural) : null;
     if (sit && sit.thighBend !== 0 && this.arbiter) {
       for (const thigh of [this.model?.bones.thighL ?? null, this.model?.bones.thighR ?? null]) {
-        if (thigh) this.arbiter.add(thigh, 0, -sit.thighBend * this.sitGain);
+        if (thigh) this.arbiter.add(thigh, 0, -sit.thighBend * this.sitPoseGain);
       }
     }
 
-    // 4.1) 坐姿活体微动（ADR 0044）：呼吸 / 自主张望 / 眨眼 / 悬空晃腿。
-    //      片段停在最后一帧，Mixer 不再驱动这些骨骼的"变化"，控制权在这里。
-    //      `active` 只在"已落座"时为真：解除坐姿后由 `sit-motion` 自己的包络淡出。
-    const motion = this.sitMotion.update(now, dt, this.sitting && this.sitArrived);
-    this.applySitMotion(motion);
+    // 4.1) 坐姿活体微动（ADR 0044 / ADR 0051）：阶段 A 不启用，让官方片段自己演；
+    //      阶段 B 起才把呼吸/自主张望/晃腿叠上去（`frame.gain` 有 500ms 软启动）。
+    //      `active` 只在"已落座且已进入阶段 B"时为真：解除坐姿后由 `sit-motion` 自淡出。
+    const stageBActive = this.sitting && this.sitArrived && this.sitStageBStartedAt !== null;
+    const motion = this.sitMotion.update(now, dt, stageBActive);
+    this.applySitMotion(motion, sitPool.weights);
 
     // 4.2) 拖拽姿态（ADR 0041 D1）：**不再有任何按部位手写的骨骼偏移**。
     //      悬空姿态由官方片段 `Formation_Pickup` 给出；这里只剩第 6 步的
@@ -3076,17 +3548,17 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     // **补偿必须按坐姿混合权重缩放**：片段把身体搬到 (+257, -287)px，站姿时补偿必须是 0；
     // 旧实现直接用满值 → `snap_applied` 那一帧模型瞬移近 390px（真机"乱平移/出边框"的根因）。
     //
-    // **呼吸与微动与补偿解耦**（ADR 0044 D5）：补偿只跟 `sitGain`，微动只走 `sit-motion`，
-    // 两者相加而不是相乘 —— 呼吸的 ±0.9px 永远不会放大到补偿量上去。
+    // **呼吸与微动与补偿解耦**（ADR 0044 D5 / ADR 0051）：补偿只跟 `sitGain × sitDrop`，
+    // 微动只走 `sit-motion`，两者相加而不是相乘 —— 呼吸的 ±0.9px 永远不会放大到补偿量上去。
     const sitRaw = this.sitOffsetPx();
-    const sitShift = { x: sitRaw.x * this.sitGain, y: sitRaw.y * this.sitGain };
+    const sitShift = { x: sitRaw.x * this.sitPoseGain, y: sitRaw.y * this.sitPoseGain };
     const breathFloatPx = sitMotionOn ? this.sitMotion.frame()?.breathFloatPx ?? 0 : 0;
     this.animationRoot.position.x = sitShift.x + pivotShift.x + startleX;
     this.animationRoot.position.y =
       -this.height / 2 +
       hop -
-      (sit?.dropPx ?? 0) * this.sitGain +
-      (sit?.transitionLiftPx ?? 0) * this.sitGain +
+      (sit?.dropPx ?? 0) * this.sitPoseGain +
+      (sit?.transitionLiftPx ?? 0) * this.sitPoseGain +
       // ADR 0044 D2：呼吸的整体高低浮动，**≤1px**（常量 SIT_BREATH_FLOAT_PX）
       breathFloatPx +
       sitShift.y +
@@ -3095,7 +3567,7 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     this.animationRoot.rotation.z =
       tilt +
       dragAngle +
-      (sit?.lean ?? 0) * this.sitGain;
+      (sit?.lean ?? 0) * this.sitPoseGain;
     // 转身 / `look` 反应 / 坐姿微侧身共用同一个 Y 轴通道：叠加而不是互相覆盖
     // ADR 0045 D1：根节点的偏航只剩"行走朝向"与"视线/反应"两个来源；
     // 原来的 `fidgetYaw`（原地转圈）已删除。ADR 0046 D3.1 新增坐姿微侧身。

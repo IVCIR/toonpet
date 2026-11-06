@@ -6,7 +6,7 @@ import { createModelAnimations } from './animation-controller';
 /**
  * ADR 0044 回归：**停帧的 hold 也必须报告权重**。
  *
- * 真机上踩到的现象：坐姿 `playHold` 播完（0.42s）后 `clampWhenFinished` 把 action
+ * 真机上踩到的现象：坐姿 `playHold` 播完（ADR 0051 后是 2.0s）后 `clampWhenFinished` 把 action
  * 置成 `paused`，`isRunning()` 变 false。旧 `roleWeight()` 用 `isRunning()` 过滤，
  * 于是权重从 1 掉到 0 → 身体平移补偿整块消失 → 她被推到窗口左边只剩半个身子。
  */
@@ -15,16 +15,16 @@ test('roleWeight：playHold 停帧后仍然报告权重 1（否则坐姿补偿�
   const bone = new THREE.Object3D();
   bone.name = 'Bip001_Pelvis';
   root.add(bone);
-  const clip = new THREE.AnimationClip('CH0335_my_event088_pastmemory_01', 0.42, [
-    new THREE.NumberKeyframeTrack(`${bone.name}.position[y]`, [0, 0.42], [0, 1]),
+  const clip = new THREE.AnimationClip('CH0335_my_event088_pastmemory_01', 20, [
+    new THREE.NumberKeyframeTrack(`${bone.name}.position[y]`, [0, 20], [0, 1]),
   ]);
   const animations = createModelAnimations(root, [clip, new THREE.AnimationClip('CH0335_Cafe_Idle', 1, [])]);
   animations.play('idle', 0);
   assert.equal(animations.playHold('sit', 0), true);
   assert.ok(animations.roleWeight('sit') > 0.99, `刚开播 weight=${animations.roleWeight('sit')}`);
 
-  // 推过片段末尾：clampWhenFinished 生效（paused=true、isRunning=false）
-  for (let i = 0; i < 20; i += 1) animations.update(0.05);
+  // 推过片段末尾（ADR 0051 的 sit 窗口是 2.0s）：clampWhenFinished 生效
+  for (let i = 0; i < 60; i += 1) animations.update(0.05);
   const hold = animations.hold();
   assert.ok(hold?.done === true, '片段应当已经停在最后一帧');
   assert.equal(hold?.paused, true, 'clampWhenFinished 会把 action 暂停');

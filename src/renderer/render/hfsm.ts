@@ -189,9 +189,19 @@ export function createHfsm(options: HfsmOptions): Hfsm {
       if (!isReactingIntent(intent)) return false;
       // ADR 0039 D5：同上（回弹期间不得被 intent 打断，已经是既有规则）
       if (physics === 'dragged' || physics === 'settling') return false;
-      // ADR 0039 D5：摸头反应已经在播时，编排层那条伴随台词的 `pat_react`
-      // 不得重启或截短它（否则官方片段会被切成 1.1s 的表情窗口）
-      if (intent === 'pat_react' && isPatReaction(reaction)) return false;
+      // ADR 0039 D5：摸头反应**还在播**时，编排层那条伴随台词的 `pat_react`
+      // 不得重启或截短它（否则官方片段会被切成 1.1s 的表情窗口）。
+      // 注意：必须同时判"未到期"——`reaction` 要等下一帧 `tick()` 才清空，
+      // 否则在"刚到期的这一帧"里，新反应会被一条已经播完的旧反应挡掉
+      // （自检"说话时被摸头"复现过一次：`pat.active=false` 但 `reaction` 仍在）。
+      if (
+        intent === 'pat_react' &&
+        isPatReaction(reaction) &&
+        reaction !== null &&
+        now - reaction.startedAt < reaction.durationMs
+      ) {
+        return false;
+      }
       startReaction(now, 'intent', intent, durationMs);
       return true;
     },

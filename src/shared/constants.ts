@@ -365,27 +365,91 @@ export const DRAG_FOOT_KICK_MIN_INTERVAL_MS = 800;
 export const DRAG_FOOT_KICK_MAX_INTERVAL_MS = 1400;
 export const DRAG_FOOT_KICK_DURATION_MS = 180;
 
-// --- 待机小动作（ADR 0041 D4；ADR 0045 起**只剩官方片段**） ---
+// --- 待机静态站姿轮换（ADR 0050） ---
 /**
- * 空闲时"偶尔做一个有趣的小动作"的间隔（ms）。
+ * 正面站姿轮换的间隔（ms）：每 20–45s 换一个**静态站姿**。
  *
- * 与待机姿态轮换（22–40s 换一个循环姿势）是两件事：轮换换的是**底噪**，
- * 这里是一次性的小演出。
- *
- * ADR 0045 D1：**原地转圈已删除**。真机反馈"3D 角色原地平移转圈像陀螺，非常出戏"。
- * 现在只剩官方片段 `fidget.shy`（`Cafe_Reaction` 3.2–4.9s 的掩面缩身）；
- * 片段缺失时**什么都不做**（不再回退到程序化动作）。
+ * 这是本版对"空闲演出"的唯一形态（ADR 0050）：
+ * - 旧的一次性小动作 `fidget.shy`（`Cafe_Reaction` 3.2–4.9s 的掩面缩身）**已删除**——
+ *   真机反馈"动静太大、极其突兀"，并且该片段在停帧/交叉淡入时会出现"手绕着手腕突然垂下"
+ *   的骨骼扭曲；空闲时不再播放任何来自 `Cafe_Reaction` 的演出。
+ * - 只保留"她本来就是站着的"的官方正面待机片段，在它们之间做 0.8s 交叉淡入。
+ *   换姿势仍然**不是**新状态：`getState().base` 恒为 `idle`，不新增事件/IPC/字段。
  */
-export const IDLE_FIDGET_MIN_MS = 45_000;
-export const IDLE_FIDGET_MAX_MS = 95_000;
+export const IDLE_VARIATION_MIN_MS = 20_000;
+export const IDLE_VARIATION_MAX_MS = 45_000;
+/**
+ * 站姿之间的交叉淡入时长（秒）。
+ *
+ * 0.8s 是"看得出在换姿势、但不会读成动作"的下限：再短（<0.5s）会像瞬移，
+ * 再长（>1.2s）会让她长时间处在两个站姿的混合体里（手臂会穿过身体）。
+ */
+export const IDLE_VARIATION_FADE_SECONDS = 0.8;
+
+// --- 坐姿两段式播放（ADR 0051） ---
+/**
+ * 坐姿片段的**进入窗口**（秒，片段绝对时间）。
+ *
+ * ADR 0051 的两段式：
+ * - **阶段 A（14.2 → 16.0s）**：正常播放（`LoopOnce`），让她自己演完"坐下 + 第一次张望"。
+ *   14.2s 起播是为了把 14.5s 之前那一点身体落位也放出来；14.95s 左右有一次
+ *   头部 0.253rad 的快速转头（实测），这是最容易读成"活人"的一下。
+ * - **阶段 B（16.0 → 16.2s）**：继续播到 16.2s 后停帧；从 16.0s 起用 0.3s 淡入
+ *   `ADR 0048` 的站立上半身覆盖与程序化微动。16.2s 是停帧基准（身体/头的姿态参考点），
+ *   17.0s 之后大腿/小腿开始起身，**不能**再往后取。
+ */
+export const SIT_CLIP_START_SECONDS = 14.2;
+export const SIT_CLIP_STAGE_B_SECONDS = 16.0;
+export const SIT_CLIP_HOLD_SECONDS = 16.2;
+/**
+ * 阶段 A → B 的**上半身覆盖**淡入时长（ms）。
+ *
+ * 0.3s 是需求给定的窗口：再短会在 16.0–16.2s 的 0.2s 里看到"头被拽正"，
+ * 再长则 16.2s 停帧之后还有明显两个姿态在混。
+ */
+export const SIT_STAGE_B_FADE_MS = 300;
+/**
+ * 阶段 A（14.2–16.0s）的**抬头补偿**（rad，正 = 低头、负 = 抬头；与 `BoneArbiter` 同口径）。
+ *
+ * 默认 0 = 完全照播官方片段。官方片段在 14.9–16.0s 自带低头/半眯眼；
+ * 真机嫌"坐下时有点困"时改成 **-0.1 ~ -0.15**（抬头 5.7°–8.6°）即可。
+ *
+ * 实现：阶段 A 内 `arbiter.add(head, 0, 值 × sitPoseGain × (1-stageBBlend))`；
+ * 阶段 B 的 0.3s 覆盖会把这份补偿平滑收到 0，不会在 16.0s 硬切。
+ */
+export const SIT_PHASE_A_HEAD_TUNE_RAD = 0;
+/**
+ * 下背 `Spine` 的**站立覆盖权重**（0..1）。
+ *
+ * 默认 1.0 = 下背也完全照抄站立姿态（上半身最直）。
+ * 真机嫌"坐得太直、像罚坐"时改成 **0.85**（保留 15% 片段自带的前倾），
+ * 改到 0 等于退回"只覆盖胸/颈/头"（头会重新低下去，ADR 0051 已实测）。
+ *
+ * 只影响 `Spine` 一根骨骼；胸/颈/头仍是完整的 `upperBlend`。
+ */
+export const SIT_SPINE_OVERLAY_WEIGHT = 1.0;
+
+// --- 坐姿下坐弹簧（ADR 0051，替代 240ms 线性半蹲） ---
+/**
+ * 临界阻尼弹簧：`v += (-k·(sitDrop-1) - c·v)·dt`，`sitDrop += v·dt`。
+ *
+ * k=180 → ω≈13.42 rad/s；c=26.8 ≈ 2√k（ζ=1，不过冲）。0→90% 约 0.3s，
+ * 观感是"沉下去、不弹回来"；比原来的线性 240ms 更像"体重落在座面上"。
+ */
+export const SIT_DROP_STIFFNESS = 180;
+export const SIT_DROP_DAMPING = 26.8;
+/** 单帧积分上限（秒）：切后台/断点回来时不许一步跨完 */
+export const SIT_DROP_MAX_DT_SECONDS = 0.05;
+/** 固定子步长（秒）：显式欧拉在 k=180 下 1/240 稳定，且与帧率无关 */
+export const SIT_DROP_SUBSTEP_SECONDS = 1 / 240;
 
 // --- 坐姿活体微动（ADR 0044） ---
 /**
  * **注意：这里是坐姿所有"活感"的唯一出处。**
  *
- * 上一版把坐姿片段循环 0.42s 来制造动感，结果读作"抽搐"（ADR 0043 D2 被本轮否决）。
- * 现在的分工：官方片段**停帧**提供姿态（骨架基线），所有运动都由本组参数驱动的
- * 程序化微动给出 —— 呼吸、自主张望、眨眼、悬空晃腿。
+ * 分工（ADR 0051 起）：官方片段先播完阶段 A（坐下 + 第一次张望），阶段 B 停帧后
+ * 提供姿态基线，所有持续运动由本组参数驱动的程序化微动给出 —— 呼吸、自主张望、
+ * 悬空晃腿。眨眼仍然不做（ADR 0046 D2）。
  */
 
 /** 呼吸周期（ms）：3–4 秒，一定要慢；低于 2.5s 会读成"喘" */
@@ -406,14 +470,22 @@ export const SIT_BREATH_SHOULDER_RAD = 0.02;
 
 /**
  * 自主张望：一次注视保持多久（ms，含随机区间）。
- * ADR 0045 D2.2：3–6s → **2.2–4.2s**，换得更勤才有"东张西望"的活物感。
+ * ADR 0045 D2.2：3–6s → **2.2–4.2s**；真机第二轮反馈"像雷达，一直在搜" →
+ * 本版 **5–9s**（换向总周期 = 过渡 0.8–1.2s + 静止 5–9s）。
  */
-export const SIT_GAZE_HOLD_MIN_MS = 2200;
-export const SIT_GAZE_HOLD_MAX_MS = 4200;
+export const SIT_GAZE_HOLD_MIN_MS = 5_000;
+export const SIT_GAZE_HOLD_MAX_MS = 9_000;
+/**
+ * 每次转头**到位之后**的完全静止时间下限（ms）。
+ *
+ * 需求原话："转动一次之后，必须有至少 2 秒的完全静止时间"。调度器取
+ * `max(SIT_GAZE_STILL_MIN_MS, 本次 hold)`，所以未来把 hold 调小也不会破这条约束。
+ */
+export const SIT_GAZE_STILL_MIN_MS = 2_000;
 /**
  * 新目标的范围（rad）。
  *
- * ADR 0045 D2.2：**偏向抬头**。她坐的那一帧（14.5–14.7s）自带低头，程序化张望是叠在
+ * ADR 0045 D2.2：**偏向抬头**。她停帧的那一帧（16.2s）自带低头，程序化张望是叠在
  * 这个低头之上的，所以"平视 + 略微抬头"才能抵消掉；全部给正俯角只会让她继续看地。
  * 这里的 pitch 与 `BoneArbiter` 同一口径（**正 = 低头**），所以抬头用负值。
  */
@@ -432,11 +504,24 @@ export const SIT_GAZE_UP_CHANCE = 0.72;
  */
 export const SIT_GAZE_EYE_EXTRA = 0.35;
 /**
- * 张望的过渡时长（ms，ADR 0045 D2.2）：每次换方向用一个 `easeInOutCubic` 走完，
- * 比指数阻尼"干脆"。220–420ms ≈ 一次自然的转头。
+ * 张望的过渡时长（ms）：每次换方向用一个 `easeInOutCubic` 走完。
+ * ADR 0045 D2.2 是 220–420ms（"干脆"）；真机第二轮反馈太像雷达扫描 →
+ * 本版 **800–1200ms**（"慵懒地看风景"）。注意：这只是过渡，到位后还有 ≥2s 静止。
  */
-export const SIT_GAZE_MOVE_MIN_MS = 220;
-export const SIT_GAZE_MOVE_MAX_MS = 420;
+export const SIT_GAZE_MOVE_MIN_MS = 800;
+export const SIT_GAZE_MOVE_MAX_MS = 1200;
+/**
+ * "看向屏幕中心（镜头）"在张望目标里的权重（ADR 0051）。
+ *
+ * 1/3：三个目标里有一个是"看镜头"，另外两个是左右/上下的随机张望。
+ * 为什么需要：她坐着的时候如果永远只看远处，会像"回避对视"；偶尔看回镜头，
+ * 才像"她注意到你在看她"。目标就是屏幕中心方向（yaw=0 / pitch=0），
+ * 因此**不额外叠角度**，只把 head/eye 的随机量收回到 0。
+ */
+export const SIT_GAZE_CAMERA_CHANCE = 1 / 3;
+/** 看镜头时的偏航/俯仰（rad；0/0 = 正对屏幕中心，与站立平视同一口径） */
+export const SIT_GAZE_CAMERA_YAW_RAD = 0;
+export const SIT_GAZE_CAMERA_PITCH_RAD = 0;
 /**
  * 已废弃（ADR 0045 D2.2 起改用固定时长的 easeInOutCubic）：
  * 保留常量只为不破坏旧诊断读数，运行时不再使用。
@@ -509,6 +594,164 @@ export const SIT_LEG_RAMP_MS = 600;
 /** 整套坐姿微动的总包络（ms）：落座后淡入、解除时淡出，避免切换瞬间跳变 */
 export const SIT_MOTION_RAMP_MS = 500;
 
+// --- 微动作池（ADR 0049 D1） ---
+/**
+ * 微动作池的**唯一定义**：条目与切换间隔都写在这里，`render` 只按 `kind` 实现姿态。
+ *
+ * 为什么要有池：sitting 的"呼吸 + 张望 + 晃腿"与 idle 的"待机轮换"都是**固定循环**，
+ * 看久了能数出节拍。池把"这一段时间以哪个小动作为主"变成随机抽签，
+ * 每 15–30s 换一次，换的时候用指数插值交叉淡入淡出——**不是**新状态、不是新片段。
+ *
+ * 硬约束（ADR 0049）：
+ * - 条目只能用**现有骨骼**（头/颈/脊柱/腿），不依赖新动画片段、不引入 Live2D/精灵图；
+ * - 池只是 `render` 内部调度，`getState()` 不变、不新增事件/IPC/`RenderState` 字段；
+ * - 过渡由调用方按 `weights` 做指数插值，**禁止**瞬切。
+ */
+export interface MicroPoolEntry<K extends string> {
+  /** 条目名（`render` 内部按它分派姿态） */
+  kind: K;
+  /** 抽签权重（>0；越大约容易被抽到） */
+  weight: number;
+  /**
+   * 维持时长（ms）：非默认条目**必须**在一段时间后自己退出、把权重交还给默认条目，
+   * 不能让"歪头"一直歪着（真机反馈）。缺省 = 维持到下一次抽签。
+   *
+   * 默认条目 = 池里的第一项（idle 的 `browse`、sitting 的 `legs`）；它们不设维持时长。
+   * 到时后 `active` 立刻回到默认条目，权重按 `MICRO_POOL_TRANSITION_RATE` 指数衰减；
+   * **下一次随机抽签仍按 15–30s 的节奏走**，不会因为回正而提前再抽一次。
+   */
+  holdMinMs?: number;
+  holdMaxMs?: number;
+}
+
+/** idle 池：`browse` = 现有待机（四段轮换 + 光标视线），`headTilt` = 偶尔歪头 */
+export type IdleMicroKind = 'browse' | 'headTilt';
+/**
+ * idle 池条目（3:1）：大部分时间是现有待机，"歪头"是偶尔的一次。
+ *
+ * 为什么给 `browse` 更高权重：歪头是"偶尔"（需求原话），且她本来就该有一半以上时间
+ * 正常看着用户；如果 1:1，用户会觉得她脖子一直在偏。
+ */
+export const IDLE_MICRO_POOL: readonly MicroPoolEntry<IdleMicroKind>[] = [
+  { kind: 'browse', weight: 3 },
+  /** 歪头是"一次性小动作"：**3–5 秒后必须自己回正**，不能一直歪着 */
+  { kind: 'headTilt', weight: 1, holdMinMs: 3_000, holdMaxMs: 5_000 },
+];
+
+/** sitting 池：`legs` = 现有晃腿，`hands` = 低头看手，`far` = 抬头看远处 */
+export type SitMicroKind = 'legs' | 'hands' | 'far';
+/**
+ * sitting 池条目（3:1:1）：晃腿是坐姿的"底噪"（与 ADR 0044 D5 一致），
+ * 另外两个是偶尔的变奏。
+ *
+ * 为什么 `hands` 不做字面"托腮"：本资产没有 IK，把手抬到下巴要靠上肢三根骨骼手调，
+ * 既会穿模也违反 ADR 0039 D2"不手写骨骼姿态"的教训。坐姿停帧时手本来就放在膝上，
+ * "低头看手"是同一语义（需求里写的是"托腮/低头看手"）且只用头/颈/眼——零穿模风险。
+ */
+export const SIT_MICRO_POOL: readonly MicroPoolEntry<SitMicroKind>[] = [
+  { kind: 'legs', weight: 3 },
+  /** 低头看手 4–7s 后回正（一直在看手会很呆） */
+  { kind: 'hands', weight: 1, holdMinMs: 4_000, holdMaxMs: 7_000 },
+  /** 抬头看远处 5–8s 后回正（看风景也要收回视线） */
+  { kind: 'far', weight: 1, holdMinMs: 5_000, holdMaxMs: 8_000 },
+];
+
+/** 池的切换间隔（ms）：需求规定 15–30s 随机一次 */
+export const MICRO_POOL_MIN_MS = 15_000;
+export const MICRO_POOL_MAX_MS = 30_000;
+/**
+ * 条目之间的过渡速率（1/s）：`w += (target - w) · (1 - e^{-rate·dt})`。
+ *
+ * 3.0 → 约 1s 走完 95%。与呼吸/张望的指数插值同一套公式（不引入新的缓动函数）。
+ */
+export const MICRO_POOL_TRANSITION_RATE = 3.0;
+
+// --- idle 池 `headTilt` 的姿态量（ADR 0049 D1） ---
+/**
+ * 歪头的头部侧倾（rad，绕世界 Z）。0.14rad ≈ 8°，是"看得到但说不出"的量级；
+ * 再大会读成"落枕"（ADR 0045 D1 删除转圈的同一类观感审慎）。
+ */
+export const IDLE_TILT_HEAD_ROLL_RAD = 0.14;
+/** 歪头时顺带的一点水平偏转（rad，绕世界 Y），让"歪"不是纯侧倒 */
+export const IDLE_TILT_HEAD_YAW_RAD = 0.06;
+/** 颈椎分担比例：歪头来自整条脖子，而不是头骨单独折（否则像断了） */
+export const IDLE_TILT_NECK_SHARE = 0.45;
+
+// --- sitting 池 `hands` / `far` 的姿态量（ADR 0049 D1） ---
+/**
+ * 低头看手：头部俯仰（rad，**正 = 低头**，与 ADR 0035 D5 的标定同口径）。
+ * 只动头/颈/眼，不动手臂（见上面 `SIT_MICRO_POOL` 的说明）。
+ */
+export const SIT_MICRO_HANDS_HEAD_PITCH_RAD = 0.17;
+/** 低头看手时朝哪只手偏一点（rad，绕世界 Y；负 = 她的右手侧） */
+export const SIT_MICRO_HANDS_HEAD_YAW_RAD = -0.12;
+/** 低头看手时躯干微微前倾（rad，正 = 前屈） */
+export const SIT_MICRO_HANDS_SPINE_PITCH_RAD = 0.02;
+/** 低头时晃腿还剩多少（0 = 完全停下：专注看手就不晃了） */
+export const SIT_MICRO_HANDS_LEG_SCALE = 0;
+
+/** 抬头看远处：头部俯仰（rad，**负 = 抬头**） */
+export const SIT_MICRO_FAR_HEAD_PITCH_RAD = -0.15;
+/** 抬头看远处时朝向哪边（rad，绕世界 Y；正 = 她的左侧） */
+export const SIT_MICRO_FAR_HEAD_YAW_RAD = 0.16;
+/** 抬头时躯干轻微后仰（rad，负 = 后仰） */
+export const SIT_MICRO_FAR_SPINE_PITCH_RAD = -0.02;
+/** 抬头看远处时晃腿放慢到三成（不是完全停：发呆时脚还会轻轻晃） */
+export const SIT_MICRO_FAR_LEG_SCALE = 0.3;
+
+// --- 视线跟随的三级阻尼（ADR 0049 D2） ---
+/**
+ * 三级阻尼刚度（1/s）：`α = 1 - e^{-k·dt}`。
+ *
+ * 需求给定的初始值：眼球 **12**（最快）、头部 **8**（中等）、躯干 **4**（最慢）。
+ * 数字越大越"跟手"；三者的差就是"眼先动、头慢半拍、身子最后跟"的时间差。
+ */
+export const GAZE_EYE_STIFFNESS = 12;
+export const GAZE_HEAD_STIFFNESS = 8;
+export const GAZE_SPINE_STIFFNESS = 4;
+/** 头部跟随的最大偏航/俯仰（rad，≈18° / 11°） */
+export const GAZE_MAX_HEAD_YAW_RAD = 0.32;
+export const GAZE_MAX_HEAD_PITCH_RAD = 0.2;
+/** 眼球相对头部的额外幅度（与 `SIT_GAZE_EYE_EXTRA` 同一口径） */
+export const GAZE_EYE_EXTRA = 0.35;
+/**
+ * 眼球"先动"的领先份额（0..1）：头部还没转过去的那部分差值，眼球先承担这么多。
+ *
+ * 为什么需要：只把眼球阻尼调快，它自己的目标量只有 `EYE_EXTRA × 目标`（0.11rad），
+ * 而头部要走到 0.32rad —— 画面上"先动"的其实是头，眼球的变化被淹没。
+ * 让它先承担"头还没到的那一截"，总朝向在前 100ms 就能扫过大半，
+ * 随后头部追上、眼球自动回到 `EYE_EXTRA` 的常驻量（真机就是"眼先动、头慢半拍"）。
+ */
+export const GAZE_EYE_LEAD_SHARE = 0.45;
+/** 眼球偏移的硬上限（rad）：领先份额叠出来的瞬时量不许转成"翻白眼" */
+export const GAZE_EYE_OFFSET_MAX_RAD = 0.45;
+/**
+ * 躯干只在大幅偏航时跟随：`超出阈值的那部分 × 份额`。
+ *
+ * 真机第一版：阈值 0.08rad、份额 0.18 → 光标在正常范围内最大只跟 0.043rad（2.5°），
+ * 在 chibi 体型的躯干上几乎看不出来（"只有眼睛和头在动"）。本版改成：
+ * 阈值 0.05rad、份额 0.35 → 头部偏航 0.24rad 时躯干跟 **0.0665rad（3.8°）**，
+ * 到最大 0.32rad 时跟 **0.0945rad（5.4°）**——满足"哪怕只有 0.05rad 的微转"。
+ * 再大就会读成"整个上半身在转向"，所以 0.35 是上限，不再往上调。
+ */
+export const GAZE_SPINE_YAW_THRESHOLD_RAD = 0.05;
+export const GAZE_SPINE_SHARE = 0.35;
+/**
+ * 光标离开跟随范围后的**保持窗口**（ms）：需求规定先保持 150ms 再缓出回正。
+ *
+ * "离开"的判据 = 超过这么久没有收到 `cmd:probe`（探针在窗口内 ≥20Hz，
+ * 所以 150ms 静默只可能是光标真的走了）。
+ */
+export const GAZE_CURSOR_HOLD_MS = 150;
+/** 光标静默这么久 → 进入 idle 微动（每 5s 随机换一个注视方向，替代眨眼，ADR 0010 D1） */
+export const GAZE_CURSOR_IDLE_TIMEOUT_MS = 1500;
+/** 回正用的阻尼刚度（1/s）：比跟随慢，才是"缓出"而不是"弹回" */
+export const GAZE_RELEASE_STIFFNESS = 3.0;
+/** idle 微动换向间隔（ms）与幅度（rad） */
+export const GAZE_IDLE_RETARGET_MS = 5000;
+export const GAZE_IDLE_YAW_RAD = 0.2;
+export const GAZE_IDLE_PITCH_RAD = 0.1;
+
 // --- 落地冲击（契约 §5.3、D-6；ADR 0035 D4；参数与口径改见 ADR 0040 D3） ---
 /**
  * 下蹲包络总时长/吸震段（毫秒）。
@@ -538,16 +781,16 @@ export const STARTLE_CLICKED_MS = 120;
 export const STARTLE_COMMAND_MS = 260;
 export const STARTLE_LOST_MS = 320;
 
-// --- 坐下的过渡与解除下落（ADR 0042） ---
+// --- 坐下的过渡与解除下落（ADR 0042 / ADR 0051） ---
 /**
- * "从站到坐"的过渡时长（ms）：官方坐姿片段是瞬间进入坐姿的，直接交叉淡入会读成
- * "融化成坐姿"。这 240ms 里额外叠一个**半蹲**（身体先略高于座面、再落到座面，
- * 同时大腿前弯、脊柱微前倾），眼睛看到的是"她屈膝坐下去了"。
+ * 官方坐姿片段的进入窗口与下坐弹簧见上方「坐姿两段式播放 / 坐姿下坐弹簧」。
+ *
+ * 这里只保留**姿态量**：弹簧把 `sitDrop` 从 0 拉到 1 的过程中，
+ * 悬空高度 / 大腿弯曲 / 躯干前倾都按 `(1 - sitDrop)` 衰减到 0。
  */
-export const SIT_LOWER_MS = 240;
-/** 半蹲起点的"悬空高度"（px）：从座面上方这么多开始落下 */
+/** 弹簧起点"悬空高度"（px）：从座面上方这么多开始落下 */
 export const SIT_LOWER_LIFT_PX = 14;
-/** 半蹲时额外的膝/髋弯曲（rad）与躯干前倾（rad），在 SIT_LOWER_MS 内回到 0 */
+/** 弹簧下坐时额外的膝/髋弯曲（rad）与躯干前倾（rad），按 `(1 - sitDrop)` 回到 0 */
 export const SIT_LOWER_THIGH_RAD = 0.22;
 export const SIT_LOWER_LEAN_RAD = 0.05;
 /**

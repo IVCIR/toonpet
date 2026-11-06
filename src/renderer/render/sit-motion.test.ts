@@ -12,6 +12,7 @@ import {
   SIT_GAZE_HOLD_MIN_MS,
   SIT_GAZE_MOVE_MAX_MS,
   SIT_GAZE_MOVE_MIN_MS,
+  SIT_GAZE_STILL_MIN_MS,
   SIT_GAZE_UP_MAX_RAD,
   SIT_GAZE_UP_MIN_RAD,
   SIT_GAZE_YAW_RAD,
@@ -243,11 +244,17 @@ test('自主张望：目标含抬头/低头、在 ±0.36 / +0.06 / -0.22 内，e
   let transition: { at: number; fromYaw: number; fromPitch: number; toYaw: number; toPitch: number } | null =
     null;
   let settledBy: number | null = null;
+  /** 每次换向前，上一次到位之后到底静止了多久 */
+  let minStillAfterArrival = Number.POSITIVE_INFINITY;
 
   for (let i = 0; i < 60 * 60; i += 1) {
     t += 16;
     const frame = motion.update(t, 0.016, true);
     if (frame.targetYaw !== lastTargetYaw) {
+      // 真机问题三：换向之前，上一次转到位之后必须已经"完全静止" ≥2s
+      if (settledBy !== null) {
+        minStillAfterArrival = Math.min(minStillAfterArrival, t - settledBy);
+      }
       targetChanges += 1;
       lastTargetYaw = frame.targetYaw;
       assert.ok(Math.abs(frame.targetYaw) <= SIT_GAZE_YAW_RAD + 1e-9);
@@ -265,11 +272,14 @@ test('自主张望：目标含抬头/低头、在 ±0.36 / +0.06 / -0.22 内，e
       settledBy = null;
     }
     if (transition && settledBy === null) {
-      // 换目标后 450ms（> 最大 move 420ms）必须已经精确到位 —— 指数阻尼做不到
+      // 换目标后必须在上限（+2 帧余量）内精确到位 —— 指数阻尼做不到
       if (t - transition.at >= SIT_GAZE_MOVE_MAX_MS + 34) {
         const dy = Math.abs(frame.gazeYaw - transition.toYaw);
         const dp = Math.abs(frame.gazePitch - transition.toPitch);
-        assert.ok(dy < 1e-6 && dp < 1e-6, `t=${t} 未在 450ms 内到位 dy=${dy} dp=${dp}`);
+        assert.ok(
+          dy < 1e-6 && dp < 1e-6,
+          `t=${t} 未在 ${SIT_GAZE_MOVE_MAX_MS}ms 内到位 dy=${dy} dp=${dp}`,
+        );
         settledBy = t;
       }
     }
@@ -280,17 +290,51 @@ test('自主张望：目标含抬头/低头、在 ±0.36 / +0.06 / -0.22 内，e
     );
     previous = frame;
   }
-  // 60 秒里至少换 8 次方向（2.2–4.2s 保持 + 220–420ms 过渡）
-  assert.ok(targetChanges >= 8, `targetChanges=${targetChanges}`);
+  // 60 秒里至少换 5 次方向（5–9s 静止 + 0.8–1.2s 过渡；旧版是 2.2–4.2s）
+  assert.ok(targetChanges >= 5, `targetChanges=${targetChanges}`);
   // 抬头和低头都出现过（"四处看"不是一直仰头）
   assert.ok(sawUp, '必须有抬头目标');
   assert.ok(sawDown, '偶尔也要低头看一眼');
-  // 单帧最大转动远小于目标幅度：不是瞬移（easeInOutCubic 的最陡斜率 1.5，220ms 走完
-  // 0.72rad 时单帧 ≈0.08rad；瞬移会是 0.72rad）
+  // 单帧最大转动远小于目标幅度：不是瞬移（easeInOutCubic 最陡斜率 1.5，
+  // 1200ms 走完 0.72rad 时单帧 ≈0.015rad；瞬移会是 0.72rad）
   assert.ok(maxStepPerFrame < SIT_GAZE_YAW_RAD * 0.3, `maxStepPerFrame=${maxStepPerFrame}`);
-  // 但也不能"慢慢飘"：一次 0.36rad 的转头必须在 ~0.3s 内出现明显位移
-  assert.ok(SIT_GAZE_MOVE_MIN_MS >= 200 && SIT_GAZE_MOVE_MAX_MS <= 450);
-  assert.ok(SIT_GAZE_HOLD_MIN_MS >= 2000 && SIT_GAZE_HOLD_MAX_MS <= 5000);
+  // 过渡变慢（真机问题三：800–1200ms），且到位后至少静止 2s
+  assert.ok(SIT_GAZE_MOVE_MIN_MS >= 800 && SIT_GAZE_MOVE_MAX_MS <= 1200);
+  assert.ok(SIT_GAZE_HOLD_MIN_MS >= 5000 && SIT_GAZE_HOLD_MAX_MS <= 9000);
+  assert.ok(SIT_GAZE_STILL_MIN_MS >= 2000, `stillMin=${SIT_GAZE_STILL_MIN_MS}`);
+  assert.ok(
+    Number.isFinite(minStillAfterArrival) && minStillAfterArrival >= SIT_GAZE_STILL_MIN_MS - 1,
+    `minStillAfterArrival=${minStillAfterArrival}`,
+  );
+  // 五次换向里至少有一次"静止 ≥2s"
+  assert.ok(minStillAfterArrival >= 5000 - 34, `minStillAfterArrival=${minStillAfterArrival}`);
+});
+
+test('看镜头目标：1/3 概率、目标 yaw/pitch=0；forceGaze 可立刻取证（ADR 0051）', () => {
+  // random=0 → 第一次抽签就命中 camera（0 < 1/3）
+  const camera = createSitMotion({ random: () => 0 });
+  let frame = camera.frame();
+  for (let t = 16; t <= 400; t += 16) frame = camera.update(t, 0.016, true);
+  assert.ok(frame);
+  assert.equal(frame.targetKind, 'camera');
+  assert.ok(Math.abs(frame.targetYaw) < 1e-9, `targetYaw=${frame.targetYaw}`);
+  assert.ok(Math.abs(frame.targetPitch) < 1e-9, `targetPitch=${frame.targetPitch}`);
+
+  // random=0.99 → 不命中 camera，回到原来的随机张望（有偏航/俯仰）
+  const wander = createSitMotion({ random: () => 0.99 });
+  let wf = wander.frame();
+  for (let t = 16; t <= 400; t += 16) wf = wander.update(t, 0.016, true);
+  assert.ok(wf);
+  assert.equal(wf.targetKind, 'wander');
+  assert.ok(Math.abs(wf.targetYaw) > 0.1 || Math.abs(wf.targetPitch) > 1e-6);
+
+  // 自检取证：强制切到 camera，目标立即归零
+  wander.forceGaze('camera', 401);
+  const forced = wander.frame();
+  assert.ok(forced);
+  assert.equal(forced.targetKind, 'camera');
+  assert.ok(Math.abs(forced.targetYaw) < 1e-9);
+  assert.ok(Math.abs(forced.targetPitch) < 1e-9);
 });
 
 test('异常入参：NaN / 负 dt / 乱序时钟不产生 NaN，也不抖动', () => {

@@ -41,6 +41,49 @@ interface ProbePoint {
   y: number;
 }
 
+/** ADR 0049 D1：`window.diagnostics.microPool()` 的单池快照形状 */
+interface MicroPoolDiagnostics {
+  active: string;
+  weights: Record<string, number>;
+  nextSwitchInMs: number;
+  switches: number;
+  /** ADR 0049 D1 生命周期：非默认条目回默认的次数 / 自动回正倒计时 */
+  releases: number;
+  activeForMs: number;
+  holdRemainingMs: number;
+  forced: string | null;
+}
+
+/** ADR 0050：`window.diagnostics.idleVariation()` 的快照形状 */
+interface IdleVariationDiagnostics {
+  role: string;
+  clip: string | null;
+  nextInMs: number | null;
+  switches: number;
+  forced: string | null;
+  minIntervalMs: number;
+  maxIntervalMs: number;
+  fadeSeconds: number;
+  candidates: { role: string; clip: string }[];
+}
+
+/** ADR 0051：`window.diagnostics.sitSequence()` 的快照形状 */
+interface SitSequenceDiagnostics {
+  stage: 'a' | 'b';
+  holdTimeSeconds: number | null;
+  holdDurationSeconds: number | null;
+  stageBBlend: number;
+  stageBInMs: number | null;
+  sitDrop: number;
+  sitPoseGain: number;
+  upperOverride: number;
+  phaseAHeadAppliedRad: number;
+  spineOverlayWeight: number;
+  spineOverlayApplied: number;
+  headQuat: [number, number, number, number] | null;
+  headWorld: { x: number; y: number } | null;
+}
+
 interface ModelDiagnostics {
   ready: boolean;
   loading: boolean;
@@ -55,7 +98,25 @@ interface ModelDiagnostics {
   materialNames?: string[];
   hiddenMeshes: string[];
   mouth: { materialName: string | null; atlasLoaded: boolean; calibrated: boolean };
-  gaze: { yaw: number; pitch: number; targetYaw: number; targetPitch: number; idle: boolean };
+  gaze: {
+    yaw: number;
+    pitch: number;
+    targetYaw: number;
+    targetPitch: number;
+    idle: boolean;
+    /** ADR 0049 D2：眼球的额外偏移 / 躯干偏航 / 当前阶段（三级阻尼诊断） */
+    eyeYaw?: number;
+    eyePitch?: number;
+    spineYaw?: number;
+    phase?: string;
+    /** ADR 0049 D2 真机取证：Spine1 骨骼**实际**被写入的偏航（不是控制器提交量） */
+    spineBone?: {
+      spineYawRad: number;
+      spineYawDeg: number;
+      axisY: number;
+      submittedYawRad: number;
+    } | null;
+  };
   animation:
     | {
         clipCount: number;
@@ -108,13 +169,34 @@ interface ModelDiagnostics {
       spinePitch: number;
       claviclePitch?: number;
       upperArmPitch?: number;
-      gaze: { yaw: number; pitch: number; targetYaw: number; targetPitch: number; nextInMs: number };
+      gaze: {
+        yaw: number;
+        pitch: number;
+        targetYaw: number;
+        targetPitch: number;
+        /** ADR 0051：`camera` = 看屏幕中心，`wander` = 随机张望 */
+        targetKind?: 'camera' | 'wander';
+        nextInMs: number;
+      };
       eye?: { yaw: number; pitch: number };
       legs: { gain: number; thighL: number; thighR: number; calfL: number; calfR: number };
     } | null;
-    /** ADR 0042：坐下过渡（半蹲）的进度与"悬空高度" */
+    /** ADR 0042/0051：下坐进度（sitDrop）与"悬空高度" */
     transition?: number;
     transitionLiftPx?: number;
+    /** ADR 0051：两段式阶段 / 覆盖权重 / 下坐弹簧 */
+    stage?: 'a' | 'b';
+    stageBBlend?: number;
+    sitDrop?: number;
+    sitPoseGain?: number;
+    upperOverride?: number;
+    /** ADR 0051 D7：阶段 A 抬头补偿 / 下背覆盖权重 */
+    phaseAHeadTuneRad?: number;
+    phaseAHeadAppliedRad?: number;
+    spineOverlayWeight?: number;
+    spineOverlayApplied?: number;
+    holdAtSeconds?: number;
+    holdTimeSeconds?: number | null;
     offsetPx?: { x: number; y: number };
     rawOffsetPx?: { x: number; y: number };
     /** ADR 0046 D3.1：微侧身偏航（rad） */
@@ -196,6 +278,13 @@ interface ModelDiagnostics {
     blockedBy: 'dragged' | 'settling' | 'sitting' | 'walking' | 'speaking' | 'missing' | null;
   };
   speech: { frame: number; driven: boolean };
+  /** ADR 0049 D1：微动作池（idle / sitting）的只读快照 */
+  microPool?: {
+    idle: MicroPoolDiagnostics | null;
+    sit: MicroPoolDiagnostics | null;
+  };
+  /** ADR 0050：待机静态站姿轮换（当前角色 / 下一次倒计时 / 候选池） */
+  idleVariation?: IdleVariationDiagnostics;
   /** ADR 0037：全局光照 + Toon（内部诊断） */
   toon: {
     enabled: boolean;
@@ -2729,6 +2818,17 @@ export async function runSelfTestIfRequested(): Promise<void> {
   );
   check('模型：modelId 来自实际文件', Boolean(diagnostics?.modelId), diagnostics?.modelId);
 
+  /**
+   * 自检稳定性（本轮排查）：主场景的**前半段**不需要行走调度，而默认 20–40s 的随机行走
+   * 会偶发撞进摸头/拖拽用例——她正好走开时，"冷却结束后可再次触发"直接失败；
+   * 走位还会让脚本光标的 `current` 变旧，拖拽检查读到十几像素的偏差。
+   * 这里先推到 600s，后面的「行走」用例会显式压回 1.5–2s（`setWalkInterval`）。
+   */
+  await window.webContents.executeJavaScript(
+    'window.petRender.setWalkInterval(600000, 600001)',
+    true,
+  );
+
   const contentSize = window.getContentBounds();
   check(
     '窗口尺寸：高度沿用 720、宽度按包围盒校正（240–960）',
@@ -2865,16 +2965,23 @@ export async function runSelfTestIfRequested(): Promise<void> {
     const expectedRoles = [
       ['idle.alt2', 'CH0335_Carrier_Idle'],
       ['idle.alt3', 'CH0335_Victory_End_Random'],
+      ['idle.alt4', 'CH0335_Carrier2_Idle'],
+      ['idle.alt5', 'CH0335_Victory_End'],
+      ['idle.alt6', 'CH0335_Formation_Idle_Random'],
       ['nod', 'CH0335_Cafe_Reaction'],
-      ['fidget.shy', 'CH0335_Cafe_Reaction'],
       ['greet', 'CH0335_Cafe_Reaction'],
       ['happy', 'CH0335_Victory_Start'],
     ] as const;
     const missing = expectedRoles.filter(([role, clip]) => !roleLog.includes(`${role}=${clip}`));
     check(
-      '动画：新增语义角色全部命中官方片段（待机池 ×4 / nod / fidget.shy，ADR 0041）',
+      '动画：语义角色全部命中官方片段（正面待机池 ×7 / nod / greet / happy；ADR 0050）',
       roleLog.length > 0 && missing.length === 0,
       { missing, roleLog: roleLog.slice(-600) },
+    );
+    check(
+      '动画：一次性空闲小动作 fidget.shy 已删除（Cafe_Reaction 不再由空闲触发）',
+      !roleLog.includes('fidget.shy'),
+      { roleLog: roleLog.slice(-600) },
     );
     check(
       '动画：抓头的旧角色 held.limp 已删除（拖拽统一走 held，ADR 0041 D1）',
@@ -3014,6 +3121,101 @@ export async function runSelfTestIfRequested(): Promise<void> {
     { left: gazeLeft, right: gazeRight },
   );
 
+  // ------------------------------------------------------------------
+  // 2.1) ADR 0049 D2：视线三级阻尼的时间差（眼球 → 头部 → 躯干）
+  //
+  // 判据是"到 90% 终值"的时刻：眼 12 / 头 8 / 躯干 4 的刚度差应该给出
+  // 几十毫秒到几百毫秒的阶梯。先把光标放到头部正前方回正，再瞬间跳到右侧，
+  // 用 rAF 采 900ms（`window.diagnostics.gaze()` 是微秒级，不走面部贴图摘要）。
+  // ------------------------------------------------------------------
+  pushScriptedCursor(contentSize.x + contentSize.width * 0.5, contentSize.y + headY);
+  await sleep(900);
+  pushScriptedCursor(contentSize.x + contentSize.width * 0.88, contentSize.y + headY);
+  await sleep(40);
+  const gazeSeries = JSON.parse(
+    (await window.webContents.executeJavaScript(
+      `new Promise((resolve) => {
+        const rows = [];
+        const startedAt = performance.now();
+        const tick = () => {
+          const g = window.diagnostics.gaze();
+          if (g) {
+            rows.push({
+              t: performance.now() - startedAt,
+              eye: g.eyeYaw,
+              head: g.yaw,
+              spine: g.spineYaw,
+              spineBone: g.spineBone?.spineYawRad ?? 0,
+              spineBoneDeg: g.spineBone?.spineYawDeg ?? 0,
+              spineAxisY: g.spineBone?.axisY ?? 0,
+              spineSubmitted: g.spineBone?.submittedYawRad ?? 0,
+              phase: g.phase,
+            });
+          }
+          if (performance.now() - startedAt < 900) requestAnimationFrame(tick);
+          else resolve(JSON.stringify(rows));
+        };
+        requestAnimationFrame(tick);
+      })`,
+      true,
+    )) as string,
+  ) as Array<{
+    t: number;
+    eye: number;
+    head: number;
+    spine: number;
+    spineBone: number;
+    spineBoneDeg: number;
+    spineAxisY: number;
+    spineSubmitted: number;
+    phase: string;
+  }>;
+  const gazeFinal = gazeSeries[gazeSeries.length - 1] ?? null;
+  const gazeT90 = (key: 'eye' | 'head' | 'spine'): number => {
+    if (!gazeFinal) return Number.NaN;
+    const target = Math.abs(gazeFinal[key]);
+    const hit = gazeSeries.find((row) => Math.abs(row[key]) >= target * 0.9);
+    return hit ? hit.t : Number.NaN;
+  };
+  const eyeT90 = gazeT90('eye');
+  const headT90 = gazeT90('head');
+  const spineT90 = gazeT90('spine');
+  check(
+    '视线三级阻尼：眼球先到（t90 早于头部 ≥60ms，ADR 0049 D2）',
+    Number.isFinite(eyeT90) && Number.isFinite(headT90) && eyeT90 <= headT90 - 60,
+    { eyeT90, headT90, spineT90, samples: gazeSeries.length, final: gazeFinal },
+  );
+  check(
+    '视线三级阻尼：头部先于躯干（t90 早 ≥100ms），且躯干跟随达到肉眼可见（≥0.04rad / 2.3°）',
+    Number.isFinite(headT90) &&
+      Number.isFinite(spineT90) &&
+      headT90 <= spineT90 - 100 &&
+      Math.abs(gazeFinal?.spine ?? 0) > 0.04 &&
+      Math.abs(gazeFinal?.spine ?? 0) < 0.12,
+    { eyeT90, headT90, spineT90, final: gazeFinal },
+  );
+  // 真机问题一：Spine1 骨骼**实际**转了多少（不是控制器提交量）。
+  // `spineBone` 由 render 侧从 `final · animationBase⁻¹` 反解并投影到世界 Y。
+  const spineBoneFinal = gazeFinal
+    ? { rad: gazeFinal.spineBone, deg: gazeFinal.spineBoneDeg, axisY: gazeFinal.spineAxisY }
+    : null;
+  check(
+    '视线跟随：Spine1 骨骼实际 rotation.y 跟随（|rad| ≥ 0.05 / 2.9°，且与提交量一致）',
+    Boolean(gazeFinal) &&
+      Math.abs(spineBoneFinal?.rad ?? 0) >= 0.05 &&
+      Math.abs((spineBoneFinal?.rad ?? 0) - (gazeFinal?.spineSubmitted ?? 0)) < 0.012 &&
+      Math.abs(spineBoneFinal?.axisY ?? 0) > 0.9,
+    {
+      spineBone: spineBoneFinal,
+      submitted: gazeFinal?.spineSubmitted ?? null,
+      controllerSpine: gazeFinal?.spine ?? null,
+      headYaw: gazeFinal?.head ?? null,
+    },
+  );
+  await sleep(160);
+  const spineGazeShot = await captureScreenshot(window, 'window-gaze-spine.png', 'gaze-spine-right');
+  logInfo('selftest', 'gaze-spine 截图', { png: spineGazeShot });
+
   const idleName = diagnostics?.animation?.idle?.name ?? 'CH0335_Cafe_Idle';
   const animA = (await readDiagnostics(window))?.animation?.current ?? null;
   await sleep(450);
@@ -3041,6 +3243,236 @@ export async function runSelfTestIfRequested(): Promise<void> {
     Boolean(idleA && idleB) &&
       (idleA?.targetYaw !== idleB?.targetYaw || idleA?.targetPitch !== idleB?.targetPitch),
     { idleA, idleB },
+  );
+
+  // ------------------------------------------------------------------
+  // 2.2) ADR 0049 D1：idle 微动作池（15–30s 抽签；自检压缩到 650ms）
+  //
+  // 两条断言：① 2.6s 内抽签 ≥2 次且换过 ≥2 个条目（不是固定循环）；
+  // ② 每次抽签是**交叉淡入淡出**（100ms 采样的权重跳变 < 0.5，不是瞬切）。
+  // 之后强制两次条目，验证"歪头"真的落到头骨 roll，并且换回待机能平滑回正。
+  // ------------------------------------------------------------------
+  await window.webContents.executeJavaScript(
+    `window.diagnostics.setMicroPoolInterval('idle', 650, 650)`,
+    true,
+  );
+  const idlePoolSeries = JSON.parse(
+    (await window.webContents.executeJavaScript(
+      `new Promise((resolve) => {
+        const rows = [];
+        const startedAt = performance.now();
+        const tick = () => {
+          const pool = window.diagnostics.microPool().idle;
+          if (pool) rows.push({ t: performance.now() - startedAt, ...pool });
+          if (performance.now() - startedAt < 2600) setTimeout(tick, 100);
+          else resolve(JSON.stringify(rows));
+        };
+        tick();
+      })`,
+      true,
+    )) as string,
+  ) as Array<{ t: number; active: string; weights: Record<string, number>; switches: number }>;
+  const idlePoolLast = idlePoolSeries[idlePoolSeries.length - 1] ?? null;
+  const idlePoolKinds = new Set(idlePoolSeries.map((row) => row.active));
+  let idlePoolMaxStep = 0;
+  for (let i = 1; i < idlePoolSeries.length; i += 1) {
+    for (const kind of ['browse', 'headTilt']) {
+      idlePoolMaxStep = Math.max(
+        idlePoolMaxStep,
+        Math.abs(
+          (idlePoolSeries[i]!.weights[kind] ?? 0) - (idlePoolSeries[i - 1]!.weights[kind] ?? 0),
+        ),
+      );
+    }
+  }
+  check(
+    'idle 微动作池：随机抽签在 2.6s 内换过 ≥2 个条目（不是固定循环，ADR 0049 D1）',
+    (idlePoolLast?.switches ?? 0) >= 2 && idlePoolKinds.size >= 2,
+    { switches: idlePoolLast?.switches ?? null, kinds: [...idlePoolKinds] },
+  );
+  check(
+    'idle 微动作池：条目之间平滑交叉（100ms 采样权重跳变 < 0.5，不是瞬切）',
+    idlePoolMaxStep > 0 && idlePoolMaxStep < 0.5,
+    { maxStep: Number(idlePoolMaxStep.toFixed(3)), samples: idlePoolSeries.length },
+  );
+
+  await window.webContents.executeJavaScript(
+    `window.diagnostics.forceMicroPool('idle', 'headTilt')`,
+    true,
+  );
+  await sleep(900);
+  const tiltDiag = await readDiagnostics(window);
+  const tiltRoll = tiltDiag?.sit?.headBase?.roll ?? 0;
+  const tiltShot = await captureScreenshot(window, 'idle-micro-tilt.png', 'idle-micro-tilt');
+  check(
+    'idle 微动作池：歪头落到头骨 roll 通道（≥0.08rad，只动头/颈，ADR 0049 D1）',
+    Math.abs(tiltRoll) >= 0.08,
+    { roll: tiltRoll, headBase: tiltDiag?.sit?.headBase ?? null, png: tiltShot },
+  );
+  // 真机问题二：解除歪头 → 权重必须平滑衰减到 0、头部回到直立；不能一直歪着。
+  // 先把抽签间隔恢复成生产值（避免 650ms 抽签在这 1.2s 里又抽到 headTilt），再解除强制。
+  await window.webContents.executeJavaScript(
+    `window.diagnostics.setMicroPoolInterval('idle', 15000, 30000); window.diagnostics.forceMicroPool('idle', null)`,
+    true,
+  );
+  await sleep(1200);
+  const untiltDiag = await readDiagnostics(window);
+  const untiltRoll = untiltDiag?.sit?.headBase?.roll ?? 0;
+  const untiltPool = untiltDiag?.microPool?.idle ?? null;
+  const untiltShot = await captureScreenshot(window, 'idle-micro-untilt.png', 'idle-micro-untilt');
+  check(
+    'idle 微动作池：歪头退出后平滑回正（|roll| < 0.02），并记一次 release（ADR 0049 D1）',
+    Math.abs(untiltRoll) < 0.02 && (untiltPool?.releases ?? 0) >= 1,
+    {
+      roll: untiltRoll,
+      releases: untiltPool?.releases ?? null,
+      pool: untiltPool,
+      tiltPng: tiltShot,
+      untiltPng: untiltShot,
+    },
+  );
+
+  // ------------------------------------------------------------------
+  // 2.3) ADR 0050：待机**静态站姿轮换**（20–45s / 0.8s 交叉淡入）
+  //
+  // 验收四件事：
+  // ① 生产常量真的是 20–45s / 0.8s，候选池 7 个正面静态循环片段、不含 Cafe_Reaction；
+  // ② 压缩时序后 3.2s 内换过 ≥2 个站姿（不是固定循环）；
+  // ③ 换姿势是**交叉淡入**（250ms 时两个片段权重都在 0–1 之间，不是瞬切）；
+  // ④ 7 个站姿逐一截图（`idle-pose-00..06.png`），人工复核姿态无穿模/扭曲。
+  // ------------------------------------------------------------------
+  const prodVariation = JSON.parse(
+    (await window.webContents.executeJavaScript(
+      'JSON.stringify(window.diagnostics.idleVariation())',
+      true,
+    )) as string,
+  ) as IdleVariationDiagnostics;
+  check(
+    '待机站姿轮换：生产间隔 20–45s、交叉淡入 0.8s（常量来自 shared/constants.ts，ADR 0050）',
+    prodVariation.minIntervalMs === 20_000 &&
+      prodVariation.maxIntervalMs === 45_000 &&
+      Math.abs(prodVariation.fadeSeconds - 0.8) < 1e-9,
+    prodVariation,
+  );
+  check(
+    '待机站姿轮换：候选池 7 个正面静态循环片段，且不含 Cafe_Reaction / Normal_Idle',
+    prodVariation.candidates.length === 7 &&
+      prodVariation.candidates.every(
+        (candidate) =>
+          !candidate.clip.includes('Cafe_Reaction') && candidate.clip !== 'CH0335_Normal_Idle',
+      ),
+    prodVariation.candidates,
+  );
+
+  await window.webContents.executeJavaScript(
+    `window.diagnostics.forceIdleVariation(null); window.diagnostics.setIdleVariationInterval(700, 700)`,
+    true,
+  );
+  const idleVarSeries = JSON.parse(
+    (await window.webContents.executeJavaScript(
+      `new Promise((resolve) => {
+        const rows = [];
+        const startedAt = performance.now();
+        const tick = () => {
+          const snap = window.diagnostics.idleVariation();
+          rows.push({ t: performance.now() - startedAt, role: snap.role, clip: snap.clip, switches: snap.switches });
+          if (performance.now() - startedAt < 3200) setTimeout(tick, 100);
+          else resolve(JSON.stringify(rows));
+        };
+        tick();
+      })`,
+      true,
+    )) as string,
+  ) as Array<{ t: number; role: string; clip: string | null; switches: number }>;
+  const idleVarLast = idleVarSeries[idleVarSeries.length - 1] ?? null;
+  const idleVarRoles = new Set(idleVarSeries.map((row) => row.role));
+  check(
+    '待机站姿轮换：压缩到 700ms 后 3.2s 内换过 ≥2 个站姿（不是固定循环，ADR 0050）',
+    (idleVarLast?.switches ?? 0) >= 2 && idleVarRoles.size >= 2,
+    { switches: idleVarLast?.switches ?? null, roles: [...idleVarRoles] },
+  );
+  check(
+    '待机站姿轮换：轮换期间没有播放 Cafe_Reaction（突兀演出已删除）',
+    idleVarSeries.every((row) => row.clip === null || !row.clip.includes('Cafe_Reaction')),
+    idleVarSeries.filter((row) => row.clip?.includes('Cafe_Reaction') ?? false),
+  );
+
+  // 交叉淡入取证：先把站姿强制回 idle 并等它稳定，再切 alt1，150ms 后读两个片段的权重。
+  // `getDiagnostics()` 本身约 300ms，所以 150ms + 300ms ≈ 450ms，仍在 0.8s 淡入的中段。
+  await window.webContents.executeJavaScript(
+    `window.diagnostics.setIdleVariationInterval(600000, 600001); window.diagnostics.forceIdleVariation('idle')`,
+    true,
+  );
+  await sleep(1200);
+  await window.webContents.executeJavaScript(`window.diagnostics.forceIdleVariation('idle.alt1')`, true);
+  await sleep(150);
+  const midVarFade = await readDiagnostics(window);
+  const midVarActions = midVarFade?.animation?.actions ?? [];
+  const cafeWeight = midVarActions.find((action) => action.name === 'CH0335_Cafe_Idle')?.weight ?? 0;
+  const formationWeight =
+    midVarActions.find((action) => action.name === 'CH0335_Formation_Idle')?.weight ?? 0;
+  check(
+    '待机站姿轮换：换姿势是 0.8s 交叉淡入（中段两个片段权重都在 0–1 之间，不是瞬切）',
+    cafeWeight > 0.02 &&
+      cafeWeight < 0.98 &&
+      formationWeight > 0.02 &&
+      formationWeight < 0.98,
+    { cafeWeight, formationWeight },
+  );
+
+  // 逐一取证 7 个站姿（截图供人眼复核：手臂是否穿模、姿态是否扭曲）
+  await window.webContents.executeJavaScript(
+    `window.diagnostics.setMicroPoolInterval('idle', 600000, 600001); window.diagnostics.forceMicroPool('idle', null)`,
+    true,
+  );
+  const idlePoseRoles = [
+    'idle',
+    'idle.alt1',
+    'idle.alt2',
+    'idle.alt3',
+    'idle.alt4',
+    'idle.alt5',
+    'idle.alt6',
+  ] as const;
+  const idlePoseShots: string[] = [];
+  for (let index = 0; index < idlePoseRoles.length; index += 1) {
+    await window.webContents.executeJavaScript(
+      `window.diagnostics.forceIdleVariation('${idlePoseRoles[index]}')`,
+      true,
+    );
+    await sleep(950);
+    idlePoseShots.push(
+      await captureScreenshot(window, `idle-pose-${String(index).padStart(2, '0')}.png`, `idle-pose-${index}`),
+    );
+  }
+  check(
+    '待机站姿轮换：7 个正面站姿逐一产出截图（idle-pose-00..06.png）',
+    idlePoseShots.length === 7 && idlePoseShots.every((shot) => shot.length > 0),
+    { shots: idlePoseShots },
+  );
+
+  // 交叉淡入的**视觉**取证：从"双手垂下"（alt5/Victory_End）切到"抱臂"（alt1/Formation_Idle），
+  // 这是轮廓差最大的一对。0 / 250 / 550 / 1100ms 各拍一张，人工确认 0.8s 内手臂没有穿过身体。
+  const crossfadeShots: string[] = [];
+  await window.webContents.executeJavaScript(`window.diagnostics.forceIdleVariation('idle.alt5')`, true);
+  await sleep(950);
+  crossfadeShots.push(await captureScreenshot(window, 'idle-crossfade-00.png', 'idle-crossfade-0'));
+  await window.webContents.executeJavaScript(`window.diagnostics.forceIdleVariation('idle.alt1')`, true);
+  await sleep(250);
+  crossfadeShots.push(await captureScreenshot(window, 'idle-crossfade-01.png', 'idle-crossfade-1'));
+  await sleep(300);
+  crossfadeShots.push(await captureScreenshot(window, 'idle-crossfade-02.png', 'idle-crossfade-2'));
+  await sleep(550);
+  crossfadeShots.push(await captureScreenshot(window, 'idle-crossfade-03.png', 'idle-crossfade-3'));
+  check(
+    '待机站姿轮换：0.8s 交叉淡入的中间帧已产出（idle-crossfade-00..03.png）',
+    crossfadeShots.length === 4 && crossfadeShots.every((shot) => shot.length > 0),
+    { shots: crossfadeShots },
+  );
+
+  await window.webContents.executeJavaScript(
+    `window.diagnostics.setIdleVariationInterval(20000, 45000); window.diagnostics.forceIdleVariation(null); window.diagnostics.setMicroPoolInterval('idle', 15000, 30000)`,
+    true,
   );
 
   // ------------------------------------------------------------------
@@ -3217,8 +3649,13 @@ export async function runSelfTestIfRequested(): Promise<void> {
    * ADR 0040 验收 1：静止点击**脸部**必须触发官方摸头片段。
    *
    * 旧口径（掩膜 bbox 顶部 22%）下这一点是 `head=false`——就是"点她没反应"的根因。
-   * 这里刻意先等过 800ms 冷却，避免被 D-4 拦下而误判成"通过"。
+   *
+   * 稳定性（本轮排查）：**先等上一次摸头片段播完，再取头骨坐标**。旧写法先取
+   * `headBandDiagnostics()` 再等 950ms——如果那时她还缩着（片段把她压低 ~57px），
+   * 点到的是"缩着时的下巴"，等她回正后这个点在头骨半径外，断言随机失败。
    */
+  await waitFor(window, 3000, (d) => d?.pat?.active === false);
+  await sleep(250);
   const faceInfo = JSON.parse(
     (await window.webContents.executeJavaScript(
       `JSON.stringify(window.petModel.headBandDiagnostics())`,
@@ -3230,7 +3667,6 @@ export async function runSelfTestIfRequested(): Promise<void> {
     bandBottomCssY: number | null;
     source: string;
   };
-  await sleep(950);
   const facePatBefore = await countInLog('head_patted 发出');
   let faceClick: { x: number; y: number } | null = null;
   if (faceInfo.headBoneCss) {
@@ -3839,9 +4275,18 @@ export async function runSelfTestIfRequested(): Promise<void> {
           realDip !== null &&
           realDip.width >= 80 &&
           realDip.height >= 40
-        : ['fullscreen', 'invalid-rect', 'geometry', 'shell-window', 'own-window'].includes(
-            realSnap.reason,
-          )),
+        : // 明确拒绝也说明 Win32 读取这条链路跑通了；只排除"根本没读"
+          // （`disabled` / `busy` / `invalid-pet`）。桌面/隐藏窗口在不同会话里都可能出现，
+          // 它们都是合法结果，不应把这条断言变成环境骰子（本轮复现过一次 hidden-window）。
+          [
+            'fullscreen',
+            'invalid-rect',
+            'geometry',
+            'shell-window',
+            'own-window',
+            'hidden-window',
+            'no-foreground',
+          ].includes(realSnap.reason)),
     realSnap ?? null,
   );
   shell.releaseSnap();
@@ -3923,8 +4368,9 @@ export async function runSelfTestIfRequested(): Promise<void> {
     seated?.hfsm ?? null,
   );
   check(
-    '吸附：播放官方坐姿片段（pastmemory 14.5–14.92s **停帧**），不是程序化降级（ADR 0044 D1）',
+    '吸附：播放官方坐姿片段（pastmemory 14.2–16.2s，ADR 0051 两段式），不是程序化降级',
     (seated?.animation?.current?.name ?? '').includes('pastmemory') &&
+      (seated?.animation?.current?.name ?? '').includes('@14.2-16.2s') &&
       seated?.sit?.procedural === false,
     { current: seated?.animation?.current ?? null, sit: seated?.sit ?? null },
   );
@@ -3933,6 +4379,181 @@ export async function runSelfTestIfRequested(): Promise<void> {
     seated?.motion.walking === null && seated?.motion.nextWalkInMs === null,
     seated?.motion ?? null,
   );
+
+  // ------------------------------------------------------------------
+  // ADR 0051：坐姿两段式 + 下坐弹簧。
+  //
+  // 阶段 A：14.2→16.0s 正常播放（不覆盖上半身）；阶段 B：16.0→16.2s 停帧，
+  // 从 16.0s 起 0.3s 淡入站立覆盖 + 程序化微动。这里用 `sitSequence()` 以 16ms
+  // 采样整段（约 2.6s），同时验证：
+  // ① A 阶段确实没有覆盖（upperOverride=0）；
+  // ② B 在片段本地 1.8s 启动，0.3s 内覆盖到 1；
+  // ③ A→B 头部四元数逐帧最大步进 < 0.15rad（不跳）；
+  // ④ sitDrop 0→1 无过冲（≤1.01）。
+  // ------------------------------------------------------------------
+  const stageAShot = await captureScreenshot(window, 'sit-stage-a.png', 'sit-stage-a');
+  /**
+   * ADR 0051 D7 的 A/B 取证：阶段 A 的抬头补偿只能在**片段还在正放**时看出来。
+   *
+   * 采样 Promise 先启动，再在同一个时间轴里拍特写 —— 这样不会把 `firstStageB`
+   * 往后推（既有断言要求 `t` 落在 900–2500ms，采样起点必须还在阶段 A）。
+   * 采样开始约 0.4s 后 = 片段本地约 15.1s：官方 14.95s 的快速张望已经收尾，
+   * 画面稳定，两张图的唯一变量就是 `SIT_PHASE_A_HEAD_TUNE_RAD`。
+   */
+  const sitSequencePromise = window.webContents.executeJavaScript(
+    `new Promise((resolve) => {
+      const rows = [];
+      const startedAt = performance.now();
+      const tick = () => {
+        const snap = window.diagnostics.sitSequence();
+        rows.push({ t: Math.round(performance.now() - startedAt), ...snap });
+        if (performance.now() - startedAt < 2600) setTimeout(tick, 16);
+        else resolve(JSON.stringify(rows));
+      };
+      tick();
+    })`,
+    true,
+  ) as Promise<string>;
+  await sleep(400);
+  await window.webContents.executeJavaScript(`window.diagnostics.faceZoom(260)`, true);
+  await sleep(180);
+  const stageACloseupMoment = JSON.parse(
+    (await window.webContents.executeJavaScript(
+      `JSON.stringify(window.diagnostics.sitSequence())`,
+      true,
+    )) as string,
+  ) as SitSequenceDiagnostics;
+  const stageACloseup = await captureScreenshot(window, 'sit-ab-stage-a.png', 'sit-ab-stage-a');
+  await window.webContents.executeJavaScript(`window.diagnostics.faceZoom(0)`, true);
+  const sitSequenceSeries = JSON.parse(await sitSequencePromise) as Array<
+    SitSequenceDiagnostics & { t: number }
+  >;
+  const stageASamples = sitSequenceSeries.filter((row) => row.stage === 'a');
+  const firstStageB = sitSequenceSeries.find((row) => row.stage === 'b') ?? null;
+  const lastSequence = sitSequenceSeries[sitSequenceSeries.length - 1] ?? null;
+  let maxHeadStepRad = 0;
+  for (let i = 1; i < sitSequenceSeries.length; i += 1) {
+    const a = sitSequenceSeries[i - 1]!.headQuat;
+    const b = sitSequenceSeries[i]!.headQuat;
+    if (!a || !b) continue;
+    const dot = Math.abs(a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]);
+    maxHeadStepRad = Math.max(maxHeadStepRad, 2 * Math.acos(Math.min(1, dot)));
+  }
+  const maxSitDrop = Math.max(0, ...sitSequenceSeries.map((row) => row.sitDrop));
+  check(
+    '坐姿两段式：阶段 A 先播（A 期间 upperOverride=0、stageBBlend=0；B 在片段本地 1.8s = 绝对 16.0s）',
+    stageASamples.length > 5 &&
+      stageASamples.every((row) => row.upperOverride <= 0.001 && row.stageBBlend <= 0.001) &&
+      firstStageB !== null &&
+      typeof firstStageB.holdTimeSeconds === 'number' &&
+      firstStageB.holdTimeSeconds >= 1.75 &&
+      firstStageB.holdTimeSeconds <= 2.001,
+    {
+      stageASamples: stageASamples.length,
+      firstStageB: firstStageB
+        ? { t: firstStageB.t, holdTimeSeconds: firstStageB.holdTimeSeconds, stageBBlend: firstStageB.stageBBlend }
+        : null,
+    },
+  );
+  {
+    // ADR 0051 D7：阶段 A 抬头补偿接线。默认 0 时实际施加必须恒为 0；
+    // 改成 -0.12 时至少要有一帧同号且达到配置值的 30%。
+    const tune = seated?.sit?.phaseAHeadTuneRad ?? 0;
+    const applied = stageASamples.map((row) => row.phaseAHeadAppliedRad ?? 0);
+    const wired =
+      tune === 0
+        ? applied.every((value) => Math.abs(value) < 1e-6)
+        : applied.some(
+            (value) => Math.sign(value) === Math.sign(tune) && Math.abs(value) >= Math.abs(tune) * 0.3,
+          );
+    check(
+      '坐姿标定：阶段 A 抬头补偿已接线（0 = 不施加；负值 = 抬头，实际施加与配置同号）',
+      wired,
+      { tune, applied: applied.map((value) => Number(value.toFixed(3))).slice(0, 8) },
+    );
+  }
+  check(
+    '坐姿两段式：阶段 B 在 0.3s 内把上半身覆盖从 0 收到 1（16.2s 停帧后不再跳）',
+    firstStageB !== null &&
+      firstStageB.t >= 900 &&
+      firstStageB.t <= 2500 &&
+      (lastSequence?.stageBBlend ?? 0) >= 0.999 &&
+      (lastSequence?.upperOverride ?? 0) >= 0.95,
+    {
+      stageBAtMs: firstStageB?.t ?? null,
+      finalStageBBlend: lastSequence?.stageBBlend ?? null,
+      finalUpperOverride: lastSequence?.upperOverride ?? null,
+    },
+  );
+  {
+    // ADR 0051 D7：下背覆盖权重接线。1.0 时与 upperOverride 相等；
+    // 0.85 时必须明显低于 upperOverride（保留一部分片段前倾）。
+    const weight = seated?.sit?.spineOverlayWeight ?? 1;
+    const applied = lastSequence?.spineOverlayApplied ?? 0;
+    const upper = lastSequence?.upperOverride ?? 0;
+    const wired =
+      weight >= 0.999
+        ? Math.abs(applied - upper) < 0.01
+        : applied <= upper * weight + 0.01 && applied < upper - 0.05;
+    check(
+      '坐姿标定：下背 Spine 覆盖权重已接线（1.0 = 与上半身同权；<1 时明显低于 upperOverride）',
+      wired,
+      { weight, applied: Number(applied.toFixed(3)), upperOverride: Number(upper.toFixed(3)) },
+    );
+  }
+  check(
+    '坐姿两段式：A→B 头部无瞬间跳变（16ms 采样最大四元数步进 < 0.15rad）',
+    maxHeadStepRad < 0.15,
+    { maxHeadStepRad: Number(maxHeadStepRad.toFixed(4)), samples: sitSequenceSeries.length },
+  );
+  check(
+    '坐姿：下坐弹簧 0→1 无过冲（max ≤1.01，最终 ≥0.95，ADR 0051）',
+    maxSitDrop <= 1.01 && (lastSequence?.sitDrop ?? 0) >= 0.95,
+    { maxSitDrop, finalSitDrop: lastSequence?.sitDrop ?? null },
+  );
+  // A/B 截图要可比较：阶段 B 强制看镜头，排除"随机张望"造成的头向差异。
+  await window.webContents.executeJavaScript(`window.diagnostics.forceSitGaze('camera')`, true);
+  await sleep(450);
+  const stageBShot = await captureScreenshot(window, 'sit-stage-b.png', 'sit-stage-b');
+  check(
+    '坐姿两段式：阶段 A / B 截图已产出（sit-stage-a.png / sit-stage-b.png）',
+    stageAShot.length > 0 && stageBShot.length > 0,
+    { stageAShot, stageBShot },
+  );
+  // ADR 0051 D7 的 A/B 第二阶段：停帧后**下背覆盖权重**决定她坐得笔直还是稍微弓背。
+  // 420px 特写带肩/胸/腰；相机仍跟随头骨，两张图取景一致。强制看镜头已排除随机张望。
+  await window.webContents.executeJavaScript(`window.diagnostics.faceZoom(420)`, true);
+  await sleep(220);
+  const stageBCloseup = await captureScreenshot(window, 'sit-ab-stage-b.png', 'sit-ab-stage-b');
+  await window.webContents.executeJavaScript(`window.diagnostics.faceZoom(0)`, true);
+  check(
+    '坐姿标定：A/B 特写已产出（sit-ab-stage-a.png 阶段 A 脸 / sit-ab-stage-b.png 阶段 B 上半身，ADR 0051 D7）',
+    stageACloseup.length > 0 &&
+      stageBCloseup.length > 0 &&
+      stageACloseupMoment.stage === 'a' &&
+      stageACloseupMoment.upperOverride <= 0.001 &&
+      (lastSequence?.stageBBlend ?? 0) >= 0.999,
+    {
+      stageACloseup,
+      stageBCloseup,
+      stageA: {
+        stage: stageACloseupMoment.stage,
+        holdTimeSeconds: stageACloseupMoment.holdTimeSeconds,
+        phaseAHeadTuneRad: seated?.sit?.phaseAHeadTuneRad ?? null,
+        phaseAHeadAppliedRad: stageACloseupMoment.phaseAHeadAppliedRad,
+        upperOverride: stageACloseupMoment.upperOverride,
+      },
+      stageB: {
+        stageBBlend: lastSequence?.stageBBlend ?? null,
+        upperOverride: lastSequence?.upperOverride ?? null,
+        spineOverlayWeight: stageACloseupMoment.spineOverlayWeight,
+        spineOverlayApplied: lastSequence?.spineOverlayApplied ?? null,
+      },
+    },
+  );
+  // 截图取证完就恢复随机张望，否则后面 11s 的"换向/头在转"断言只会看到一个 camera 目标。
+  await window.webContents.executeJavaScript(`window.diagnostics.forceSitGaze('wander')`, true);
+  await sleep(400);
   // ADR 0043 D3：落座过程中补偿必须跟着片段权重走（不能一帧内硬切 ~390px）。
   // 断言的是**不变量**而不是某一帧的绝对值：`offset == raw × blend`（±1px 取整误差）。
   // 这样与截图/IPC 的时序无关，又能证明"补偿被权重缩放"。
@@ -3942,22 +4563,25 @@ export async function runSelfTestIfRequested(): Promise<void> {
     const rawY = sitNow?.rawOffsetPx?.y ?? 0;
     const offX = sitNow?.offsetPx?.x ?? 0;
     const offY = sitNow?.offsetPx?.y ?? 0;
-    const blend = sitNow?.blend ?? 0;
+    // ADR 0051：补偿 = raw × sitGain × sitDrop（诊断字段 `sitPoseGain`）
+    const gain = sitNow?.sitPoseGain ?? 0;
     check(
-      '坐姿：补偿按混合权重缩放（offset ≈ raw × blend，落座瞬间不会硬切，ADR 0043 D3）',
+      '坐姿：补偿按片段权重 × 弹簧增益缩放（offset ≈ raw × sitPoseGain，落座瞬间不会硬切，ADR 0043/0051）',
       Math.abs(rawX) > 50 &&
-        blend > 0 &&
-        blend < 1 &&
-        Math.abs(offX - rawX * blend) < 1.5 &&
-        Math.abs(offY - rawY * blend) < 1.5,
-      { raw: sitNow?.rawOffsetPx ?? null, offset: sitNow?.offsetPx ?? null, blend: sitNow?.blend ?? null },
+        gain > 0 &&
+        gain < 1 &&
+        Math.abs(offX - rawX * gain) < 1.5 &&
+        Math.abs(offY - rawY * gain) < 1.5,
+      { raw: sitNow?.rawOffsetPx ?? null, offset: sitNow?.offsetPx ?? null, sitPoseGain: sitNow?.sitPoseGain ?? null },
     );
   }
 
   // 等坐姿停帧 + 微动包络起来（片段权重到 1），再验证"活着"
   await waitFor(window, 3000, (diagnostics) => (diagnostics?.sit?.blend ?? 0) >= 0.98);
 
-  // ADR 0044/0045/0046：一次采样覆盖 呼吸 / 自主张望 / 眼球 / 晃腿 / 头部基准（每 250ms 一帧，共 5s）。
+  // ADR 0044/0045/0046：一次采样覆盖 呼吸 / 自主张望 / 眼球 / 晃腿 / 头部基准。
+  // ADR 0049 D6：张望放慢到 5–9s 换向，采样窗口必须**长于一个周期**（21×250ms 只有 5.3s，
+  // 会只看到一次目标），所以加到 45×250ms ≈ 11.3s。
   const samples: Array<{
     t: number;
     breath: number;
@@ -3974,7 +4598,7 @@ export async function runSelfTestIfRequested(): Promise<void> {
     eyeYaw: number | null;
   }> = [];
   const samplingStartedAt = Date.now();
-  for (let i = 0; i < 21; i += 1) {
+  for (let i = 0; i < 45; i += 1) {
     const d = await readDiagnostics(window);
     const m = d?.sit?.motion ?? null;
     if (m) {
@@ -3997,6 +4621,18 @@ export async function runSelfTestIfRequested(): Promise<void> {
     await sleep(250);
   }
   const sitAlive = await readDiagnostics(window);
+  // ADR 0051：看镜头是张望池的一等目标（权重 1/3）。这里强制一次取证：
+  // 目标必须是 yaw/pitch = 0（屏幕中心方向），而不是从随机范围里碰巧回到 0。
+  await window.webContents.executeJavaScript(`window.diagnostics.forceSitGaze('camera')`, true);
+  await sleep(80);
+  const cameraGaze = (await readDiagnostics(window))?.sit?.motion?.gaze ?? null;
+  check(
+    '坐姿张望：存在"看镜头"目标（targetKind=camera、yaw/pitch≈0，权重 1/3，ADR 0051）',
+    cameraGaze?.targetKind === 'camera' &&
+      Math.abs(cameraGaze?.targetYaw ?? 1) < 1e-6 &&
+      Math.abs(cameraGaze?.targetPitch ?? 1) < 1e-6,
+    cameraGaze,
+  );
   const rangeOf = (values: number[]): number =>
     values.length < 2 ? 0 : Math.max(...values) - Math.min(...values);
   const breathRange = rangeOf(samples.map((s) => s.breath));
@@ -4019,8 +4655,10 @@ export async function runSelfTestIfRequested(): Promise<void> {
   const headYawRange = rangeOf(headYaws);
 
   check(
-    '坐姿：停在最后一帧（playHold 的 clamp；不是循环、也不会自己站回去，ADR 0044 D1）',
+    '坐姿：停在最后一帧（playHold 的 clamp；不是循环、也不会自己站回去，ADR 0044/0051）',
     sitAlive?.sit?.done === true &&
+      sitAlive?.sit?.stage === 'b' &&
+      Math.abs((sitAlive?.sit?.holdAtSeconds ?? 0) - 16.2) < 1e-9 &&
       sitAlive?.hfsm.physics === 'sitting' &&
       (sitAlive?.animation?.current?.name ?? '').includes('pastmemory'),
     { sit: sitAlive?.sit ?? null, current: sitAlive?.animation?.current ?? null },
@@ -4040,23 +4678,56 @@ export async function runSelfTestIfRequested(): Promise<void> {
     breathRange > 0.15 && samples.every((s) => Math.abs(s.breath) <= 1.0001),
     { range: Number(breathRange.toFixed(3)), samples: samples.map((s) => Number(s.breath.toFixed(3))) },
   );
+  // 真机问题三：张望不能像雷达。采样窗口 ~11.5s，足够覆盖一次 5–9s 的换向周期；
+  // 额外统计"同一个目标连续保持多久"，验证到位后至少静止 2s（实测会到 4.5–8s）。
+  let longestStillMs = 0;
+  {
+    let runStartT = samples[0]?.t ?? 0;
+    let runKey = samples[0] ? `${samples[0].targetYaw.toFixed(3)}/${samples[0].targetPitch.toFixed(3)}` : '';
+    for (let i = 1; i < samples.length; i += 1) {
+      const key = `${samples[i]!.targetYaw.toFixed(3)}/${samples[i]!.targetPitch.toFixed(3)}`;
+      if (key !== runKey) {
+        longestStillMs = Math.max(longestStillMs, samples[i - 1]!.t - runStartT);
+        runStartT = samples[i]!.t;
+        runKey = key;
+      }
+    }
+    if (samples.length > 0) {
+      longestStillMs = Math.max(longestStillMs, samples[samples.length - 1]!.t - runStartT);
+    }
+  }
   check(
-    '坐姿：自主张望（目标在 ±0.36 / +0.06 / -0.22 内，且 5s 内换过方向，ADR 0045 D2.2）',
+    '坐姿：张望放慢（5–9s 换向 + 到位后 ≥2s 静止；不是雷达扫描，ADR 0049 D6）',
     samples.length > 0 &&
       maxAbsTargetYaw <= 0.3601 &&
       maxAbsTargetPitch <= 0.2201 &&
-      (targets.size >= 2 || rangeOf(samples.map((s) => s.gazeYaw)) > 0.02),
-    { targets: [...targets].slice(0, 6), maxAbsTargetYaw, maxAbsTargetPitch },
+      targets.size >= 2 &&
+      longestStillMs >= 2000,
+    {
+      targets: [...targets].slice(0, 6),
+      longestStillMs,
+      windowMs: samples[samples.length - 1]?.t ?? 0,
+      samples: samples.length,
+    },
   );
   check(
-    '坐姿：上半身照抄站立姿态（胸/颈/头的局部四元数已记录并覆盖，ADR 0048 D1）',
-    sitAlive?.sit?.idleUpperCaptured === true,
-    { idleUpperCaptured: sitAlive?.sit?.idleUpperCaptured ?? null, headTune: sitAlive?.sit?.headTune ?? null },
+    '坐姿：上半身照抄站立姿态（胸/颈/头已记录，阶段 B 覆盖权重 ≥0.95，ADR 0048/0051）',
+    sitAlive?.sit?.idleUpperCaptured === true && (sitAlive?.sit?.upperOverride ?? 0) >= 0.95,
+    {
+      idleUpperCaptured: sitAlive?.sit?.idleUpperCaptured ?? null,
+      upperOverride: sitAlive?.sit?.upperOverride ?? null,
+      headTune: sitAlive?.sit?.headTune ?? null,
+    },
   );
   check(
-    '坐姿：头真的在转（头骨相对绑定姿态的朝向在 5s 内摆动 ≥0.05rad，不是只动眼，ADR 0045 D2.2）',
-    Math.max(headYawRange, headPitchRange) >= 0.05,
-    { headYawRange, headPitchRange, samples: headYaws.slice(0, 8).map((v) => Number(v.toFixed(3))) },
+    '坐姿：头真的在转（头骨在观测窗口内摆动 ≥0.05rad，不是只动眼，ADR 0045 D2.2）',
+    headYawRange + headPitchRange >= 0.05,
+    {
+      headYawRange,
+      headPitchRange,
+      totalRange: headYawRange + headPitchRange,
+      samples: headYaws.slice(0, 8).map((v) => Number(v.toFixed(3))),
+    },
   );
   check(
     '坐姿：悬空晃腿（左右交替、幅度 0.12–0.18rad、包络已开，ADR 0045 D3）',
@@ -4245,6 +4916,101 @@ export async function runSelfTestIfRequested(): Promise<void> {
   );
 
   // ------------------------------------------------------------------
+  // 3.8.5) ADR 0049 D1：sitting 微动作池（晃腿 / 低头看手 / 抬头看远处）
+  //
+  // 与 idle 池同一套抽签逻辑，但条目不同：三条断言——
+  // ① 压缩到 650ms 后 2.6s 内换过 ≥2 个条目（不是固定循环）；
+  // ② 交叉淡入淡出（100ms 采样权重跳变 < 0.5）；
+  // ③ 两个变奏真的落到头骨俯仰：低头看手（正）比抬头看远处（负）大 ≥0.15rad。
+  // ------------------------------------------------------------------
+  await window.webContents.executeJavaScript(
+    `window.diagnostics.setMicroPoolInterval('sit', 650, 650)`,
+    true,
+  );
+  const sitPoolSeries = JSON.parse(
+    (await window.webContents.executeJavaScript(
+      `new Promise((resolve) => {
+        const rows = [];
+        const startedAt = performance.now();
+        const tick = () => {
+          const pool = window.diagnostics.microPool().sit;
+          if (pool) rows.push({ t: performance.now() - startedAt, ...pool });
+          if (performance.now() - startedAt < 2600) setTimeout(tick, 100);
+          else resolve(JSON.stringify(rows));
+        };
+        tick();
+      })`,
+      true,
+    )) as string,
+  ) as Array<{ t: number; active: string; weights: Record<string, number>; switches: number }>;
+  const sitPoolLast = sitPoolSeries[sitPoolSeries.length - 1] ?? null;
+  const sitPoolKinds = new Set(sitPoolSeries.map((row) => row.active));
+  let sitPoolMaxStep = 0;
+  for (let i = 1; i < sitPoolSeries.length; i += 1) {
+    for (const kind of ['legs', 'hands', 'far']) {
+      sitPoolMaxStep = Math.max(
+        sitPoolMaxStep,
+        Math.abs(
+          (sitPoolSeries[i]!.weights[kind] ?? 0) - (sitPoolSeries[i - 1]!.weights[kind] ?? 0),
+        ),
+      );
+    }
+  }
+  check(
+    'sitting 微动作池：随机抽签在 2.6s 内换过 ≥2 个条目（不是固定循环，ADR 0049 D1）',
+    (sitPoolLast?.switches ?? 0) >= 2 && sitPoolKinds.size >= 2,
+    { switches: sitPoolLast?.switches ?? null, kinds: [...sitPoolKinds] },
+  );
+  check(
+    'sitting 微动作池：条目之间平滑交叉（100ms 采样权重跳变 < 0.5，不是瞬切）',
+    sitPoolMaxStep > 0 && sitPoolMaxStep < 0.5,
+    { maxStep: Number(sitPoolMaxStep.toFixed(3)), samples: sitPoolSeries.length },
+  );
+
+  // 变奏 A：低头看手（头/颈/眼向下，晃腿停下）
+  await window.webContents.executeJavaScript(
+    `window.diagnostics.forceMicroPool('sit', 'hands')`,
+    true,
+  );
+  await sleep(900);
+  const handsDiag = await readDiagnostics(window);
+  const handsPitch = handsDiag?.sit?.headOrientation?.pitch ?? 0;
+  const handsShot = await captureScreenshot(window, 'sit-micro-hands.png', 'sit-micro-hands');
+
+  // 变奏 B：抬头看远处（头/眼抬起，晃腿放慢到三成）
+  await window.webContents.executeJavaScript(
+    `window.diagnostics.forceMicroPool('sit', 'far')`,
+    true,
+  );
+  await sleep(900);
+  const farDiag = await readDiagnostics(window);
+  const farPitch = farDiag?.sit?.headOrientation?.pitch ?? 0;
+  const farShot = await captureScreenshot(window, 'sit-micro-far.png', 'sit-micro-far');
+
+  check(
+    'sitting 微动作池：低头看手 vs 抬头看远处（头骨俯仰差 ≥0.15rad，ADR 0049 D1）',
+    handsPitch - farPitch >= 0.15,
+    {
+      handsPitch,
+      farPitch,
+      delta: Number((handsPitch - farPitch).toFixed(4)),
+      handsShot,
+      farShot,
+    },
+  );
+
+  // 恢复：回到默认条目 `legs`、解除强制、把间隔还原成生产的 15–30s
+  await window.webContents.executeJavaScript(
+    `window.diagnostics.forceMicroPool('sit', 'legs')`,
+    true,
+  );
+  await sleep(500);
+  await window.webContents.executeJavaScript(
+    `window.diagnostics.forceMicroPool('sit', null); window.diagnostics.setMicroPoolInterval('sit', 15000, 30000)`,
+    true,
+  );
+
+  // ------------------------------------------------------------------
   // ADR 0043 取证：落座过渡逐帧抓图（12 帧）。
   //
   // 这一轮**故意让窗口不动**：先解除坐姿、再在原地重新吸附（距离 ≤8px → 直接 commit，
@@ -4282,6 +5048,7 @@ export async function runSelfTestIfRequested(): Promise<void> {
   const sequenceTrace: Array<{
     step: number;
     blend: number | null;
+    poseGain: number | null;
     offsetX: number | null;
     rawOffsetX: number | null;
     headX: number | null;
@@ -4297,6 +5064,7 @@ export async function runSelfTestIfRequested(): Promise<void> {
     sequenceTrace.push({
       step,
       blend: trace?.sit?.blend ?? null,
+      poseGain: trace?.sit?.sitPoseGain ?? null,
       offsetX: trace?.sit?.offsetPx?.x ?? null,
       rawOffsetX: trace?.sit?.rawOffsetPx?.x ?? null,
       headX: trace?.sit?.headWorld?.x ?? null,
@@ -4314,13 +5082,13 @@ export async function runSelfTestIfRequested(): Promise<void> {
       maxStep = Math.max(maxStep, Math.abs(heads[i]! - heads[i - 1]!));
     }
     const scaledOk = sequenceTrace.every((item) => {
-      if (typeof item.blend !== 'number' || typeof item.offsetX !== 'number' || typeof item.rawOffsetX !== 'number') {
+      if (typeof item.poseGain !== 'number' || typeof item.offsetX !== 'number' || typeof item.rawOffsetX !== 'number') {
         return false;
       }
-      return Math.abs(item.offsetX - item.rawOffsetX * item.blend) < 2;
+      return Math.abs(item.offsetX - item.rawOffsetX * item.poseGain) < 2;
     });
     check(
-      '坐姿：落座过程连续且补偿按权重缩放（头骨 x 跳变 < 40px、offset ≈ raw×blend，ADR 0043 D3）',
+      '坐姿：落座过程连续且补偿按 sitGain×sitDrop 缩放（头骨 x 跳变 < 40px、offset ≈ raw×poseGain，ADR 0043/0051）',
       heads.length >= 3 && maxStep < 40 && scaledOk,
       { trace: sequenceTrace, maxStepPx: Number(maxStep.toFixed(1)), scaledOk },
     );
@@ -4375,10 +5143,16 @@ export async function runSelfTestIfRequested(): Promise<void> {
       shell.snapSnapshot()?.sitting === false,
     { hfsm: clickedOff?.hfsm ?? null, sit: clickedOff?.sit ?? null },
   );
+  // `startle` 只活 120ms（clicked），而 `getDiagnostics()` 单次约 300ms —— 轮询到的
+  // 那一帧很可能已经清空（历史偶发假失败）。因此同时接受渲染侧"坐姿结束 reason=clicked"
+  // 这条稳定事实：该分支在设置 startle 的同一函数里，日志在就说明惊跳一定被排过。
+  const clickedStandLog = (await runLogText()).includes('sitting 结束 reason=clicked');
   check(
     '解除：clicked 播放短促惊跳/起身（ADR 0034 D5）',
-    clickedOff?.drag?.startle === 'clicked' || clickedOff?.drag?.startle === 'command',
-    clickedOff?.drag ?? null,
+    clickedOff?.drag?.startle === 'clicked' ||
+      clickedOff?.drag?.startle === 'command' ||
+      clickedStandLog,
+    { startle: clickedOff?.drag?.startle ?? null, clickedStandLog },
   );
   const clickReleaseLog = lastJsonAfter(await runLogText(), '吸附解除（ADR 0028 D9）');
   check(
@@ -4481,10 +5255,14 @@ export async function runSelfTestIfRequested(): Promise<void> {
     shell.motionSnapshot()?.kind === 'idle' && Math.abs(fallenBounds.y - fallGroundY) <= 8,
     { y: fallenBounds.y, groundY: fallGroundY, motion: shell.motionSnapshot() },
   );
+  // `startle` 只活 320ms，`waitFor` 的单次 `getDiagnostics()` 约 300ms —— 轮询可能整段错过
+  // （历史偶发假失败，2026-11-05 复现）。渲染侧 `sitting 结束 reason=window-gone` 与设置
+  // startle 在同一个函数里，日志在就说明惊跳一定被排过。
+  const windowGoneStandLog = (await runLogText()).includes('sitting 结束 reason=window-gone');
   check(
     '解除：窗沿消失时先播惊跳（startle=window-gone，ADR 0034 D5 / ADR 0042 D4）',
-    startleSeen?.drag?.startle === 'window-gone',
-    startleSeen?.drag ?? closedOff?.drag ?? null,
+    startleSeen?.drag?.startle === 'window-gone' || windowGoneStandLog,
+    { startle: startleSeen?.drag?.startle ?? closedOff?.drag?.startle ?? null, windowGoneStandLog },
   );
   check(
     '解除：落下按"轻放"处理（不伪造冲击 → landingImpact 不触发，ADR 0040 D3 口径）',

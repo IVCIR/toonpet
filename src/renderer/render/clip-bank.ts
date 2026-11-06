@@ -16,12 +16,19 @@
  * 选择规则与 ADR 0014 D3 一致：精确名 → 模式降级 → 缺失；降级原因进日志。
  */
 import * as THREE from 'three';
+import {
+  SIT_CLIP_HOLD_SECONDS,
+  SIT_CLIP_START_SECONDS,
+} from '../../shared/constants';
 
 export type ClipRole =
   | 'idle'
   | 'idle.alt1'
   | 'idle.alt2'
   | 'idle.alt3'
+  | 'idle.alt4'
+  | 'idle.alt5'
+  | 'idle.alt6'
   | 'held'
   | 'walk'
   | 'walk.carried'
@@ -30,7 +37,6 @@ export type ClipRole =
   | 'greet'
   | 'nod'
   | 'happy'
-  | 'fidget.shy'
   // 以下为侧向战斗片段：只登记、默认不接线（留着做"战斗模式"或转屏演出）
   | 'attack'
   | 'skill'
@@ -99,6 +105,27 @@ export const CLIP_RULES: Record<ClipRole, ClipRule> = {
     patterns: [/victory[_\s-]?end[_\s-]?random/i],
     loop: true,
   },
+  'idle.alt4': {
+    // ADR 0050：正面双手交叠在身前；与 `Carrier_Idle` 的"双手自然下垂"是两种不同站姿。
+    // 44 段普查：4s 循环、shrinkRatio 0.001、pitchRange 0.012 —— 只有呼吸/头发在动。
+    exact: 'CH0335_Carrier2_Idle',
+    patterns: [/carrier2[_\s-]?idle/i],
+    loop: true,
+  },
+  'idle.alt5': {
+    // ADR 0050：正面收势站姿（手臂自然垂下）；`Victory_End_Random` 之外的另一个 4s 循环。
+    // 注意模式必须锚定整名，不能命中 `Victory_End_Random` / `*_interaction_*`。
+    exact: 'CH0335_Victory_End',
+    patterns: [/^CH0335_Victory_End$/i],
+    loop: true,
+  },
+  'idle.alt6': {
+    // ADR 0050：`Formation_Idle` 的随机变体（同一抱臂姿势、不同的头部/呼吸相位）。
+    // 4s 循环、shrinkRatio 0.005、pitchRange 0.016；普查 facing 1.186（正面带一点偏头）。
+    exact: 'CH0335_Formation_Idle_Random',
+    patterns: [/formation[_\s-]?idle[_\s-]?random/i],
+    loop: true,
+  },
   held: {
     // ADR 0041 D1：**唯一**的官方悬空片段，抓头/抓身/抓脚**统一**用它。
     //
@@ -126,20 +153,19 @@ export const CLIP_RULES: Record<ClipRole, ClipRule> = {
     loop: true,
   },
   sit: {
-    // ADR 0044 D1：**回到停帧**。14.5–14.7s 是普查里最平稳、且**眼皮完全睁开**的一段坐姿
-    // （14.5→14.7 的骨骼差：头 y 0.0003、骨盆 0.0002、脚底 0.0005；眼皮 `translation.x`
-    // 稳定在 0.000263 —— 14.8s 之后她开始眯眼、14.92s 已到 0.000314，所以窗口不能再往后放，
-    // 否则"睁眼基线"就是半闭的，程序化眨眼会看不出来）。
+    // ADR 0051：**两段式**。进入窗口从 14.2s 起播，到 16.2s 停帧：
+    // - 阶段 A（14.2–16.0s）：正常 LoopOnce 播放，让她自然演"坐下 + 第一次张望"。
+    //   14.95s 左右有一次头部 0.253rad 的快速转头（实测），这是最容易读成"活人"的一下；
+    // - 阶段 B（16.0–16.2s）：继续播到 16.2s 后 clamp 停帧；从 16.0s 起 0.3s 淡入
+    //   ADR 0048 的站立上半身覆盖 + 程序化微动。16.2s 是停帧基准。
     //
-    // `playHold` 停在窗口末尾那一帧 = 姿态基线。
-    // 为什么不再循环：ADR 0043 D2 曾把这 0.42s 循环起来制造动感，真机读作"抽搐"——
-    // 循环接缝在 1–2px、且 0.42s 的节奏本身就快。现在**片段只给姿态、不给运动**，
-    // 呼吸/张望/眨眼/晃腿全部由 `sit-motion.ts` 以慢变量叠加（ADR 0044 D2–D5）。
+    // 为什么不是 14.5–14.7（旧版）：那 0.2s 把 14.95s 的转头直接冻掉了，坐下第一秒像假人。
+    // 为什么不能到 17.0s：17.0s 之后大腿/小腿开始起身（实测 17.5s 大腿已 1.46rad）。
     exact: 'CH0335_my_event088_pastmemory_01',
     patterns: [/pastmemory/i, /sit[_\s-]?(idle|down|loop)?$/i, /chair|seat/i],
     loop: false,
-    startSeconds: 14.5,
-    maxSeconds: 14.7,
+    startSeconds: SIT_CLIP_START_SECONDS,
+    maxSeconds: SIT_CLIP_HOLD_SECONDS,
     fadeInSeconds: 0.45,
     fadeOutSeconds: 0.35,
   },
@@ -158,7 +184,8 @@ export const CLIP_RULES: Record<ClipRole, ClipRule> = {
     // 读起来是"慢慢直起身"，而不是"被切断"）。
     //
     // 为什么不继续用 `Cafe_Reaction`（3.5–6.6s）：那一段一直含胸抱手，**没有回正**。
-    // `Cafe_Reaction` 只保留给 `greet` / `nod` / `fidget.shy`。
+    // `Cafe_Reaction` 只保留给 `greet` / `nod`（都是显式意图，不由空闲触发；ADR 0050
+    // 又删掉了唯一由空闲触发的 `fidget.shy` 窗口）。
     //
     // 武器/道具由 HIDE_ATTACHMENTS 隐藏；整段脚底高度只变化 0.01 单位（≈7px），无需补偿。
     exact: 'CH0335_Victory_Start_Random',
@@ -203,17 +230,6 @@ export const CLIP_RULES: Record<ClipRole, ClipRule> = {
     loop: false,
     fadeInSeconds: 0.2,
     fadeOutSeconds: 0.35,
-  },
-  'fidget.shy': {
-    // ADR 0041 D4：空闲小动作之一 —— `Cafe_Reaction` 3.2–4.9s 的"双手掩到脸前、
-    // 身子缩一下"（害羞），1.7s 闭环后回站姿。同一段素材的第三个窗口。
-    exact: 'CH0335_Cafe_Reaction',
-    patterns: [/cafe[_\s-]?reaction/i, /reaction/i],
-    loop: false,
-    startSeconds: 3.2,
-    maxSeconds: 4.9,
-    fadeInSeconds: 0.3,
-    fadeOutSeconds: 0.4,
   },
 
   // ---- 侧向战斗片段（只登记，默认不接线）----

@@ -192,6 +192,17 @@ export function createModelAnimations(
     roleActions.set(role, mixer.clipAction(clip));
   }
 
+  /**
+   * 所有 action 的去重集合（基础槽位 + 语义角色）。
+   *
+   * 为什么需要：`fadeTo` 只对 `currentAction` 调 `crossFadeFrom`。如果进入下一个动作时
+   * **还有第三个动作在交叉淡入中**（真机：待机姿态轮换 0.8s 的淡入途中被拖拽打断），
+   * 它不会被淡出，权重会停在半途（自检实测 `Cafe_Idle` 在拖拽中仍有 0.52），
+   * 于是"Base 的 Idle 已淡出"偶发失败，并且真的会在悬空姿态上叠一层站姿。
+   * 这里在每次切换时把"除目标与上一个 action 之外、仍有权的动作"一并淡出。
+   */
+  const actionRegistry = [...new Set([...byName.values(), ...roleActions.values()])];
+
   const selection: Record<AnimationSlot, ClipSelection> = {
     idle: selectClip(roleSelections, 'idle'),
     held: selectClip(roleSelections, 'held'),
@@ -238,6 +249,15 @@ export function createModelAnimations(
     action.play();
     if (previous) {
       action.crossFadeFrom(previous, Math.max(0, fadeSeconds), false);
+    }
+    // 除目标与上一个 action 外，任何仍有权的动作都要淡出（见 `actionRegistry` 的说明）
+    for (const other of actionRegistry) {
+      if (other === action || other === previous) continue;
+      if (!other.enabled) continue;
+      const weight = other.getEffectiveWeight();
+      if (Number.isFinite(weight) && weight > 0.001) {
+        other.fadeOut(Math.max(0, fadeSeconds));
+      }
     }
     currentAction = action;
   }

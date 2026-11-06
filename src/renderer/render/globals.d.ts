@@ -69,6 +69,24 @@ declare global {
       faceZoom(size: number): ReturnType<RenderModule['setFaceZoom']>;
       /** ADR 0048 D2：坐姿头部微调（rad，正 = 低头）。键盘 ↑/↓ 也走这里 */
       headTune(rad: number): number;
+      /** ADR 0049 D1：微动作池的只读快照（idle / sitting，极轻，可 100ms 采样） */
+      microPool(): ReturnType<RenderModule['microPoolDiagnostics']>;
+      /** ADR 0049 D1（自检取证）：强制池条目（null = 解除） */
+      forceMicroPool(pool: 'idle' | 'sit', kind: string | null): string | null;
+      /** ADR 0049 D1（自检压缩时序）：覆盖池的切换间隔 */
+      setMicroPoolInterval(pool: 'idle' | 'sit', minMs: number, maxMs: number): void;
+      /** ADR 0050：待机静态站姿轮换的只读快照（当前角色 / 倒计时 / 候选池） */
+      idleVariation(): import('./idle-variation').IdleVariationSnapshot;
+      /** ADR 0050（自检取证）：强制下一个 tick 换到某个站姿（null = 解除） */
+      forceIdleVariation(role: string | null): string | null;
+      /** ADR 0050（自检压缩时序）：覆盖站姿轮换间隔 */
+      setIdleVariationInterval(minMs: number, maxMs: number): void;
+      /** ADR 0051：坐姿两段式的极轻快照（阶段 / 弹簧 / 头骨） */
+      sitSequence(): import('./render-module').SitSequenceDiagnostics;
+      /** ADR 0051（自检取证）：立刻把坐姿张望目标切到 camera / wander */
+      forceSitGaze(kind: 'camera' | 'wander'): 'camera' | 'wander';
+      /** ADR 0049 D2：视线三级阻尼的极轻快照（眼球 / 头部 / 躯干） */
+      gaze(): ReturnType<RenderModule['gazeDiagnostics']>;
     };
   }
 }

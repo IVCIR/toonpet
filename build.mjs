@@ -140,9 +140,41 @@ const bundles = [
     target: 'node20',
   },
   {
+    // ADR 0051：下坐弹簧（k=180 / c=26.8，临界阻尼、固定子步长）
+    entry: 'src/renderer/render/sit-drop.test.ts',
+    outfile: 'dist/tests/sit-drop.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0051：坐姿两段式（14.2→16.0→16.2；阶段 B 覆盖 0.3s）
+    entry: 'src/renderer/render/sit-sequence.test.ts',
+    outfile: 'dist/tests/sit-sequence.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
     // ADR 0044：坐姿活体微动（呼吸 / 自主张望 / 眨眼 / 悬空晃腿）
     entry: 'src/renderer/render/sit-motion.test.ts',
     outfile: 'dist/tests/sit-motion.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0049 D1：微动作池（15–30s 抽签 / 指数交叉淡入淡出 / 强制与间隔覆盖）
+    entry: 'src/renderer/render/micro-pool.test.ts',
+    outfile: 'dist/tests/micro-pool.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0049 D2：视线三级阻尼（眼 12 / 头 8 / 躯干 4，150ms 保持 + 慢回正）
+    entry: 'src/renderer/render/gaze.test.ts',
+    outfile: 'dist/tests/gaze.test.mjs',
     platform: 'node',
     format: 'esm',
     target: 'node20',
@@ -171,9 +203,9 @@ const bundles = [
     target: 'node20',
   },
   {
-    // ADR 0041 D4：空闲小动作（间隔边界 + 转圈角度曲线）
-    entry: 'src/renderer/render/fidget.test.ts',
-    outfile: 'dist/tests/fidget.test.mjs',
+    // ADR 0050：待机静态站姿轮换（20–45s 间隔 / 排除当前 / 只抽可用角色）
+    entry: 'src/renderer/render/idle-variation.test.ts',
+    outfile: 'dist/tests/idle-variation.test.mjs',
     platform: 'node',
     format: 'esm',
     target: 'node20',

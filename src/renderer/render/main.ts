@@ -11,6 +11,7 @@ import { createDragPause } from '../shell/drag-pause';
 import { createSubtitle } from '../shell/subtitle';
 import { createSubtitleCue } from '../shell/subtitle-cue';
 import { createSpeechPlayer } from '../voice/speech-player';
+import type { ClipRole } from './clip-bank';
 import { createRenderModule } from './render-module';
 
 const canvas = document.querySelector<HTMLCanvasElement>('#stage');
@@ -86,6 +87,21 @@ window.diagnostics = {
   faceZoom: (size: number) => module.setFaceZoom(size),
   // ADR 0048 D2：坐姿头部微调（键盘 ↑/↓ 与自检共用）
   headTune: (rad: number) => module.setSitHeadTune(rad),
+  // ADR 0049：微动作池（只读快照 / 强制条目 / 压缩间隔，全部只给自检与取证）
+  microPool: () => module.microPoolDiagnostics(),
+  forceMicroPool: (pool: 'idle' | 'sit', kind: string | null) => module.forceMicroPool(pool, kind),
+  setMicroPoolInterval: (pool: 'idle' | 'sit', minMs: number, maxMs: number) =>
+    module.setMicroPoolInterval(pool, minMs, maxMs),
+  // ADR 0050：待机静态站姿轮换（只读快照 / 强制角色 / 压缩间隔，全部只给自检与取证）
+  idleVariation: () => module.idleVariationDiagnostics(),
+  forceIdleVariation: (role: string | null) => module.forceIdleVariation(role as ClipRole | null),
+  setIdleVariationInterval: (minMs: number, maxMs: number) =>
+    module.setIdleVariationInterval(minMs, maxMs),
+  // ADR 0051：坐姿两段式（极轻快照 / 强制张望目标，只给自检与取证）
+  sitSequence: () => module.sitSequenceDiagnostics(),
+  forceSitGaze: (kind: 'camera' | 'wander') => module.forceSitGaze(kind),
+  // ADR 0049 D2：视线三级阻尼的极轻快照（自检 16ms 采样"眼→头→躯干"的时间差）
+  gaze: () => module.gazeDiagnostics(),
 };
 
 // --- ADR 0048 D2：键盘 ↑/↓ 现场微调坐姿头部（**默认关闭**，只在 `?tune=1` 时挂载） ---

@@ -7,7 +7,7 @@ import { createModelAnimations } from './animation-controller';
 /**
  * 片段表的回归护栏（ADR 0041 / ADR 0042 的标定值都在这里锁一遍）。
  *
- * 为什么值得写：这些窗口（0.3–2.05s 的摸头、8.7–9.9s 的鞠躬、14.5–14.92s 的坐姿循环）
+ * 为什么值得写：这些窗口（0.3–2.05s 的摸头、8.7–9.9s 的鞠躬、14.2–16.2s 的坐姿两段式）
  * 是**对着 CH0335 逐帧量出来的**，改错一个数字不会报错，只会让动作变得难看。
  */
 test('片段表：摸头/打招呼/鞠躬/小动作/坐姿的裁剪窗口与总时长', () => {
@@ -25,16 +25,12 @@ test('片段表：摸头/打招呼/鞠躬/小动作/坐姿的裁剪窗口与总�
   assert.equal(greet.exact, 'CH0335_Cafe_Reaction');
   assert.ok((greet.maxSeconds ?? 99) <= 2.4);
 
-  const shyy = CLIP_RULES['fidget.shy'];
-  assert.ok((shyy.maxSeconds ?? 0) > (shyy.startSeconds ?? 0));
-  assert.ok((shyy.fadeOutSeconds ?? 0) >= 0.35);
-
   const sit = CLIP_RULES.sit;
   assert.equal(sit.exact, 'CH0335_my_event088_pastmemory_01');
-  assert.equal(sit.startSeconds, 14.5, 'ADR 0044 D1：坐姿回到停帧，窗口取最平稳的一段');
-  assert.equal(sit.maxSeconds, 14.7);
-  assert.equal(sit.loop, false, 'ADR 0044 D1：停帧（循环会在接缝处读作"抽搐"）');
-  assert.ok((sit.maxSeconds ?? 0) - (sit.startSeconds ?? 0) <= 0.6, '窗口要短，才能保证末帧稳定');
+  assert.equal(sit.startSeconds, 14.2, 'ADR 0051：阶段 A 从 14.2s 正放，让坐下 + 第一次张望可见');
+  assert.equal(sit.maxSeconds, 16.2, 'ADR 0051：16.2s 是阶段 B 的停帧基准');
+  assert.equal(sit.loop, false, 'ADR 0051：LoopOnce 播完 clamp，不循环');
+  assert.ok((sit.maxSeconds ?? 0) - (sit.startSeconds ?? 0) >= 1.9, '进入段要够长，才能看到 14.95s 的转头');
 });
 
 test('片段表：拖拽只认一个官方悬空片段，且不再按部位分片（ADR 0041 D1）', () => {
@@ -44,11 +40,16 @@ test('片段表：拖拽只认一个官方悬空片段，且不再按部位分�
   assert.equal(Object.hasOwn(CLIP_RULES, 'held.limp'), false);
 });
 
-test('片段表：待机姿态池是四个互不相同的正面循环片段', () => {
-  const roles = ['idle', 'idle.alt1', 'idle.alt2', 'idle.alt3'] as const;
+test('片段表：待机站姿池是七个互不相同的正面循环片段（ADR 0050）', () => {
+  const roles = ['idle', 'idle.alt1', 'idle.alt2', 'idle.alt3', 'idle.alt4', 'idle.alt5', 'idle.alt6'] as const;
   const names = roles.map((role) => CLIP_RULES[role].exact);
   assert.equal(new Set(names).size, names.length);
   for (const role of roles) assert.equal(CLIP_RULES[role].loop, true);
+  // 一次性小动作已删除：空闲池里不得再出现 Cafe_Reaction 的任何窗口
+  assert.equal(Object.hasOwn(CLIP_RULES, 'fidget.shy'), false);
+  assert.ok(names.every((name) => !name.includes('Cafe_Reaction')));
+  // 侧身战斗待机不得进池
+  assert.ok(names.every((name) => name !== 'CH0335_Normal_Idle'));
 });
 
 test('selectRole：精确名优先，其次模式降级，最后 missing', () => {
@@ -122,6 +123,36 @@ test('playOnce：播完淡回"演出前正在播的那个动作"（姿势连续�
   assert.equal(animations.current().slot, 'idle');
 });
 
+test('切换动作时把"交叉淡入半途的第三个 action"一并淡出（拖拽打断待机轮换）', () => {
+  const root = new THREE.Object3D();
+  const bone = new THREE.Object3D();
+  bone.name = 'Bip001_Spine';
+  root.add(bone);
+  const make = (name: string) =>
+    new THREE.AnimationClip(name, 1, [
+      new THREE.NumberKeyframeTrack(`${bone.name}.position[y]`, [0, 1], [0, 1]),
+    ]);
+  const animations = createModelAnimations(root, [
+    make('CH0335_Cafe_Idle'),
+    make('CH0335_Formation_Idle'),
+    make('CH0335_Formation_Pickup'),
+  ]);
+
+  // 基础 idle 在播 → 待机轮换开始 0.2s 淡入 alt1；只走 0.1s，停在半途
+  assert.equal(animations.play('idle', 0), true);
+  assert.equal(animations.playRole('idle.alt1', 0.2, 'idle'), true);
+  animations.update(0.1);
+  const mid = animations.actions().find((action) => action.name === 'CH0335_Cafe_Idle');
+  assert.ok((mid?.weight ?? 0) > 0.3, `半途应有残留权重：${String(mid?.weight)}`);
+
+  // 此时拖拽接管：crossFade 只认 currentAction（alt1），旧实现会把 Cafe_Idle 留在 0.5
+  assert.equal(animations.playRole('held', 0.2, 'held'), true);
+  for (let i = 0; i < 8; i += 1) animations.update(0.05);
+  const stale = animations.actions().find((action) => action.name === 'CH0335_Cafe_Idle');
+  assert.ok((stale?.weight ?? 0) < 0.1, `残留的 Cafe_Idle 必须被淡出：${String(stale?.weight)}`);
+  assert.equal(animations.current().name, 'CH0335_Formation_Pickup');
+});
+
 test('playOnce：片段缺失时返回 false（调用方走程序化降级）', () => {
   const root = new THREE.Object3D();
   const animations = createModelAnimations(root, [
@@ -134,7 +165,7 @@ test('playOnce：片段缺失时返回 false（调用方走程序化降级）', 
   assert.equal(animations.roles.greet.name, null);
 });
 
-test('语义角色同样按窗口裁剪：坐姿的停帧片段只保留 14.5–14.7s（ADR 0044 D1）', () => {
+test('语义角色同样按窗口裁剪：坐姿保留 14.2–16.2s（ADR 0051 两段式）', () => {
   const root = new THREE.Object3D();
   const bone = new THREE.Object3D();
   bone.name = 'Bip001_Pelvis';
@@ -155,9 +186,9 @@ test('语义角色同样按窗口裁剪：坐姿的停帧片段只保留 14.5–
   // 停帧播放（`playHold`）：与运行时同一条路径
   assert.equal(animations.playHold('sit', 0), true);
   const current = animations.current();
-  // 名字带裁剪后缀、时长 = 14.7-14.5 = 0.2s（旧实现会把 20s 整段绑上去）
-  assert.ok(current.name?.includes('@14.5-14.7s'), `name=${String(current.name)}`);
-  assert.ok(Math.abs((animations.roles.sit.name ? 0.2 : 0) - 0.2) < 1e-9);
+  // 名字带裁剪后缀、时长 = 16.2-14.2 = 2.0s（旧实现会把 20s 整段绑上去）
+  assert.ok(current.name?.includes('@14.2-16.2s'), `name=${String(current.name)}`);
+  assert.ok(Math.abs((animations.roles.sit.name ? 2.0 : 0) - 2.0) < 1e-9);
   // 坐姿片段的权重是"坐姿混合权重"的来源（ADR 0043 D3）
   assert.ok(animations.roleWeight('sit') > 0.99, `weight=${animations.roleWeight('sit')}`);
   // 没在跑的角色必须是 0（three 未播放 action 的默认权重是 1，不能直接读）

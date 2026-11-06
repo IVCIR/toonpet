@@ -11,8 +11,9 @@
  * 1. **呼吸**：单根 3.6s 正弦，脊柱/颈 ±0.006rad、整体高低 ≤1px；
  * 2. **肩膀呼吸**（ADR 0045 D2.3）：锁骨 ±0.02rad、上臂同幅且相位略领先 ——
  *    停帧后肩线完全不动会让上半身像块板子；
- * 3. **自主张望**（ADR 0045 D2.2）：每 2.2–4.2s 换一个目标，用 **easeInOutCubic**
- *    在 220–420ms 内干脆地转过去；俯仰**偏向抬头**（负 pitch），因为片段自带低头；
+ * 3. **自主张望**（ADR 0045 D2.2 → ADR 0049 D6 放缓）：每 5–9s 换一个目标，
+ *    用 **easeInOutCubic** 在 800–1200ms 内慵懒地转过去；到位后至少静止 2s
+ *    （`SIT_GAZE_STILL_MIN_MS`）。俯仰**偏向抬头**（负 pitch），因为片段自带低头；
  * 4. **悬空晃腿**（ADR 0045 D3）：±0.17rad、2.6rad/s，包络 `lift^0.66/0.82`
  *    （顶部变平 → 抬到位停一下再放下），左右**速度/幅度/包络幂次都不同**
  *    （左腿快 5%、高 11%），小腿带 0.32rad 的跟随滞后 —— 不再像节拍器。
@@ -31,10 +32,14 @@ import {
   SIT_BREATH_SPINE_RAD,
   SIT_GAZE_DOWN_MAX_RAD,
   SIT_GAZE_EYE_EXTRA,
+  SIT_GAZE_CAMERA_CHANCE,
+  SIT_GAZE_CAMERA_PITCH_RAD,
+  SIT_GAZE_CAMERA_YAW_RAD,
   SIT_GAZE_HOLD_MAX_MS,
   SIT_GAZE_HOLD_MIN_MS,
   SIT_GAZE_MOVE_MAX_MS,
   SIT_GAZE_MOVE_MIN_MS,
+  SIT_GAZE_STILL_MIN_MS,
   SIT_GAZE_UP_CHANCE,
   SIT_GAZE_UP_MAX_RAD,
   SIT_GAZE_UP_MIN_RAD,
@@ -71,6 +76,8 @@ export interface SitMotionFrame {
   /** 当前张望目标（rad，诊断用） */
   targetYaw: number;
   targetPitch: number;
+  /** 本次目标类型：`camera` = 看屏幕中心（ADR 0051），`wander` = 随机张望 */
+  targetKind: 'camera' | 'wander';
   /** 眼球相对头部的额外量（rad，ADR 0046 D1：眼球基底已被重置为绑定姿态） */
   eyeYaw: number;
   eyePitch: number;
@@ -104,6 +111,11 @@ export interface SitMotion {
   frame(): SitMotionFrame | null;
   /** 重置（重新落座时调用：相位归零、包络从 0 开始） */
   reset(nowMs: number): void;
+  /**
+   * 内部（ADR 0051，自检取证）：立刻把张望目标切到 `camera` / `wander`。
+   * 生产路径不调用；用完后下一次自然抽签仍按 1/3 概率。
+   */
+  forceGaze(kind: 'camera' | 'wander', nowMs: number): void;
 }
 
 function clamp01(value: number): number {
@@ -220,6 +232,7 @@ export function createSitMotion(options: SitMotionOptions = {}): SitMotion {
   let gazePitch = 0;
   let targetYaw = 0;
   let targetPitch = 0;
+  let targetKind: 'camera' | 'wander' = 'wander';
   /** 本次转头从哪出发（easeInOutCubic 的起点） */
   let gazeFromYaw = 0;
   let gazeFromPitch = 0;
@@ -244,23 +257,46 @@ export function createSitMotion(options: SitMotionOptions = {}): SitMotion {
    * 2. **固定时长的 easeInOutCubic**：`SIT_GAZE_MOVE_MIN/MAX_MS` 内走完，不用指数阻尼；
    * 3. **到达之后再开始计时**下一轮（hold 从 `now + moveMs` 起算），不会"还没转过去就换目标"。
    */
-  function pickGazeTarget(nowMs: number): void {
+  function pickGazeTarget(nowMs: number, forced?: 'camera' | 'wander'): void {
     gazeFromYaw = gazeYaw;
     gazeFromPitch = gazePitch;
-    targetYaw = (sampleUnit(random) * 2 - 1) * SIT_GAZE_YAW_RAD;
-    if (sampleUnit(random) < SIT_GAZE_UP_CHANCE) {
-      // 抬头：负 pitch（与 `BoneArbiter` 的"正 = 低头"同口径）
-      targetPitch = -(
-        SIT_GAZE_UP_MIN_RAD +
-        sampleUnit(random) * (SIT_GAZE_UP_MAX_RAD - SIT_GAZE_UP_MIN_RAD)
-      );
+    /**
+     * ADR 0051：**1/3 概率看镜头**。
+     *
+     * 先抽"是不是看镜头"，是就跳过左右/上下的随机量 —— 目标就是屏幕中心
+     * （yaw=0 / pitch=0），不再叠偏移。这样"看镜头"是一等目标，不是从随机范围里
+     * 碰巧落回 0。
+     */
+    const kind: 'camera' | 'wander' =
+      forced ?? (sampleUnit(random) < SIT_GAZE_CAMERA_CHANCE ? 'camera' : 'wander');
+    targetKind = kind;
+    if (kind === 'camera') {
+      targetYaw = SIT_GAZE_CAMERA_YAW_RAD;
+      targetPitch = SIT_GAZE_CAMERA_PITCH_RAD;
     } else {
-      targetPitch = sampleUnit(random) * SIT_GAZE_DOWN_MAX_RAD;
+      targetYaw = (sampleUnit(random) * 2 - 1) * SIT_GAZE_YAW_RAD;
+      if (sampleUnit(random) < SIT_GAZE_UP_CHANCE) {
+        // 抬头：负 pitch（与 `BoneArbiter` 的"正 = 低头"同口径）
+        targetPitch = -(
+          SIT_GAZE_UP_MIN_RAD +
+          sampleUnit(random) * (SIT_GAZE_UP_MAX_RAD - SIT_GAZE_UP_MIN_RAD)
+        );
+      } else {
+        targetPitch = sampleUnit(random) * SIT_GAZE_DOWN_MAX_RAD;
+      }
     }
     gazeMoveStartedAt = nowMs;
     gazeMoveMs = randomIn({ min: SIT_GAZE_MOVE_MIN_MS, max: SIT_GAZE_MOVE_MAX_MS }, random);
-    nextGazeAt =
-      nowMs + gazeMoveMs + randomIn({ min: SIT_GAZE_HOLD_MIN_MS, max: SIT_GAZE_HOLD_MAX_MS }, random);
+    /**
+     * 到位之后再"完全静止"一段时间（真机问题三：像雷达扫描）。
+     * 需求要求至少 2s；这里取 `max(STILL_MIN, 本次 hold)`，所以把 hold 调小也破不了下限。
+     * `nextGazeAt` 从**开始转**算起：转完 `gazeMoveMs` 之后才开始计静止时间。
+     */
+    const hold = randomIn(
+      { min: SIT_GAZE_HOLD_MIN_MS, max: SIT_GAZE_HOLD_MAX_MS },
+      random,
+    );
+    nextGazeAt = nowMs + gazeMoveMs + Math.max(SIT_GAZE_STILL_MIN_MS, hold);
   }
 
   /** 按 easeInOutCubic 把当前视线推到目标（每次 update 调用一次）。 */
@@ -290,6 +326,7 @@ export function createSitMotion(options: SitMotionOptions = {}): SitMotion {
       gazePitch: gazePitch * gain,
       targetYaw,
       targetPitch,
+      targetKind,
       eyeYaw: gazeYaw * SIT_GAZE_EYE_EXTRA * gain,
       eyePitch: gazePitch * SIT_GAZE_EYE_EXTRA * gain,
       legGain,
@@ -338,6 +375,14 @@ export function createSitMotion(options: SitMotionOptions = {}): SitMotion {
       return lastFrame;
     },
 
+    forceGaze(kind: 'camera' | 'wander', nowMs: number): void {
+      ensureStarted(nowMs);
+      gazeStarted = true;
+      pickGazeTarget(nowMs, kind);
+      // 立刻刷新一帧，否则诊断读到的还是强制前的 lastFrame（自检会误判）
+      lastFrame = buildFrame(nowMs);
+    },
+
     reset(nowMs: number): void {
       startedAt = nowMs;
       lastUpdateAt = Number.NaN;
@@ -348,6 +393,7 @@ export function createSitMotion(options: SitMotionOptions = {}): SitMotion {
       gazePitch = 0;
       targetYaw = 0;
       targetPitch = 0;
+      targetKind = 'wander';
       gazeFromYaw = 0;
       gazeFromPitch = 0;
       gazeMoveStartedAt = nowMs;
