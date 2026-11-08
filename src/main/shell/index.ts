@@ -10,12 +10,14 @@
  * - 资产协议注册：`pet-asset:` 只读两路由（ADR 0009 D1）。
  */
 import { app, globalShortcut, ipcMain, screen } from 'electron';
-import type { BrowserWindow, IpcMainEvent } from 'electron';
+import type { BrowserWindow, IpcMainEvent, IpcMainInvokeEvent } from 'electron';
 import path from 'node:path';
 import {
   SNAP_RELEASE_FALL_MIN_PX,
   SNAP_RELEASE_FALL_VY_PX_PER_SEC,
   TRAY_STATS_REFRESH_MS,
+  VISION_HOTKEY_DEFAULT,
+  VISION_HOTKEY_FALLBACK,
   WINDOW_HEIGHT_PX,
   WINDOW_WIDTH_PX,
 } from '../../shared/constants';
@@ -27,6 +29,13 @@ import { intersectionArea } from '../../shared/geometry';
 import type { Rect } from '../../shared/geometry';
 import { IPC_CHANNELS } from '../../shared/ipc';
 import type { PointerFact, ProbeResponse, WalkCommand } from '../../shared/ipc';
+import type {
+  VisionQueryRequest,
+  VisionResult,
+  VisionSource,
+} from '../../shared/vision';
+import { parseVisionQueryRequest } from '../../shared/vision';
+import type { CaptureOutcome } from '../vision/capture';
 import { logError, logInfo, logWarn } from '../log';
 import { appBus } from '../event-bus';
 import { noteModelReady } from '../model-ready';
@@ -48,17 +57,36 @@ import type { SnapController, SnapDiagnostics, SnapOutcome } from './snap';
 import {
   INPUT_HOTKEY_DEFAULT,
   INPUT_HOTKEY_FALLBACK,
+  PANEL_HOTKEY,
   registerInputHotkey,
 } from './hotkey';
 import type { HotkeyRegistration } from './hotkey';
 import type { InputBarBounds } from './input-bar-geometry';
 import { createInputWindow, loadInputBarRenderer, positionInputBar } from './input-window';
+import { createPanelController } from './panel';
+import type { PanelBackendLike, PanelController, PanelDiagnostics } from './panel';
 import { createShellTray } from './tray';
 import type { ShellTray, TrayDiagnostics } from './tray';
 import type { TrayStatsView } from './tray-menu';
 
 export interface ShellStartOptions {
   hotkey?: string;
+}
+
+/**
+ * `shell` 需要的最小视觉后端（ADR 0054 D6）。
+ *
+ * 与 `PanelBackendLike` 同一手法：只描述结构，**不 import runtime**，
+ * 这样"runtime 装配失败时热键与 IPC 仍能返回可读的失败结果"。
+ */
+export interface VisionBackendLike {
+  capture(source?: VisionSource): Promise<CaptureOutcome>;
+  recognize(
+    outcome: CaptureOutcome,
+    source: VisionSource,
+    prompt?: string,
+  ): Promise<VisionResult>;
+  query(request?: VisionQueryRequest): Promise<VisionResult>;
 }
 
 export interface ShellBounds {
@@ -119,6 +147,34 @@ export interface ShellModule {
    * 只用于落地冲击分级截图（ADR 0035 D4），不暴露给渲染侧。
    */
   debugDropFromHeight(heightPx: number): boolean;
+  /**
+   * 内部（非契约，ADR 0052）：打开控制面板（与托盘"控制面板…"同一个入口）。
+   * 自检/截图脚本需要一条不依赖真实点击的路径（与 `openInputBar` 同理）。
+   */
+  openControlPanel(): boolean;
+  /** 内部诊断（非契约，ADR 0052）：面板窗口/当前值/配置文件/最近一次状态回报。 */
+  panelDiagnostics(): PanelDiagnostics | null;
+  /** 内部（非契约，ADR 0052）：面板 BrowserWindow 句柄，只给自检截图用。 */
+  getControlPanelWindow(): BrowserWindow | null;
+  /**
+   * 内部（非契约，ADR 0053）：注入面板的运行期后端（来自 `runtime.panel()`）。
+   *
+   * 由 `bootstrap` 在 runtime 就绪后调用——`shell` **不** import `runtime`，
+   * 这样"装配失败时面板仍然能打开看配置"这条降级路径才成立。
+   */
+  attachPanelBackend(provider: () => PanelBackendLike | null): void;
+  /**
+   * 内部（非契约，ADR 0054）：注入视觉后端（来自 `runtime.vision()`）。
+   * 与 `attachPanelBackend` 同一时机、同一理由：`shell` 不 import `runtime`。
+   */
+  attachVisionBackend(provider: () => VisionBackendLike | null): void;
+  /**
+   * 内部（非契约，ADR 0054）：触发一次视觉查询，与 Ctrl+Shift+V / `cmd:vision-query`
+   * 共用同一条路径（自检不能依赖真实按键）。`null` = 后端未装配。
+   */
+  queryVision(source?: VisionSource): Promise<VisionResult | null>;
+  /** 内部诊断（非契约）：视觉热键注册结果。 */
+  visionHotkeySnapshot(): HotkeyRegistration | null;
 }
 
 let mainWindow: BrowserWindow | null = null;
@@ -130,6 +186,16 @@ let shellTray: ShellTray | null = null;
 let snapController: SnapController | null = null;
 let snapReader: ForegroundWindowReader | null = null;
 let snapHotkeyRegistration: HotkeyRegistration | null = null;
+/** ADR 0052：控制面板热键 `Ctrl+Shift+P` 的注册结果 */
+let panelHotkeyRegistration: HotkeyRegistration | null = null;
+/** ADR 0052：控制面板控制器（懒创建窗口；面板可见时由 16ms 轮询器驱动状态推送） */
+let panelController: PanelController | null = null;
+/** ADR 0053：面板的运行期后端（bootstrap 注入），未注入时面板只读配置 */
+let panelBackendProvider: (() => PanelBackendLike | null) | null = null;
+/** ADR 0054：视觉后端（bootstrap 注入）与热键/ IPC 的注册结果 */
+let visionBackendProvider: (() => VisionBackendLike | null) | null = null;
+let visionHotkeyRegistration: HotkeyRegistration | null = null;
+let onVisionQuery: ((event: unknown, payload: unknown) => Promise<VisionResult>) | null = null;
 /** ADR 0032 D4：托盘诊断项的上次刷新时刻（`performance.now()` 时基，节流用） */
 let lastTrayStatsRefreshAt = Number.NEGATIVE_INFINITY;
 /** ADR 0032 D4：上一次同步给托盘的读数（用于"变了就立刻刷"） */
@@ -404,6 +470,10 @@ function createTray(): void {
       openInputBar: () => {
         openInputBar();
       },
+      // ADR 0052 D1：托盘项与双击托盘共用同一个入口（不复制逻辑）
+      openControlPanel: () => {
+        openControlPanel();
+      },
       // ADR 0028 D4：托盘项与 Ctrl+Shift+S 共用同一个入口（不复制逻辑）
       snapForeground: () => {
         const outcome = snapController?.snapNow() ?? null;
@@ -429,6 +499,10 @@ function createTray(): void {
     },
     // ADR 0032 D4：顶部两行用启动时的读数（多半是全零：orchestrator 还没跑过一拍）
     { firedCount: stats.firedCount, lastReason: stats.lastReason },
+    // ADR 0052 D1：双击托盘图标也能打开控制面板
+    () => {
+      openControlPanel();
+    },
   );
   lastTrayStatsRefreshAt = Number.NEGATIVE_INFINITY;
   lastTrayStats = { firedCount: stats.firedCount, lastReason: stats.lastReason };
@@ -436,6 +510,237 @@ function createTray(): void {
     firedCount: stats.firedCount,
     lastReason: stats.lastReason,
   });
+}
+
+// ---------------------------------------------------------------------------
+// 控制面板（ADR 0052）——窗口懒创建，关闭只收起；状态推送复用 16ms 轮询器
+// ---------------------------------------------------------------------------
+
+/**
+ * 建控制器（幂等）。窗口本身在第一次 `open()` 时才创建，所以启动开销只是一次
+ * `config.json` 的同步读取（几 KB）与两个 IPC 监听注册。
+ */
+function ensurePanelController(): PanelController | null {
+  if (panelController) return panelController;
+  try {
+    panelController = createPanelController({
+      appRoot: app.getAppPath(),
+      log: (level, message, data) => {
+        if (level === 'error') logError('panel', message, data);
+        else if (level === 'warn') logWarn('panel', message, data);
+        else logInfo('panel', message, data);
+      },
+      // §3.5 的单向命令：`cmd:tuning` 送到**主窗口渲染页**（不是面板）
+      sendTuning: (values, reason) => {
+        const delivered = appBus.sendCommand(IPC_CHANNELS.tuning, values);
+        logInfo('panel', '热更新参数下发', { reason, delivered, values });
+        return delivered;
+      },
+      requestRenderState: () => appBus.sendCommand(IPC_CHANNELS.statePoll, {}),
+      isMainRenderer: (sender) =>
+        Boolean(mainWindow && !mainWindow.isDestroyed() && sender === mainWindow.webContents),
+      // ADR 0053：AI/记忆那几条动作要走 runtime（换模型、换角色卡、读写 SQLite）
+      backend: () => panelBackendProvider?.() ?? null,
+    });
+  } catch (error) {
+    panelController = null;
+    logError('panel', '控制面板控制器创建失败（不影响桌宠本体）', { error: String(error) });
+  }
+  return panelController;
+}
+
+/**
+ * 面板热键（ADR 0052）：`Ctrl+Shift+P`（降级 `Ctrl+Alt+P`）。
+ * 与输入条/吸附热键同一套三级降级；失败不阻断启动（托盘项仍可用）。
+ */
+function registerPanelHotkey(): void {
+  panelHotkeyRegistration = registerInputHotkey(
+    {
+      register: (accelerator) =>
+        globalShortcut.register(accelerator, () => {
+          const controller = ensurePanelController();
+          if (!controller) {
+            logWarn('shell', '热键：控制面板控制器不可用');
+            return;
+          }
+          // 再按一次收起（toggle），与托盘"控制面板…"的"打开"语义并存
+          if (controller.isVisible()) {
+            controller.hide();
+            logInfo('shell', '热键：控制面板已收起', { accelerator });
+            return;
+          }
+          const ok = controller.open();
+          logInfo('shell', '热键：控制面板', { accelerator, ok });
+        }),
+      log: (level, message, data) => {
+        if (level === 'error') logError('shell', message, data);
+        else if (level === 'warn') logWarn('shell', message, data);
+        else logInfo('shell', message, data);
+      },
+    },
+    PANEL_HOTKEY.preferred,
+    PANEL_HOTKEY.fallback,
+  );
+  logInfo('shell', '面板热键状态', {
+    accelerator: panelHotkeyRegistration.accelerator,
+    fallbackUsed: panelHotkeyRegistration.fallbackUsed,
+    defaultFailed: panelHotkeyRegistration.defaultFailed,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 视觉/OCR（ADR 0054）：热键 + invoke 通道；截图/识别本体在 runtime.vision()
+// ---------------------------------------------------------------------------
+
+function visionFailure(
+  source: VisionSource,
+  reason: 'disabled' | 'busy' | 'unavailable' | 'timeout' | 'empty' | 'error',
+  detail: string,
+): VisionResult {
+  return {
+    ok: false,
+    source,
+    capturedFrom: null,
+    text: '',
+    chars: 0,
+    at: Date.now(),
+    durationMs: 0,
+    image: null,
+    model: '',
+    baseUrl: '',
+    reason,
+    detail,
+  };
+}
+
+/**
+ * 视觉热键（ADR 0054 D6.2）：`Ctrl+Shift+V`（降级 `Ctrl+Alt+V`）。
+ *
+ * 顺序刻意是"**先截图、再呼出输入条、最后 OCR**"：
+ * 输入条是置顶窗口，如果先呼出再截图，OCR 会把输入条自己拍进去；
+ * 反过来，等 OCR（最多 20s）才呼出输入条，用户会以为热键没反应。
+ */
+function registerVisionHotkey(): void {
+  visionHotkeyRegistration = registerInputHotkey(
+    {
+      register: (accelerator) =>
+        globalShortcut.register(accelerator, () => {
+          void runVisionHotkey(accelerator);
+        }),
+      log: (level, message, data) => {
+        if (level === 'error') logError('shell', message, data);
+        else if (level === 'warn') logWarn('shell', message, data);
+        else logInfo('shell', message, data);
+      },
+    },
+    VISION_HOTKEY_DEFAULT,
+    VISION_HOTKEY_FALLBACK,
+  );
+  logInfo('shell', '视觉热键状态', {
+    accelerator: visionHotkeyRegistration.accelerator,
+    fallbackUsed: visionHotkeyRegistration.fallbackUsed,
+    defaultFailed: visionHotkeyRegistration.defaultFailed,
+  });
+}
+
+async function runVisionHotkey(accelerator: string): Promise<void> {
+  const backend = visionBackendProvider?.() ?? null;
+  if (!backend) {
+    logWarn('shell', '视觉热键：视觉后端未装配（runtime 还没就绪）');
+    return;
+  }
+  let captured: CaptureOutcome;
+  try {
+    captured = await backend.capture();
+  } catch (error) {
+    logWarn('shell', '视觉热键：截图抛错（仍然呼出输入条，按纯文本对话）', {
+      error: String(error),
+    });
+    openInputBar();
+    return;
+  }
+
+  // 截图已经完成：现在呼出输入条不会进入画面
+  const opened = openInputBar();
+  if (!captured.ok) {
+    logWarn('shell', '视觉热键：截图失败（仍可纯文本对话）', {
+      accelerator,
+      reason: captured.reason,
+      detail: captured.detail,
+      inputBarOpened: opened,
+    });
+    return;
+  }
+  logInfo('shell', '视觉热键：截图完成，OCR 在后台继续', {
+    accelerator,
+    source: captured.capturedFrom,
+    imageBytes: captured.png.length,
+    imageSize: { width: captured.width, height: captured.height },
+    inputBarOpened: opened,
+  });
+
+  const result = await backend.recognize(captured, captured.capturedFrom);
+  if (result.ok) {
+    logInfo('shell', '视觉热键：OCR 完成，下一轮对话会带上画面文字', {
+      chars: result.chars,
+      source: result.capturedFrom,
+      durationMs: result.durationMs,
+    });
+  } else {
+    logWarn('shell', '视觉热键：OCR 失败（按无视觉上下文降级）', {
+      reason: result.reason,
+      detail: result.detail,
+      durationMs: result.durationMs,
+    });
+  }
+}
+
+/** `cmd:vision-query`（invoke/应答）。只接受角色页与面板两个 sender（ADR 0054 D6.1）。 */
+function registerVisionIpc(): void {
+  if (onVisionQuery) return;
+  onVisionQuery = async (event: unknown, payload: unknown): Promise<VisionResult> => {
+    const sender = (event as IpcMainInvokeEvent).sender;
+    const fromMain = Boolean(
+      mainWindow && !mainWindow.isDestroyed() && sender === mainWindow.webContents,
+    );
+    const panelWindow = panelController?.window() ?? null;
+    const fromPanel = Boolean(
+      panelWindow && !panelWindow.isDestroyed() && sender === panelWindow.webContents,
+    );
+    const request = parseVisionQueryRequest(payload);
+    const source = request.source ?? 'foreground';
+    if (!fromMain && !fromPanel) {
+      logWarn('shell', 'cmd:vision-query 来自未知页面，已拒绝');
+      return visionFailure(source, 'unavailable', '发送方不是角色渲染页或控制面板');
+    }
+    const backend = visionBackendProvider?.() ?? null;
+    if (!backend) {
+      return visionFailure(source, 'unavailable', '视觉后端未装配');
+    }
+    try {
+      return await backend.query(request);
+    } catch (error) {
+      logWarn('shell', 'cmd:vision-query 执行失败（不抛给渲染页）', { error: String(error) });
+      return visionFailure(source, 'error', String(error));
+    }
+  };
+  ipcMain.handle(IPC_CHANNELS.visionQuery, onVisionQuery);
+}
+
+function unregisterVisionIpc(): void {
+  if (!onVisionQuery) return;
+  ipcMain.removeHandler(IPC_CHANNELS.visionQuery);
+  onVisionQuery = null;
+}
+
+
+/** 打开控制面板（托盘菜单 / 双击托盘 / 自检脚本共用）。 */
+function openControlPanel(): boolean {
+  const controller = ensurePanelController();
+  if (!controller) return false;
+  const ok = controller.open();
+  if (!ok) logWarn('shell', '控制面板打开失败（窗口创建或装载失败）');
+  return ok;
 }
 
 /**
@@ -756,6 +1061,8 @@ function startPointerPoller(window: BrowserWindow): void {
       snap.tick(now);
       // ADR 0032 D4：托盘只读诊断也挂在这同一个定时器上（内部节流，不新开定时器）
       refreshTrayStats(now);
+      // ADR 0052 D4：面板可见时 4Hz 拉一次渲染侧快照 + 推给面板（内部节流）
+      panelController?.tick(now);
     },
     isSettling: () => motion.settling,
     logInfo: (message, data) => logInfo('shell', message, data),
@@ -968,6 +1275,17 @@ export const shell: ShellModule = {
       });
     }
 
+    // ADR 0052：控制面板控制器（懒建窗口）。放在渲染页装载之后，
+    // 这样 `config.json` 里的覆盖值可以立刻推给角色页，用户看到的第一个坐姿就是标定值。
+    const panel = ensurePanelController();
+    if (panel) {
+      panel.syncToRenderer('startup');
+      // 托盘"重新加载桌宠"会重启渲染进程：页面重新装载后必须把值再推一次
+      window.webContents.on('did-finish-load', () => {
+        panel.syncToRenderer('renderer-reload');
+      });
+    }
+
     // 托盘：启动时创建（ADR 0018 D3）。创建失败只记 WARN，热键与桌宠本体继续可用。
     createTray();
 
@@ -984,10 +1302,19 @@ export const shell: ShellModule = {
     if (snapController?.diagnostics().enabled) registerSnapHotkey();
     else logInfo('shell', '吸附已由 PET_SNAP_DISABLE 关闭：热键与托盘项都不生效');
 
+    // ADR 0052：面板热键与其它热键各自独立降级。
+    registerPanelHotkey();
+
+    // ADR 0054：视觉热键与 invoke 通道；与其它热键各自独立降级
+    registerVisionHotkey();
+    registerVisionIpc();
+
     logInfo('shell', `start 完成 hotkey=${hotkeyRegistration?.accelerator ?? '(未注册)'}`, {
       contentSize: { width: size.width, height: size.height },
       hotkeyFallbackUsed: hotkeyRegistration?.fallbackUsed ?? null,
       snapHotkey: snapHotkeyRegistration?.accelerator ?? null,
+      panelHotkey: panelHotkeyRegistration?.accelerator ?? null,
+      visionHotkey: visionHotkeyRegistration?.accelerator ?? null,
       requestedHotkey: opts.hotkey ?? null,
     });
   },
@@ -999,6 +1326,9 @@ export const shell: ShellModule = {
     lastTrayStats = null;
     lastTrayStatsRefreshAt = Number.NEGATIVE_INFINITY;
     stopPointerPoller();
+    // ADR 0052：面板窗口与两个 IPC 监听也随之释放（否则下次 start 会重复注册）
+    panelController?.dispose();
+    panelController = null;
 
     if (hotkeyRegistration?.accelerator) {
       try {
@@ -1016,7 +1346,26 @@ export const shell: ShellModule = {
         logWarn('shell', '吸附热键注销失败（继续清理）', { error: String(error) });
       }
     }
+    if (panelHotkeyRegistration?.accelerator) {
+      try {
+        globalShortcut.unregister(panelHotkeyRegistration.accelerator);
+      } catch (error) {
+        logWarn('shell', '面板热键注销失败（继续清理）', { error: String(error) });
+      }
+    }
+    panelHotkeyRegistration = null;
     snapHotkeyRegistration = null;
+
+    // ADR 0054：视觉热键与 invoke 通道
+    unregisterVisionIpc();
+    if (visionHotkeyRegistration?.accelerator) {
+      try {
+        globalShortcut.unregister(visionHotkeyRegistration.accelerator);
+      } catch (error) {
+        logWarn('shell', '视觉热键注销失败（继续清理）', { error: String(error) });
+      }
+    }
+    visionHotkeyRegistration = null;
 
     const bar = inputWindow;
     inputWindow = null;
@@ -1074,6 +1423,40 @@ export const shell: ShellModule = {
   getInputBarWindow(): BrowserWindow | null {
     const window = inputWindow;
     return window && !window.isDestroyed() ? window : null;
+  },
+
+  openControlPanel(): boolean {
+    return openControlPanel();
+  },
+
+  panelDiagnostics(): PanelDiagnostics | null {
+    return panelController?.diagnostics() ?? null;
+  },
+
+  getControlPanelWindow(): BrowserWindow | null {
+    return panelController?.window() ?? null;
+  },
+
+  attachPanelBackend(provider: () => PanelBackendLike | null): void {
+    panelBackendProvider = provider;
+    // 控制器可能已经创建（用户在 runtime 就绪前点开了面板）：它的 backend 是闭包，
+    // 读的是上面的 `panelBackendProvider`，所以这里只需要记下 provider。
+    logInfo('shell', '面板运行期后端已注入（ADR 0053：AI/记忆动作可用）');
+  },
+
+  attachVisionBackend(provider: () => VisionBackendLike | null): void {
+    visionBackendProvider = provider;
+    logInfo('shell', '视觉运行期后端已注入（ADR 0054：热键与 cmd:vision-query 可用）');
+  },
+
+  async queryVision(source?: VisionSource): Promise<VisionResult | null> {
+    const backend = visionBackendProvider?.() ?? null;
+    if (!backend) return null;
+    return backend.query(source === undefined ? {} : { source });
+  },
+
+  visionHotkeySnapshot(): HotkeyRegistration | null {
+    return visionHotkeyRegistration;
   },
 
   snapToForeground(): SnapOutcome | null {

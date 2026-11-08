@@ -27,11 +27,13 @@ import {
   MEMORY_RETRIEVE_LIMIT,
   PROACTIVE_LLM_TIMEOUT_MS,
   PROACTIVE_TICK_MS,
+  VISION_CONTEXT_TTL_MS,
 } from '../../shared/constants';
 import type { UserUtterancePayload } from '../../shared/events';
 import { IPC_CHANNELS } from '../../shared/ipc';
 import type { MemoryFact, MemoryPort } from '../../shared/memory-types';
 import type { OrchestratorState, Reply } from '../../shared/types';
+import type { VisionContext } from '../../shared/vision';
 import type { PresencePort, PresenceSnapshot, WorldFacts } from '../../shared/world-types';
 import type { EventBus } from '../event-bus';
 import { publishProactiveStats } from '../proactive-stats';
@@ -74,6 +76,11 @@ export interface OrchestratorDeps {
    * 因此现有单测（不传该字段）行为与 1.9.0 完全一致。
    */
   proactive?: ProactiveOptions;
+  /**
+   * 视觉上下文保鲜期（ADR 0054 D4）。缺省 `VISION_CONTEXT_TTL_MS`；
+   * 装配层会把 `config.vision.contextTtlMs` 传进来，让"什么时候丢弃"只有一处配置。
+   */
+  visionTtlMs?: number;
   now?: () => number;
   /** 自检/测试可注入确定性 replyId */
   newReplyId?: (utteranceId: string) => string;
@@ -112,6 +119,27 @@ export interface Orchestrator {
   cancel(): void;
   /** 内部：`head_patted` 事件入口（事件也是 §9.1 的规则条件；说话/思考时不打断） */
   handleHeadPatted(patCount: number): void;
+  /**
+   * ADR 0053（内部，不跨进程）：换掉本地 LLM 客户端（控制面板切换模型）。
+   *
+   * 为什么必须走这里而不是让 `runtime` 自己换：健康检查与熔断状态在编排层。
+   * 换客户端时**同时清零** `llmHealthChecked` / `llmDisabled` —— 用户显式选了别的模型，
+   * §11 的"一次失败即本会话熔断"必须对新模型重新开始，否则换个坏模型会连带把好模型也判死。
+   * 在途请求不打断（它属于旧模型，`respond` 用捕获的 `llm` 引用完成即可）。
+   */
+  replaceLlm(client: LlmClient, reason: string): void;
+  /**
+   * ADR 0053（内部，不跨进程）：换掉内存里的角色卡（控制面板保存角色卡后）。
+   * 只影响**下一次** `buildPrompt`：在途请求不重发，历史轮次不清空。
+   */
+  replaceCard(card: string, reason: string): void;
+  /**
+   * ADR 0054（内部，不跨进程）：把一次成功的 OCR 结果放进"下一轮专用"的视觉上下文。
+   *
+   * 语义是**一次性**的：`respond()` 的 LLM 路径消费后立即清空（段 3.6 只跟着那一轮话语），
+   * 过期（`visionTtlMs`）也会丢弃。`null` = 显式清空（截屏失败/停止时用）。
+   */
+  replaceVision(context: VisionContext | null, reason: string): void;
   /** 内部诊断（不进 RenderState） */
   snapshot(): OrchestratorSnapshot;
   dispose(): void;
@@ -123,6 +151,8 @@ export interface OrchestratorSnapshot {
   llmDisabled: boolean;
   llmHealthChecked: boolean;
   llmModel: string;
+  /** ADR 0053：当前注入 system 段的角色卡字符数（面板保存后应立刻变化） */
+  cardChars: number;
   historyTurns: number;
   voiceBusy: boolean;
   lastPatAt: number | null;
@@ -136,6 +166,12 @@ export interface OrchestratorSnapshot {
   lastInteractionAt: number | null;
   /** 段 3.5 是否会带"输入状态"：false = presence 读不到空闲毫秒 */
   presenceIdleKnown: boolean;
+  /** ADR 0054：是否有一份尚未消费、且未过期的视觉上下文 */
+  visionAvailable: boolean;
+  /** 当前视觉上下文的字符数（0 = 没有） */
+  visionChars: number;
+  /** 视觉上下文的截图时刻（epoch ms） */
+  visionAt: number | null;
 }
 
 interface UtteranceSession {
@@ -169,10 +205,16 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
   let session: UtteranceSession | null = null;
   let llmHealthChecked = false;
   let llmDisabled = false;
+  // ADR 0053：角色卡与 LLM 客户端都可被控制面板替换（见 replaceCard / replaceLlm）
+  let card = deps.card;
+  let llm = deps.llm;
   let history: HistoryTurn[] = [];
   let replySeq = 0;
   let voiceBusy = false;
   let lastPatAt: number | null = null;
+  // ADR 0054：下一轮 LLM 专用的视觉上下文；消费即清空
+  let vision: VisionContext | null = null;
+  const visionTtlMs = deps.visionTtlMs ?? VISION_CONTEXT_TTL_MS;
 
   // --- ADR 0031：主动性的全部状态（都在内存里，重启归零） ---
   /** 本进程启动时刻：本会话还没有任何交互时，idle-drive 用它当 gap 的基准 */
@@ -204,6 +246,35 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
       presence: deps.presence?.getSnapshot() ?? null,
       lastInteractionAt,
     });
+  }
+
+  /**
+   * 取走视觉上下文（ADR 0054 D4.2）：一次性 + 过期即弃。
+   *
+   * 只在 `respond()` 真正要发 LLM 请求时调用：
+   * - 规则命中 / 健康检查失败 / 用户取消 → 不消费，留给下一次尝试；
+   * - 主动路径（idle-drive）不调用 —— 她主动开口不该"顺便看一眼老师的屏幕"。
+   */
+  function takeVision(at: number): VisionContext | null {
+    if (!vision) return null;
+    const ageMs = at - vision.at;
+    if (ageMs > visionTtlMs) {
+      log('info', '视觉上下文已过期，丢弃（ADR 0054 D4）', {
+        ageMs,
+        ttlMs: visionTtlMs,
+        chars: vision.chars,
+      });
+      vision = null;
+      return null;
+    }
+    const taken = vision;
+    vision = null;
+    log('info', '视觉上下文已消费（一次性，ADR 0054 D4）', {
+      ageMs,
+      chars: taken.chars,
+      source: taken.source,
+    });
+    return taken;
   }
 
   // 用 voice 的事实事件跟踪"是否在播"，让摸头不打断语音（§5.3）；不新增接口
@@ -326,14 +397,14 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
     if (llmDisabled) return { ok: false, detail: '本会话已熔断' };
     if (llmHealthChecked) return { ok: true };
     llmHealthChecked = true;
-    const health = await deps.llm.health();
+    const health = await llm.health();
     if (!health.ok) {
       llmDisabled = true;
       log('warn', '本地 LLM 不可用，本会话不再探测 ②（§11）', {
         reason: health.reason,
         detail: health.detail,
         models: health.models ?? null,
-        model: deps.llm.model,
+        model: llm.model,
       });
       return { ok: false, detail: health.detail ?? health.reason };
     }
@@ -388,7 +459,7 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         return fromFallback(deps.rules.fallback(), current, replyId, input.utteranceId, text);
       }
 
-      const remaining = deps.llm.requestTimeoutMs - (now() - startedAt);
+      const remaining = llm.requestTimeoutMs - (now() - startedAt);
       if (remaining <= 100) {
         emitLlmFailed(replyId, 'timeout', 'thinking 预算已被健康检查耗尽');
         return fromFallback(deps.rules.fallback(), current, replyId, input.utteranceId, text);
@@ -396,25 +467,32 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
 
       const facts = retrieveMemory(text);
       const memory = formatMemoryFacts(facts, MEMORY_RETRIEVE_LIMIT, now());
+      const promptNow = now();
+      const visionContext = takeVision(promptNow);
       const messages = buildPrompt({
-        card: deps.card,
+        card,
         memory,
         history,
         userText: text,
         // ADR 0030 D2：段 3.5。presence 缺省时只有时间戳，仍然比 1.9.0 多一个"此刻"
-        world: buildWorld(now()),
+        world: buildWorld(promptNow),
+        // ADR 0054 D4：段 3.6。没有视觉上下文时一个字节都不加
+        vision: visionContext ?? undefined,
+        now: promptNow,
       });
       log('info', 'LLM 请求已装配', {
         replyId,
-        hasCard: deps.card.trim().length > 0,
-        cardChars: deps.card.length,
+        hasCard: card.trim().length > 0,
+        cardChars: card.length,
         memoryFacts: memory.length,
         historyTurns: history.length,
         systemChars: messages[0]?.content.length ?? 0,
         hasWorld: true,
+        hasVision: visionContext !== null,
+        visionChars: visionContext?.chars ?? 0,
       });
 
-      const result = await deps.llm.chat({
+      const result = await llm.chat({
         messages,
         timeoutMs: remaining,
         signal: current.controller.signal,
@@ -584,14 +662,14 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
     state = 'thinking';
     try {
       const messages = buildPrompt({
-        card: deps.card,
+        card,
         // 主动路径不检索记忆：没有用户查询词，硬造一个只会引入噪声（ADR 0031 D4.4）
         memory: [],
         history,
         userText: PROACTIVE_PROMPT_USER,
         world: buildWorld(at),
       });
-      const result = await deps.llm.chat({
+      const result = await llm.chat({
         messages,
         timeoutMs: PROACTIVE_LLM_TIMEOUT_MS,
         signal: current.controller.signal,
@@ -712,7 +790,8 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         inflightUtteranceId: session?.utteranceId ?? null,
         llmDisabled,
         llmHealthChecked,
-        llmModel: deps.llm.model,
+        llmModel: llm.model,
+        cardChars: card.length,
         historyTurns: history.length,
         voiceBusy,
         lastPatAt,
@@ -722,13 +801,41 @@ export function createOrchestrator(deps: OrchestratorDeps): Orchestrator {
         lastProactiveSkip,
         lastInteractionAt,
         presenceIdleKnown: (deps.presence?.getSnapshot().userIdleMs ?? null) !== null,
+        visionAvailable: vision !== null && now() - vision.at <= visionTtlMs,
+        visionChars: vision?.chars ?? 0,
+        visionAt: vision?.at ?? null,
       };
+    },
+
+    replaceLlm(client: LlmClient, reason: string): void {
+      const previous = llm.model;
+      llm = client;
+      // 换模型 = 重新开始一次"本会话健康检查"（§11 的熔断只属于同一个模型）
+      llmHealthChecked = false;
+      llmDisabled = false;
+      log('info', 'LLM 客户端已切换（ADR 0053/0055）', { from: previous, to: client.model, reason });
+    },
+
+    replaceCard(next: string, reason: string): void {
+      card = typeof next === 'string' ? next : '';
+      log('info', '角色卡已热更新（ADR 0053）', { reason, chars: card.length });
+    },
+
+    replaceVision(context: VisionContext | null, reason: string): void {
+      vision = context && context.text.trim() !== '' ? context : null;
+      log(vision ? 'info' : 'warn', vision ? '视觉上下文已就绪（ADR 0054）' : '视觉上下文已清空（ADR 0054）', {
+        reason,
+        chars: vision?.chars ?? 0,
+        source: vision?.source ?? null,
+        at: vision?.at ?? null,
+      });
     },
 
     dispose(): void {
       stopProactiveTimer();
       offStarted();
       offEnded();
+      vision = null;
       if (session) {
         session.cancelled = true;
         session.controller.abort();

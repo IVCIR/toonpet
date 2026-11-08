@@ -32,3 +32,9 @@ export interface MemoryPort {
   retrieve(query: string, limit?: number): MemoryFact[];
   write(event: MemoryWrite): void;
 }
+
+/**
+ * 管理视图的一行（ADR 0053，**不是** §7.5 的检索契约）：
+ * 面板"记忆管理"按时间倒序列出时用的形状，与 `MemoryFact` 同源但没有 `score`（不参与排序打分）。
+ */
+export type MemoryRecord = Omit<MemoryFact, 'score'>;

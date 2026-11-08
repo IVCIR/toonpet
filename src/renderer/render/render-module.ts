@@ -42,8 +42,6 @@ import {
   SIT_CLIP_START_SECONDS,
   SIT_GAZE_EYE_EXTRA,
   SIT_HEAD_TUNE_RAD,
-  SIT_PHASE_A_HEAD_TUNE_RAD,
-  SIT_SPINE_OVERLAY_WEIGHT,
   SIT_MICRO_FAR_HEAD_PITCH_RAD,
   SIT_MICRO_FAR_HEAD_YAW_RAD,
   SIT_MICRO_FAR_LEG_SCALE,
@@ -60,6 +58,8 @@ import { isIntent } from '../../shared/intents';
 import { cssToMask, grabBandAt, headBandBottomRow } from '../../shared/mask';
 import type { Bounds3 } from '../../shared/model-frame';
 import { DEFAULT_FRAME_EXCLUDE } from '../../shared/model-frame';
+import type { PanelRenderFacts } from '../../shared/panel';
+import type { TunableId, TunableValues } from '../../shared/tunable-params';
 import type { Emotion, Intent, RenderState } from '../../shared/types';
 import { createModelAnimations } from './animation-controller';
 import type { ActionStatus, AnimationSlot, ModelAnimations, OneShotStatus } from './animation-controller';
@@ -115,6 +115,8 @@ import { headTiltFromBind, headWorldPitch, headWorldYaw } from './sit-head';
 import { sitPose } from './sit-pose';
 import { startleDurationMs, startlePose } from './startle';
 import type { StartleReason } from './startle';
+import { createTunableStore } from './tunables-store';
+import type { TunableStore } from './tunables-store';
 import { ToonShading } from './toon-shading';
 import type { ToonShadingDiagnostics } from './toon-shading';
 import { OutlineSet } from './outline';
@@ -666,6 +668,22 @@ export interface RenderModule {
   forceIdleVariation(role: ClipRole | null): ClipRole | null;
   /** 内部（ADR 0050，自检压缩时序）：覆盖站姿轮换间隔（ms） */
   setIdleVariationInterval(minIntervalMs: number, maxIntervalMs: number): void;
+  /**
+   * 内部（ADR 0052 D3）：控制面板 → 渲染进程的热更新参数入口。
+   *
+   * 只改内存值（走与主进程同一套夹取），下一帧生效；非法 id / 非有限数被忽略。
+   * 返回真正变化的参数 id（空数组 = 没有任何变化，调用方不必记日志）。
+   */
+  applyTuning(patch: unknown): TunableId[];
+  /** 内部（ADR 0052 D3）：当前生效的一组可调参数（拷贝） */
+  tuningValues(): TunableValues;
+  /**
+   * 内部（ADR 0052 D4）：**只读、极轻**的面板状态快照（`cmd:state-report` 的载荷）。
+   *
+   * 不走 `getDiagnostics()`（单次约 300ms，含面部贴图摘要），只取
+   * `getState()` + 当前片段 + 坐姿/调参读数，供 4Hz 轮询。
+   */
+  panelSnapshot(): PanelRenderFacts;
 }
 
 export interface RenderModuleOptions {
@@ -842,6 +860,14 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
 
   /** 内部接口：掩膜采集（由 RenderBundle 持有，不属于 §7.3） */
   readonly maskCapture: MaskCapture;
+
+  /**
+   * ADR 0052 D3：运行期可调参数（控制面板滑块）。
+   *
+   * 启动时只有契约默认值；`applyTuning()` 由主进程的 `cmd:tuning` 驱动，
+   * 消费方每帧读它（坐姿补偿 3 处、视线 3 个刚度），所以热更新不需要重建任何东西。
+   */
+  private readonly tunables: TunableStore = createTunableStore();
 
   private readonly startedAt = performance.now();
   private frameHandle: number | null = null;
@@ -1067,7 +1093,14 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       for (const bone of Object.values(loaded.bones)) {
         if (bone) this.arbiter.register(bone);
       }
-      this.gaze = createGazeController(loaded.bones);
+      this.gaze = createGazeController(loaded.bones, {
+        // ADR 0052 D3：三级阻尼刚度每帧从可调参数表读，滑块一动下一帧生效
+        stiffness: () => ({
+          eye: this.tunables.get('gaze.eyeStiffness'),
+          head: this.tunables.get('gaze.headStiffness'),
+          spine: this.tunables.get('gaze.spineStiffness'),
+        }),
+      });
 
       void this.attachFacialChannel();
 
@@ -2196,7 +2229,7 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       { bone: bones.neck, target: idle?.neck ?? null },
       { bone: bones.head, target: idle?.head ?? null },
     ];
-    const spineWeight = Math.min(1, Math.max(0, SIT_SPINE_OVERLAY_WEIGHT));
+    const spineWeight = Math.min(1, Math.max(0, this.tunables.get('sit.spineOverlayWeight')));
     for (const { bone, target } of upper) {
       if (!bone) continue;
       if (!target) continue;
@@ -2289,7 +2322,7 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       sitPoseGain: Number(this.sitPoseGain.toFixed(3)),
       upperOverride: Number(this.sitUpperOverride.toFixed(3)),
       phaseAHeadAppliedRad: Number(this.sitPhaseAHeadApplied.toFixed(4)),
-      spineOverlayWeight: SIT_SPINE_OVERLAY_WEIGHT,
+      spineOverlayWeight: this.tunables.get('sit.spineOverlayWeight'),
       spineOverlayApplied: Number(this.sitSpineOverlay.toFixed(3)),
       headQuat,
       headWorld,
@@ -2405,6 +2438,55 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
   /** 内部（ADR 0050，自检压缩时序）：覆盖站姿轮换间隔（ms）；生产路径不调用。 */
   setIdleVariationInterval(minIntervalMs: number, maxIntervalMs: number): void {
     this.idleVariation.setIdleInterval(minIntervalMs, maxIntervalMs, performance.now());
+  }
+
+  /**
+   * 内部（ADR 0052 D3）：控制面板 → 渲染进程的热更新入口。
+   *
+   * 只改内存（`createTunableStore` 内部走与主进程同一套夹取），下一帧的
+   * `updateSitPose` / `gaze.update` 就会读到新值。不做 `reload`、不重建模型、不重播动画。
+   */
+  applyTuning(patch: unknown): TunableId[] {
+    const changed = this.tunables.apply(patch);
+    if (changed.length > 0) {
+      console.log('[render] 热更新参数已生效（ADR 0052）', this.tunables.values());
+    }
+    return changed;
+  }
+
+  /** 内部（ADR 0052 D3）：当前生效的一组可调参数（拷贝，外部改不到内部）。 */
+  tuningValues(): TunableValues {
+    return this.tunables.values();
+  }
+
+  /**
+   * 内部（ADR 0052 D4）：面板状态快照（`cmd:state-report` 的载荷）。
+   *
+   * 刻意**不**走 `getDiagnostics()`：那个单次约 300ms（含面部贴图摘要），
+   * 4Hz 轮询会直接把帧率打穿。这里只读几个字段，代价 O(1)。
+   */
+  panelSnapshot(): PanelRenderFacts {
+    const clip = this.animations?.current() ?? null;
+    const sitActive = this.sitPoseGain > 0.001;
+    return {
+      state: this.getState(),
+      clip: {
+        name: clip?.name ?? null,
+        slot: clip?.slot ?? null,
+        timeSeconds: clip ? Number(clip.time.toFixed(3)) : 0,
+        weight: clip ? Number(Math.min(1, Math.max(0, clip.weight)).toFixed(3)) : 0,
+      },
+      sit: sitActive
+        ? {
+            stage: this.sitStageBStartedAt === null ? 'a' : 'b',
+            sitPoseGain: Number(this.sitPoseGain.toFixed(3)),
+            phaseAHeadAppliedRad: Number(this.sitPhaseAHeadApplied.toFixed(4)),
+            spineOverlayApplied: Number(this.sitSpineOverlay.toFixed(3)),
+          }
+        : null,
+      tuning: this.tunables.values(),
+      collectedAt: Number(performance.now().toFixed(1)),
+    };
   }
 
   /**
@@ -3014,9 +3096,9 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
           sitDrop: Number(sitDrop.toFixed(3)),
           sitPoseGain: Number(this.sitPoseGain.toFixed(3)),
           upperOverride: Number(this.sitUpperOverride.toFixed(3)),
-          phaseAHeadTuneRad: SIT_PHASE_A_HEAD_TUNE_RAD,
+          phaseAHeadTuneRad: this.tunables.get('sit.phaseAHeadTuneRad'),
           phaseAHeadAppliedRad: Number(this.sitPhaseAHeadApplied.toFixed(4)),
-          spineOverlayWeight: SIT_SPINE_OVERLAY_WEIGHT,
+          spineOverlayWeight: this.tunables.get('sit.spineOverlayWeight'),
           spineOverlayApplied: Number(this.sitSpineOverlay.toFixed(3)),
           holdAtSeconds: SIT_CLIP_HOLD_SECONDS,
           holdTimeSeconds: held ? Number(held.time.toFixed(3)) : null,
@@ -3369,12 +3451,13 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
      * 阶段 B 时 `applySitMotion()` 的站立覆盖会接管头骨基底，二者相加过渡。
      */
     this.sitPhaseAHeadApplied =
-      SIT_PHASE_A_HEAD_TUNE_RAD * this.sitPoseGain * (1 - this.sitStageBGain);
+      this.tunables.get('sit.phaseAHeadTuneRad') * this.sitPoseGain * (1 - this.sitStageBGain);
     if (Math.abs(this.sitPhaseAHeadApplied) > 1e-6 && this.arbiter) {
       const head = this.model?.bones.head ?? null;
       if (head) this.arbiter.add(head, 0, this.sitPhaseAHeadApplied);
     }
-    this.sitSpineOverlay = this.sitUpperOverride * Math.min(1, Math.max(0, SIT_SPINE_OVERLAY_WEIGHT));
+    this.sitSpineOverlay =
+      this.sitUpperOverride * Math.min(1, Math.max(0, this.tunables.get('sit.spineOverlayWeight')));
     // ADR 0046 D3.1：微侧身 —— 身体先侧 0.15rad（按 sitPoseGain 淡入淡出），
     // 头部的基准在标定时已扣掉这个偏航，所以不会把侧身转回去。
     this.sitBodyYaw = SIT_BODY_YAW_RAD * this.sitPoseGain;

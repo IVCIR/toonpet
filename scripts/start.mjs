@@ -6,7 +6,7 @@
 //
 // stdio 用 inherit：不要用管道捕获 Electron 的输出，否则在没有命名管道权限的环境里会 EPERM。
 import { spawn } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -58,17 +58,53 @@ const extraArgs = process.argv
       arg !== '--selftest' &&
       arg !== '--selftest-fallback' &&
       arg !== '--selftest-speech' &&
-      arg !== '--selftest-input',
+      arg !== '--selftest-input' &&
+      arg !== '--selftest-vision' &&
+      arg !== '--panel-shot' &&
+      arg !== '--panel-opencode-shot',
   );
 const selftest = process.argv.includes('--selftest');
 const selftestFallback = process.argv.includes('--selftest-fallback');
 const selftestSpeech = process.argv.includes('--selftest-speech');
 const selftestInput = process.argv.includes('--selftest-input');
+const selftestVision = process.argv.includes('--selftest-vision');
+// ADR 0052 D7：控制面板取证（打开面板 → 拨滑块 → 验证渲染侧收到 → 截图 → 还原配置 → 退出）
+// ADR 0056：`--panel-opencode-shot` 是**手动诊断**：用真实 OpenCode Go `/models`（无 Key 公开清单）
+// 截一张"OpenCode Go 模型下拉"的图；默认的 `--panel-shot` 仍然只用 127.0.0.1 桩，不访问外网。
+const panelOpenCodeShot = process.argv.includes('--panel-opencode-shot');
+const panelShot = process.argv.includes('--panel-shot') || panelOpenCodeShot;
 
 const env = { ...process.env };
 delete env['ELECTRON_RUN_AS_NODE'];
 delete env['ELECTRON_NO_ATTACH_CONSOLE'];
-if (selftest || selftestFallback || selftestSpeech || selftestInput) env['PET_SELFTEST'] = '1';
+if (selftest || selftestFallback || selftestSpeech || selftestInput || selftestVision) env['PET_SELFTEST'] = '1';
+if (panelShot) {
+  // 面板取证**不**开 PET_SELFTEST：它需要真实运行时（真实输入/真实配置路径），
+  // 只是把配置指向 logs/selftest/panel-config.json，跑完由脚本自己还原/删除。
+  if (panelOpenCodeShot) env['PET_PANEL_OPENCODE_SHOT'] = '1';
+  else env['PET_PANEL_SHOT'] = '1';
+  if (env['PET_PANEL_CONFIG'] === undefined || env['PET_PANEL_CONFIG'] === '') {
+    env['PET_PANEL_CONFIG'] = path.join(process.cwd(), 'logs', 'selftest', 'panel-config.json');
+  }
+  // ADR 0053：角色卡也要隔离——取证会真的保存一次角色卡，不能写回用户真实人格文件。
+  // 脚本启动前把真实角色卡复制到隔离路径（见 panel-shot.ts），退出前删掉副本。
+  if (env['PET_CHARACTER_CARD'] === undefined || env['PET_CHARACTER_CARD'] === '') {
+    env['PET_CHARACTER_CARD'] = path.join(process.cwd(), 'logs', 'selftest', 'character-card.md');
+  }
+  // ADR 0053：记忆库也要隔离——取证会真的删一条、清空一次，绝不能动用户真实的 data/memory.db。
+  // 每次取证前清掉旧库（含 WAL/SHM），保证"列表里有几条"是脚本自己种的。
+  if (env['PET_MEMORY_DB'] === undefined || env['PET_MEMORY_DB'] === '') {
+    env['PET_MEMORY_DB'] = path.join(process.cwd(), 'logs', 'selftest', 'memory.db');
+    for (const suffix of ['', '-wal', '-shm']) {
+      const file = `${env['PET_MEMORY_DB']}${suffix}`;
+      try {
+        if (existsSync(file)) rmSync(file, { force: true });
+      } catch {
+        // 残留文件不影响结论：下次启动会再试
+      }
+    }
+  }
+}
 if (selftestFallback) {
   env['PET_SELFTEST_FALLBACK'] = '1';
   // 缺失模型验收：指向一个确定不存在的路径（可用显式环境变量覆盖以测别的坏路径）
@@ -78,6 +114,29 @@ if (selftestFallback) {
 }
 if (selftestSpeech) {
   env['PET_SELFTEST_SPEECH'] = '1';
+}
+
+if (selftestVision) {
+  // ADR 0054：视觉自检。OCR 端点用脚本内的本地桩（8003，真调 Windows OCR），
+  // LLM/TTS 与语音自检同一套桩（chat 桩会检查 system 段里有没有 OCR 文字）。
+  env['PET_SELFTEST_VISION'] = '1';
+  setDefault('PET_OCR_URL', 'http://127.0.0.1:8003/v1');
+  setDefault('PET_OCR_MODEL', 'win-ocr-stub');
+  setDefault('PET_OCR_TIMEOUT_MS', '20000');
+  setDefault('PET_VISION_SOURCE', 'screen');
+  // 自检屏幕是 3200×2000（200% 缩放）：缩到 1600 后 96px 字只剩 48px，
+  // Windows OCR 会把 "VISION" 拆错。放宽到契约上限 2560，保留更多笔画。
+  setDefault('PET_VISION_MAX_WIDTH', '2560');
+  setDefault('PET_TTS_URL', 'http://127.0.0.1:9881');
+  setDefault('PET_LLM_URL', 'http://127.0.0.1:11435');
+  setDefault('PET_LLM_MODEL', 'selftest-stub:1b');
+  setDefault('PET_TTS_PROMPT_TEXT', '参考音频：测试语音。');
+  if (env['PET_TTS_REF_AUDIO'] === undefined || env['PET_TTS_REF_AUDIO'] === '') {
+    const refPath = path.join(process.cwd(), 'logs', 'selftest-ref.wav');
+    mkdirSync(path.dirname(refPath), { recursive: true });
+    writeFileSync(refPath, silenceWav(300));
+    env['PET_TTS_REF_AUDIO'] = refPath;
+  }
 }
 
 /**
@@ -141,7 +200,7 @@ if (selftestSpeech) {
 
 // 自检不得污染真实记忆库（data/memory.db，ADR 0020）：改用 logs/selftest/memory.db，
 // 每次自检前清空，保证"行数 / 检索命中"类断言可复现。
-if (selftest || selftestFallback || selftestSpeech || selftestInput) {
+if (selftest || selftestFallback || selftestSpeech || selftestInput || selftestVision) {
   const memoryDir = path.join(process.cwd(), 'logs', 'selftest');
   try {
     rmSync(memoryDir, { recursive: true, force: true });
@@ -182,6 +241,22 @@ if (env['PET_CHROMIUM_NO_SANDBOX'] === '1') {
 }
 
 const args = ['.', ...extraArgs];
+
+// ADR 0053：取证用的角色卡副本从用户真实人格复制一份出来（没有真实文件就留空，
+// 由 runtime 的"最小身份行"降级——这本身也是一条要验的路径）。
+if (panelShot && env['PET_CHARACTER_CARD']) {
+  try {
+    const source = path.join(process.cwd(), 'data', 'character-card.md');
+    const target = path.resolve(env['PET_CHARACTER_CARD']);
+    if (existsSync(source)) {
+      mkdirSync(path.dirname(target), { recursive: true });
+      copyFileSync(source, target);
+    }
+  } catch (error) {
+    log('character-card-copy-failed', { error: String(error) });
+  }
+}
+
 log('launch', {
   electronPath,
   args,
@@ -190,9 +265,14 @@ log('launch', {
   env: {
     ELECTRON_RUN_AS_NODE: env['ELECTRON_RUN_AS_NODE'] ?? null,
     PET_SELFTEST: env['PET_SELFTEST'] ?? null,
+    PET_PANEL_SHOT: env['PET_PANEL_SHOT'] ?? null,
+    PET_PANEL_CONFIG: env['PET_PANEL_CONFIG'] ?? null,
     PET_SELFTEST_FALLBACK: env['PET_SELFTEST_FALLBACK'] ?? null,
     PET_SELFTEST_SPEECH: env['PET_SELFTEST_SPEECH'] ?? null,
     PET_SELFTEST_INPUT: env['PET_SELFTEST_INPUT'] ?? null,
+    PET_SELFTEST_VISION: env['PET_SELFTEST_VISION'] ?? null,
+    PET_OCR_URL: env['PET_OCR_URL'] ?? null,
+    PET_OCR_MODEL: env['PET_OCR_MODEL'] ?? null,
     PET_MODEL_PATH: env['PET_MODEL_PATH'] ?? null,
     PET_CHROMIUM_NO_SANDBOX: env['PET_CHROMIUM_NO_SANDBOX'] ?? null,
     PET_LLM_URL: env['PET_LLM_URL'] ?? null,

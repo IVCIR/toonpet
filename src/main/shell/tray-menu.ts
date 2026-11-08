@@ -15,6 +15,7 @@ import type { ProactiveSilenceReason } from '../proactive-stats';
 
 export type TrayActionId =
   | 'open-input-bar'
+  | 'open-control-panel'
   | 'snap-foreground'
   | 'release-snap'
   | 'reload-pet'
@@ -28,6 +29,8 @@ export type TrayItemId = TrayActionId | TrayStatId;
 export interface TrayActions {
   /** 呼出输入条：与全局热键共用同一个打开入口（ADR 0016 D4） */
   openInputBar(): void;
+  /** 打开控制面板（ADR 0052 D1）：独立窗口，关闭只收起不退出 */
+  openControlPanel(): void;
   /** 吸附到前台窗口的下/上边缘（与 Ctrl+Shift+S 同一个入口，ADR 0028 D4） */
   snapForeground(): void;
   /** 离开窗口边缘：解除吸附，回到站立（幂等） */
@@ -61,6 +64,8 @@ export interface TrayMenuItem {
 /** 动作项的顺序与标签是对外行为的一部分，测试与文档都以这张表为准。 */
 export const TRAY_MENU: ReadonlyArray<{ id: TrayActionId; label: string }> = [
   { id: 'open-input-bar', label: '呼出输入条' },
+  // ADR 0052 D1：控制面板是独立窗口，双击托盘 / 这里都能打开；关闭只收起
+  { id: 'open-control-panel', label: '控制面板…' },
   { id: 'snap-foreground', label: '吸附到前台窗口（Ctrl+Shift+S）' },
   { id: 'release-snap', label: '离开窗口边缘' },
   { id: 'reload-pet', label: '重新加载桌宠' },
@@ -135,6 +140,9 @@ function buildActionItems(actions: TrayActions): TrayMenuItem[] {
         case 'open-input-bar':
           actions.openInputBar();
           return;
+        case 'open-control-panel':
+          actions.openControlPanel();
+          return;
         case 'snap-foreground':
           actions.snapForeground();
           return;
@@ -153,7 +161,7 @@ function buildActionItems(actions: TrayActions): TrayMenuItem[] {
 }
 
 /**
- * 完整菜单：**顶部两行只读诊断 + 五个动作项**（ADR 0032 D4）。
+ * 完整菜单：**顶部两行只读诊断 + 六个动作项**（ADR 0032 D4、ADR 0052 D1）。
  * `stats` 缺省为全零视图，便于"还没装配 orchestrator"时也能建出菜单。
  */
 export function buildTrayMenuItems(

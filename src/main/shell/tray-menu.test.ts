@@ -19,6 +19,7 @@ function recorder(): { actions: TrayActions; calls: string[] } {
     calls,
     actions: {
       openInputBar: () => calls.push('open-input-bar'),
+      openControlPanel: () => calls.push('open-control-panel'),
       snapForeground: () => calls.push('snap-foreground'),
       releaseSnap: () => calls.push('release-snap'),
       reloadPet: () => calls.push('reload-pet'),
@@ -29,7 +30,7 @@ function recorder(): { actions: TrayActions; calls: string[] } {
 
 const STATS: TrayStatsView = { firedCount: 3, lastReason: 'budget' };
 
-test('托盘菜单：顶部两行只读诊断 + 五个动作项（ADR 0032 D4、ADR 0018 D3、ADR 0028 D4）', () => {
+test('托盘菜单：顶部两行只读诊断 + 六个动作项（ADR 0032 D4、ADR 0018 D3、ADR 0028 D4、ADR 0052 D1）', () => {
   const { actions } = recorder();
   assert.deepEqual(
     buildTrayMenuItems(actions, STATS).map((item) => [item.id, item.label, item.enabled]),
@@ -37,6 +38,7 @@ test('托盘菜单：顶部两行只读诊断 + 五个动作项（ADR 0032 D4、
       ['stat-proactive-count', '今天主动交互: 3 次', false],
       ['stat-proactive-skip', '上次未主动原因: budget（本次会话的打扰预算已用完）', false],
       ['open-input-bar', '呼出输入条', true],
+      ['open-control-panel', '控制面板…', true],
       ['snap-foreground', '吸附到前台窗口（Ctrl+Shift+S）', true],
       ['release-snap', '离开窗口边缘', true],
       ['reload-pet', '重新加载桌宠', true],
@@ -47,7 +49,7 @@ test('托盘菜单：顶部两行只读诊断 + 五个动作项（ADR 0032 D4、
   // 动作项规格表本身不因诊断项而改变顺序
   assert.deepEqual(
     TRAY_MENU.map((item) => item.label),
-    ['呼出输入条', '吸附到前台窗口（Ctrl+Shift+S）', '离开窗口边缘', '重新加载桌宠', '退出'],
+    ['呼出输入条', '控制面板…', '吸附到前台窗口（Ctrl+Shift+S）', '离开窗口边缘', '重新加载桌宠', '退出'],
   );
   assert.deepEqual(TRAY_STAT_IDS, ['stat-proactive-count', 'stat-proactive-skip']);
 });
@@ -77,7 +79,14 @@ test('托盘菜单：只读项 enabled=false 且点击无副作用（不会误�
 test('托盘菜单：每个动作项只触发自己的动作（诊断项不移位）', () => {
   const { actions, calls } = recorder();
   const items = buildTrayMenuItems(actions, STATS);
-  const expected = ['open-input-bar', 'snap-foreground', 'release-snap', 'reload-pet', 'quit'];
+  const expected = [
+    'open-input-bar',
+    'open-control-panel',
+    'snap-foreground',
+    'release-snap',
+    'reload-pet',
+    'quit',
+  ];
   for (const [index, action] of expected.entries()) {
     items[index + 2]?.click();
     assert.deepEqual(calls.at(-1), action);

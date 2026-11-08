@@ -87,6 +87,8 @@ declare global {
       forceSitGaze(kind: 'camera' | 'wander'): 'camera' | 'wander';
       /** ADR 0049 D2：视线三级阻尼的极轻快照（眼球 / 头部 / 躯干） */
       gaze(): ReturnType<RenderModule['gazeDiagnostics']>;
+      /** ADR 0052：当前生效的可调参数（控制面板热更新后的真值；截图/自检取证用） */
+      tuning(): ReturnType<RenderModule['tuningValues']>;
     };
   }
 }

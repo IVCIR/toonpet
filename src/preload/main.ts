@@ -16,6 +16,8 @@ import type {
   VoiceCommand,
   WalkCommand,
 } from '../shared/ipc';
+import type { PanelRenderFacts } from '../shared/panel';
+import type { VisionQueryRequest, VisionResult } from '../shared/vision';
 
 const api = {
   /** 主进程 → 渲染侧：请求一次掩膜命中判定（cmd:probe，ADR 0004 D1）。 */
@@ -108,6 +110,53 @@ const api = {
     if (!command || typeof command !== 'object') return;
     if (command.phase !== 'start' && command.phase !== 'stop') return;
     ipcRenderer.send(IPC_CHANNELS.walk, command);
+  },
+
+  /**
+   * 主进程 → 渲染侧：热更新参数（cmd:tuning，ADR 0052 D3）。
+   *
+   * 载荷是完整的一组 `TunableValues`；这里只做"是不是对象"的最小校验，
+   * 数值夹取统一在渲染进程的 `createTunableStore` 里做（与主进程同一份实现）。
+   */
+  onTuning(listener: (values: Record<string, unknown>) => void): () => void {
+    const wrapped = (_event: IpcRendererEvent, values: unknown): void => {
+      if (!values || typeof values !== 'object') return;
+      listener(values as Record<string, unknown>);
+    };
+    ipcRenderer.on(IPC_CHANNELS.tuning, wrapped);
+    return () => {
+      ipcRenderer.off(IPC_CHANNELS.tuning, wrapped);
+    };
+  },
+
+  /**
+   * 主进程 → 渲染侧：状态轮询（cmd:state-poll，ADR 0052 D4）。
+   * 面板可见时约 4Hz；渲染侧收到就回报一次 `reportState()`。
+   */
+  onStatePoll(listener: () => void): () => void {
+    const wrapped = (): void => {
+      listener();
+    };
+    ipcRenderer.on(IPC_CHANNELS.statePoll, wrapped);
+    return () => {
+      ipcRenderer.off(IPC_CHANNELS.statePoll, wrapped);
+    };
+  },
+
+  /** 渲染侧 → 主进程：面板状态快照（cmd:state-report，ADR 0052 D4）。 */
+  reportState(snapshot: PanelRenderFacts): void {
+    if (!snapshot || typeof snapshot !== 'object') return;
+    ipcRenderer.send(IPC_CHANNELS.stateReport, snapshot);
+  },
+
+  /**
+   * 渲染侧 → 主进程：请求一次视觉/OCR 查询（cmd:vision-query，ADR 0054 D6）。
+   *
+   * 这是**请求/应答**，不是事件：返回 `VisionResult` 后主进程即把上下文挂到下一轮对话，
+   * 渲染页不需要（也拿不到）图片本身。载荷只允许 `{ source }`，主进程会再校验。
+   */
+  queryVision(request?: VisionQueryRequest): Promise<VisionResult> {
+    return ipcRenderer.invoke(IPC_CHANNELS.visionQuery, request ?? {}) as Promise<VisionResult>;
   },
 };
 

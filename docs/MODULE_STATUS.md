@@ -2,12 +2,24 @@
 
 | 项 | 值 |
 |---|---|
-| 对应契约版本 | 1.28.1（ADR 0051 D7：坐姿手感标定参数；ADR 0051：两段式 / 下坐弹簧 / 看镜头；ADR 0050：待机静态站姿轮换；ADR 0049：微动作池 + 视线三级阻尼） |
-| 最后更新 | 2026-11-06 |
-| 当前里程碑 | **M25 坐姿手感标定：A 段抬头补偿 + Spine 覆盖权重 + A/B 封版**，契约 1.28.0 → 1.28.1 |
-| 发布 | **v1.7.0-sit-final**（2026-11-06，git tag；`package.json` 版本 1.7.0） |
-| 本轮验收（2026-11-06，当前工作区） | `npm test` **exit 0**（52 个测试文件 / **525** 条，含 memory 25 条）；`tsc --noEmit` **0 错**；主链路自检 **198 / 0 失败**（exit 0）；输入条 **29 / 0**、语音 **33 / 0**、缺失模型 **4 / 0**（均 exit 0）。A/B 两组均通过 `tsc` + 主链路自检 **198 / 0**：组 1（0 / 1.0，提交默认）阶段 A `phaseAHeadAppliedRad=0`、阶段 B `spineOverlayApplied=1.000`；组 2（-0.12 / 0.85，临时标定）阶段 A `-0.120`、阶段 B `0.850`。证据：`logs/evidence/sit-ab-compare.png`、`logs/evidence/sit-ab/group{1,2}/stage-{a,b}.png`；生成脚本 `tools/compose-sit-ab.py`。关键实测：A 段 -0.12rad（≈6.9°）把刚坐下时低着的脸抬起来、眼型不再半眯；B 段 0.85 只放松下背（15% 片段前倾），胸/颈/头仍完整照抄站立 |
+| 对应契约版本 | 1.33.0（ADR 0056：动态模型列表 + Combobox；ADR 0055：LLM 提供商自由切换；ADR 0054：视觉 OCR；ADR 0053：面板二期 AI 人格 / 模型切换 / 记忆管理；ADR 0052：控制面板 / 参数热更新） |
+| 最后更新 | 2026-11-08 |
+| 当前里程碑 | **M30（终极完全体）**：3D 渲染 / 物理 / 动画 / 本地 AI / 视觉 / 控制台全部合入，契约 **1.33.0** |
+| 发布 | **v3.0.0-ultimate**（2026-11-08，git tag `v3.0.0-ultimate`；`package.json` 版本 **3.0.0**） |
+| 本轮验收（2026-11-08，v3.0.0 封版） | `tsc --noEmit` **0 错**；`npm test` **exit 0**（**61 个测试入口 / 597 条**，含 memory 在 Electron 里 **29 条**）；`npm run panel:shot` **exit 0**，`logs/evidence/panel-hot-update.json` 的 **21 项断言全过**（原 17 项 + 模型列表 4 项：拉取填入 Combobox、选 `grok-4.7` 保存并切换后 runtime 真在用、编辑留空 Key 由主进程注入、失败红色提示且手填保存成功），截图 `panel-physics.png` / `panel-status.png` / `panel-persona.png` / `panel-providers.png` / **`panel-models.png`** / `panel-memory.png`；脚本退出前还原用户 `config.json`。自检全绿：主链路 **198 / 0**、输入条 **29 / 0**、语音 **33 / 0**、缺失模型 **4 / 0**、视觉 **16 / 0**；真机 `curl` 验证 OpenCode Go `/models`：无 Key **200**、无效 Key **401**、带 `x-opencode-session` **200**；`npm run panel:opencode` **exit 0**，真实 OpenCode Go 拉取 **30 个模型**，截图 `panel-opencode-models.png`（默认 `panel:shot` 仍只用回环桩） |
 | 维护规则 | 每个模块对话收尾时必须更新本文件；只写事实，不写计划性描述（计划进 TODO） |
+
+## v3.0.0 封版记录（M30 · 终极完全体）
+
+| 项 | 值 |
+|---|---|
+| 版本 / Tag | `v3.0.0-ultimate`（`package.json` 3.0.0） |
+| 契约 | **1.33.0**（ADR 0056 为最后一个契约变更） |
+| 全量测试 | `npm test` exit 0：61 个入口 / 597 条 / 0 fail（含 memory 29 条） |
+| 自检 | 主链路 198 / 0、输入条 29 / 0、语音 33 / 0、缺失模型 4 / 0、视觉 16 / 0 |
+| 面板取证 | `panel:shot` exit 0：21 / 21 断言；`panel:opencode` 真实 OpenCode Go 30 个模型 |
+| 封版能力 | 透明置顶 3D VRM、alpha 掩膜命中/穿透、拖拽/摸头/行走/回弹/吸附、HFSM + Toon/描边 + 表情/口型、本地 Ollama / OpenAI 兼容 / OpenCode Go 动态模型下拉、视觉截图 → OCR → 段 3.6、本地 GPT-SoVITS、SQLite 记忆、控制面板 |
+| 已知坑位 | 见各模块「已知坑位」；v3.0.0 新增/确认：改 Base URL 需重输 Key、`/models` 404/405 只红字不阻断手填、2s 节流缓存失败、`panel:opencode` 依赖外网（默认取证不依赖） |
 
 ## 填写口径
 
@@ -25,6 +37,11 @@
 ## 模块：shell
 
 ### 已完成
+- **动态模型列表 + Combobox（2026-11-08，ADR 0056）**：新增只读 IPC 通道 `cmd:fetch-models`（preload 暴露 `petPanel.fetchModels`，主进程 `shell/panel.ts` 只接受面板 sender，业务校验与网络在 `runtime.panel().fetchModels()`）。提供商表单的模型字段改为 `<input list>` + `<datalist>` + `🔄` 按钮 + 绿色/红色状态行 + 可点击模型 chips；Ollama 仍自动用 `/api/tags` 探测结果填充，手动刷新结果优先。成功填充 `{id,name}`；失败只显示红字，输入框与保存按钮保持可用（手填模型名照常 `provider-save`）。已保存 Key 不进渲染进程：编辑留空时主进程仅在 `type` + 归一化 `baseUrl` 都匹配时注入；地址被改写则要求重新输入 Key。同一配置 2s 节流 + 单飞 + 60s 内存缓存（`src/main/llm-model-list.ts`，注入时钟可单测）。取证新增 `panel-models.png` 与 4 项断言（总 21 项），临时桩只监听 127.0.0.1；另 `npm run panel:opencode` 手动诊断用真实 OpenCode Go `/models` 截图 `panel-opencode-models.png`（30 个模型），默认取证不访问外网
+- **LLM 提供商面板（2026-11-08，ADR 0055）**：`cmd:panel` 扩 5 个动作（`providers` / `provider-save` / `provider-delete` / `provider-activate` / `provider-test`），仍走同一条通道；preload 白名单同步（载荷只做形状校验，业务校验留在主进程）。写权限全在 `shell/panel.ts`：`persistLlmProviders()` 统一写 `llm.providers[]` + `llm.activeProvider`，`writeConfigWithProviders()` 保证"保存参数/恢复默认"不会覆盖提供商；API Key 只在主进程与 `config.json` 之间流动，`PanelProviderFacts` 只含 `hasApiKey`。切换/删除/保存后返回最新列表，面板原子刷新；当前生效项保存或激活后自动 `provider-test`，失败在列表与顶部徽标显示"连接失败"。**不允许删除最后一个本地 Ollama**（默认回退选项）。取证新增 `panel-providers.png` 与 3 项断言
+- **视觉查询（2026-11-07，ADR 0054）**：`cmd:vision-query`（§3.5）+ 热键 `Ctrl+Shift+V`（降级 `Ctrl+Alt+V`）+ 输入条"看看屏幕"按钮，三入口共用 `runVisionQuery`，查询中单飞。`shell` 仍**不** import runtime：`bootstrap` 用 `attachVisionBackend(() => getRuntime()?.vision())` 接线，未就绪时返回 `null` 并 WARN。截图走主进程 `desktopCapturer`（`screen` 按光标 `display_id`、`foreground` 按 presence 标题匹配，失败降级整屏），OCR 走回环 OpenAI 兼容端点；失败只更新按钮与日志，不弹窗、不发事件。视觉上下文由 orchestrator 在**下一轮 LLM** 消费。取证 `npm run selftest:vision`（16 项断言全过，真 Windows OCR 桩；`logs/evidence/vision-chain.json` + `vision-capture.png` / `vision-reply.png` / `vision-desktop.png`）
+- **控制面板二期：AI 人格 / 记忆管理（2026-11-06，ADR 0053）**：`shell/panel.ts` 的 `cmd:panel` 从 5 个动作扩到 13 个（`snapshot` / `status` / `preview` / `save` / `reset` / `card` / `save-card` / `set-model` / `tts-test` / `memories` / `memory-delete` / `memory-clear` / `hide`），**没有新增通道**。写权限全收在控制器：角色卡走 `src/main/character-card.ts`（归一化 / 码点计数 / 原子写 / 空卡超长相对路径拒绝），模型选择写 `config.json.llm.model`，记忆读写经注入的 `runtime.panel()`（`shell` **不** import `memory`，`bootstrap` 用 `attachPanelBackend` 接线）。三层校验：preload 白名单 + 面板 sender 白名单 + 主进程业务校验（模型名白名单 `[namespace/]name[:tag]`、`limit` 夹取、`memory-clear` 必须 `confirm === true`）。`status` 动作强制刷新 Ollama 探测（"重新探测"按钮不被 3s TTL 吞掉）；`hide`（`Esc`）只 hide 不销毁。`panel-config.ts` 移到 `src/main/` 并新增 `llm.model` 读写。运行期实现在 `runtime.panel()`：`card()` / `saveCard()`（**先写盘**再 `orchestrator.replaceCard`）/ `applyLlmModel()`（新 `LlmClient` + `orchestrator.replaceLlm` 清零熔断 + `heartbeat.retarget` 清零预热，**成功后才写 `config.json`**）/ `testTts()`（独立短预算、不播放不写记忆）/ `memories` / `deleteMemory` / `clearMemories`；`bootstrap` 用 `attachPanelBackend(() => getRuntime()?.panel())` 接线。取证扩到四页（14 项断言全过；角色卡与记忆库都写隔离副本，用户 `data/memory.db` 仍为 14 行）
+- **控制面板（2026-11-06，ADR 0052）**：`src/main/shell/panel.ts`（控制器）+ `panel-window.ts`（800×600、不可缩放、无边框、`alwaysOnTop`、`skipTaskbar`；独立最小 preload `src/preload/panel.ts` 只暴露 `invoke(cmd:panel)` 与 `onState(cmd:panel-state)`）+ `panel-config.ts`（`config.json` 读写：只写与默认值不同的项、保留未知顶层键、`tmp + rename` 原子写、坏文件只记 `error` 并按默认值启动、`PET_PANEL_CONFIG` 可覆盖）。入口是全局热键 **`Ctrl+Shift+P`** 与托盘第一项；`Esc`/失焦/再按热键 → `hide`（不销毁）。面板**不是**事件白名单的一部分：`cmd:panel` / `cmd:panel-state` / `cmd:tuning` / `cmd:state-poll` / `cmd:state-report` 五条都是控制面通道。渲染侧状态 4Hz 轮询**复用既有 16ms 轮询器**（节流 250ms，面板不可见立即停），**没有新定时器**；Ollama 探测 3s 一次（`ollama-probe.ts`，注入 `fetch`、只读 `/api/tags`、三态、dispose 丢弃在飞结果，**不碰熔断/事件/托盘**）。取证 `npm run panel:shot` → `logs/evidence/panel-hot-update.json`（7 项断言全过，脚本自还原用户配置）
 - **吸附跟随的追赶模式（2026-11-03，ADR 0042 D2）**：`snap.ts` 的跟随不再是固定 120ms 节流——检测到目标矩形变化（≥1px）后把节流压到**一个 tick（16ms）** 并持续 `SNAP_FOLLOW_SETTLE_MS=220ms`，目标停稳后自动回落到常规 120ms。没有新定时器（仍挂在既有 16ms 轮询器的 `onTick` 上），没有新 IPC。日志只在**进入**追赶那一拍打一条（避免 60Hz 刷屏）；诊断新增 `SnapDiagnostics.catchUp / catchUpTicks`。单测新增"目标连续移动时每 20ms 都重算、停下后回到节流"1 条；主链路自检新增"追赶模式 `catchUpTicks ≥ 1`"1 条
 - **解除吸附后落回桌面（2026-11-03，ADR 0042 D4）**：`snap_released{window-gone|fullscreen}` 之后，shell 用**回弹弹簧**（`motion.startSettle({vx:0, vy:SNAP_RELEASE_FALL_VY_PX_PER_SEC=620})`）把她从窗沿落到工作区地面线；离地面 ≤ `SNAP_RELEASE_FALL_MIN_PX=48px` 时不落下（避免无意义回弹）。`clicked`/`command`/`dragged` **不**落下（目标窗口还在，站在边缘是物理成立的）。没有新状态、新定时器、新通道；render 侧不伪造冲击速度（ADR 0040 D3 的"轻放不缩"口径），这次落地只由 `startle` + 弹簧表达。主链路自检新增 2 条（落回地面线 ±8px / 按轻放处理不触发 landing）
 - **回弹恢复系数与反跳可观测（2026-11-03，ADR 0040 D3）**：`SETTLE_RESTITUTION 0.28 → 0.15`（窗口整块反跳从 15–40px 降到 1/2 以下）；`motion.ts` 新增触地反跳打点（`回弹触地反跳 {bounce, vyBefore, vyAfter}`）与回弹结束的 `bounces` 计数，用来把"弹一下"与"摸头"区分开
@@ -128,6 +145,11 @@
 | `releaseSnap` | `releaseSnap(): void` | 非契约（内部）：解除吸附（幂等），与托盘"离开窗口边缘"同一路径 |
 | `snapSnapshot` | `snapSnapshot(): SnapDiagnostics \| null` | 非契约（内部诊断）：模式/是否坐着/**是否接近中与进度**/目标窗口/最近一次结果/跟随计数 |
 | `debugDropFromHeight` | `debugDropFromHeight(heightPx: number): boolean` | 非契约（内部标定）：把窗口抬到地面上方后走 `drag_released` 事件链，只用于落地截图（ADR 0035 D4） |
+| `openControlPanel` | `openControlPanel(): boolean` | 非契约（内部）：热键/托盘/取证脚本共用的打开入口（ADR 0052） |
+| `panelDiagnostics` | `panelDiagnostics(): PanelDiagnostics \| null` | 非契约（内部诊断）：面板存在性/可见性/当前值/配置文件/最近一次渲染侧回报/Ollama 三态/节拍计数 |
+| `fetchModels`（面板 IPC） | `cmd:fetch-models{type?,baseUrl,apiKey?,providerId?}` → `{ ok,models } \| { ok,error }` | 契约 §3.5（ADR 0056）：只读模型列表；只接受面板 sender；Key 注入与 2s 节流在主进程 |
+| `getControlPanelWindow` | `getControlPanelWindow(): BrowserWindow \| null` | 非契约（内部）：只给取证脚本截图 |
+| `attachPanelBackend` | `attachPanelBackend(provider: () => PanelBackendLike \| null): void` | 非契约（内部，ADR 0053）：`bootstrap` 在 runtime 就绪后注入 `runtime.panel()`；`shell` 因此不必 import `runtime`/`memory` |
 
 > 内部接口（不对外）：`PointerPoller.notePointerFact()`（`cmd:drag` 入队）、`DragGesture`、`drag-pause`、`installInputBarWindow()`、`registerHotkey()`。
 
@@ -235,6 +257,17 @@
 ## 模块：render
 
 ### 已完成
+- **参数热更新与状态上报（2026-11-06，ADR 0052）**：
+  ① `src/renderer/render/tunables-store.ts` 是渲染侧**唯一**参数表：`get()` / `values()` /
+  `apply(patch)`（夹取后返回真正变化的 id）/ `reset()` / `restoreDefaults()`；默认值来自
+  `shared/tunable-params.ts`（后者引用 `shared/constants.ts`），所以"没调过"与"调到默认值"完全等价。
+  ② `cmd:tuning` 收到即写表、下一帧生效：坐姿两个常量与视线三级刚度都改成**每帧读 `tunables.get()`**，
+  不再直接读常量；改参数**不重播坐姿、不打断在播片段、不重置姿势基准**。
+  ③ `cmd:state-poll` → 回 `cmd:state-report`：`{ at, state, tuning, sit }`，`state` 是 `getState()` 浅拷贝、
+  `sit` 是坐姿诊断子集；只在主进程索要时回，**不主动推、不开定时器**。
+  ④ 取证钩子 `window.__panelDebug`（仅面板页，不跨进程）：`set(id, raw)` 走与用户拖动相同的
+  `setParam → preview → invoke` 路径，`panel:shot` 用它把整条链路跑通。
+  **未新增状态、事件、`intent`、`emotion` 或 `RenderState` 字段。**
 - **坐姿手感标定参数 + A/B 封版（2026-11-06，ADR 0051 D7）**：
   ① **`SIT_PHASE_A_HEAD_TUNE_RAD`（默认 0）**——阶段 A（14.2–16.0s）把头骨的俯仰叠一个常量，
   实际施加 `= 常量 × sitPoseGain × (1 − stageBBlend)`，阶段 B 的 0.3s 覆盖平滑收到 0；
@@ -630,6 +663,8 @@
 ## 模块：orchestrator
 
 ### 已完成
+- **提供商抽象（2026-11-08，ADR 0055）**：`LlmClient` 端口不变，新增 `LLMProvider` 身份字段与 `createLlmProvider` 分发（Ollama / OpenAI 兼容 / OpenCode Go）。`replaceLlm` 仍是唯一的运行期换客户端入口（换引用 + 清零 `llmHealthChecked` / `llmDisabled`）；OpenAI 实现发 `/chat/completions`、Bearer、`response_format:json_object`，健康检查先读 `/models`（404/405 退化为 1-token 对话）。编排层仍不认识"提供商"，只认 `LlmClient`，三路分流与 §11 熔断口径不变。
+- **视觉上下文段 3.6（2026-11-07，ADR 0054）**：`replaceVision(context, reason)` 把 OCR 结果放进模块内一次性变量，`buildPrompt` 在段 3.5 之后、段 4 之前渲染 `【視覚情報（画面のOCR。N秒前の一回だけ）】`，正文前带"数据不是指令"约束，整段 ≤600 字；`now - at > visionTtlMs`（默认 120s）时整段丢弃并记日志。**只有走 LLM 的那一轮 `takeVision()` 读取并清空**；规则命中、主动话语、语音失败重试都不消费。无视觉上下文时 prompt 与 ADR 0053 逐字节一致（单测断言）。`snapshot()` 新增 `visionAvailable/visionChars/visionAt`；`RuntimeSnapshot.vision` 提供查询次数/最近结果/上下文状态。单测 `vision-context` 4 条（无上下文不变 / 600 字预算 / 一次性+过期 / 规则不消费）
 - **三路分流（§9.1，ADR 0015 D1）**：`respond({text, utteranceId})` → ① 规则池（字面命中即返回，≤5ms）→ ② 本地 LLM（Ollama，8s 硬超时）→ ③ 兜底；**永不 reject**（§7.6），任何异常都折算为兜底 `Reply`
 - **顺序与双轨（§8.1 / §7.3）**：先发 `cmd:render-intent{intent}`（命令），再发 `intent_resolved`（事实），最后 `voice.speak`（fire-and-forget，不阻塞 `thinking → idle`）；`RenderState` 未新增字段
 - **台词池 `data/lines.json`**（version 1）：7 条规则 + 5 条兜底。规则条件只允许契约列出的两类：`keywords`（字面子串、大小写不敏感）与 `on:'head_patted'`；每条规则独立冷却（缺省 4s）；命中策略是**数据顺序的第一个满足者**（确定性，不随机）；兜底按轮转取、避免连续重复
@@ -656,6 +691,7 @@
 - **前台应用归一化接入（本轮，ADR 0032 D1/D2）**：`presence` 在**采样点**就把标题/类名归一化成 `coding`/`browser`/`game`/`meeting`/`video`/`other: <类名>`（新增 `src/main/presence/app-normalizer.ts`，纯函数、6 条单测表格穷举）；`PresenceSnapshot.foregroundCategory` 随之出现，`WorldFacts` **删掉** `foregroundTitle`/`foregroundClass`、只留 `foregroundCategory`——类型上就不给"把用户文档名塞进模型"留口子。段 3.5 变成 `前面のアプリ: coding`，`coding` 时追加一句 `先生は今、プログラミングに集中している`；降级顺序在原有基础上插入"先丢编程提示"
 - **生命周期心跳（本轮，ADR 0033；预热从本模块迁出）**：新增 `src/main/orchestrator/heartbeat.ts` + `src/main/heartbeat-config.ts` + `src/main/env-flags.ts`（与 `proactive-config` 共用同一个"什么算真"的语义）+ `src/main/model-ready.ts`（闩锁 + 观察者）。心跳是 `runtime` 装配的**独立 15s 节拍**（`HEARTBEAT_TICK_MS`），**只做生命周期任务**，当前唯一一件 = 冷启动预热（1-token `/api/generate`；16 + 6 + 12 条单测）。触发有两条：① `model_ready` 到达**立即**一次（ADR 0033 D2，`warmUpNow('model-ready')`）；② 15s 节拍按"未热好 + 未在飞 + 未熔断 + 编排层空闲 + presence 可读 + 距上次 ≥60s + 未超 3 次"重试。**与主动性彻底解耦**：`PET_PROACTIVE_DISABLE=1` 照样预热；`PET_SELFTEST=1` 时心跳整个不启动（不建定时器、零后台推理、无 opt-in 开关）；另有 `PET_WARMUP_DISABLE=1` 逃生口。沿用 W-1…W-4（不建会话 / 不改熔断 / 不发事件 / 不占预算），唯一放宽的是 `model_ready` 触发不看 presence（启动动作本身就是在场证据，ADR 0033 D3）。`orchestrator.snapshot()` 随之**删除** `llmWarmedUp` / `warmupAttempts`，诊断搬到 `RuntimeSnapshot.warmup`（迁移后编排层不再认识"预热"这个概念）
 - **托盘诊断的数据源（本轮，ADR 0032 D4）**：新增 `src/main/proactive-stats.ts` 进程内单例（`reset/publish/read`，读出来是副本）。`tickProactive()` 每拍写 `lastReason`、`publishProactive()` 每次成功开口写 `firedCount`；`startProactiveTimer()` 在主动性关闭时写 `disabled`（托盘据此解释"为什么没开"，而不是含糊的"尚未评估"）。**没有新增事件、IPC 或 setter**
+- **运行期换模型 / 换角色卡（2026-11-06，ADR 0053）**：新增两个**内部**方法（不跨进程、不属契约接口）——`replaceLlm(client, reason)` 换引用并**清零 `llmHealthChecked` / `llmDisabled`**（§11 的"一次失败即熔断"只属于同一个模型，换模型必须重新开始；在途 `respond` 捕获旧引用，用旧模型说完这一句）；`replaceCard(text, reason)` 只改下一轮 `buildPrompt` 的 system 段（不清历史、不重发）。`snapshot()` 新增 `cardChars` 作为可断言事实。单测新增 2 条（换卡后 prompt 用新卡且历史保留；换 client 后健康检查重新开始、旧 client 不再被调用）
 
 ### 未完成
 - 台词池的权重/随机化/多句变体（当前确定性首命中 + 固定兜底轮转）
@@ -746,6 +782,47 @@
 
 ---
 
+## 模块：LLM 提供商（ADR 0055）
+
+### 已完成
+- **共享契约**：`src/shared/llm-providers.ts`（纯数据/纯校验，主进程与面板共用）——`LlmProviderConfig`、三种类型、OpenCode Go 预设端点、`sanitizeProviderConfig`、地址/模型/Key 校验、`maskApiKey`、`makeLocalOllamaProvider`。Ollama 仅回环 http；OpenAI 兼容远程仅 https（回环可 http）且禁 URL 内嵌凭证/查询串；OpenCode Go 的 base URL 不可被配置改写。
+- **三个客户端**（`src/main/orchestrator/llm-client.ts`）：`OllamaProvider`（原行为：`/api/tags` + `/api/chat` + `/api/generate` 预热）、`OpenAIProvider`（`/models` + `/chat/completions`，Bearer，`response_format:json_object`；`/models` 404/405 时退化为 1-token 对话验证 Key）、`OpenCodeGoProvider`（OpenAI 实现的固定端点 `https://opencode.ai/inference/go/openai/v1`，带 `x-opencode-session` 与自有 User-Agent）。`LLMProvider extends LlmClient`，`createLlmProvider` 唯一分发；`createLlmClient` 保留为本地 Ollama 兼容别名。云端不实现 `warmup`，心跳走 `no-warmup`；远程健康预算至少 5s（本地 Ollama 仍用 800ms）。
+- **配置**：`config.json.llm.providers[]` + `activeProvider`；旧的 `llm.model` 仍可读（迁移成本地 Ollama 模型）。运行时**至少追加一个本地 Ollama**；删除最后一个 Ollama 被拒绝。`panel-config.ts` 逐项清洗，坏项只跳过并记一条"被忽略"，不阻断启动。
+- **运行期切换**（`runtime.panel()`）：`applyProvider` / `activateProvider` / `deleteProvider` / `testProvider`。换客户端统一走"先建后换 → `orchestrator.replaceLlm`（清零熔断）→ `heartbeat.retarget`（清零预热）"；在途请求用旧提供商说完，下一轮才换。测试结果只存面板内存，不写盘、不改熔断；激活失败仍完成切换（由下一轮兜底/熔断暴露）。
+- **可观测**：`RuntimeSnapshot.llm.providerId/providerType/providerName`；`PanelPersonaFacts.llmProvider*`；`PanelStatus.providers`、`PanelResult.providerTest`。日志只记 id/type/name/baseUrl/model 与 `apiKey: 已配置|未配置`，无明文 Key。
+- **面板**：提供商列表（名称/类型/模型/地址/Key 状态/使用中/连接测试徽标）、新增/编辑表单（Ollama 模型来自 `/api/tags`，OpenCode Go 端点只读、模型可 🔄 拉取，也允许手填）、使用/测试/编辑/删除；当前生效项连接失败时顶部徽标与列表同时标红。旧"本地模型快速切换"卡片保留，但只改本地 Ollama（远程生效时按钮变"更新本地"）。
+- **动态模型列表（ADR 0056）**：`LLMProvider.fetchModels()` 三个实现——Ollama `GET /api/tags`、OpenAI 兼容 `GET {base}/models`、OpenCode Go 固定预设 `GET /models`（Bearer + `x-opencode-session`）；返回 `{id,name}[]`，401/403、404/405、超时/网络错误都给可读 `error`，不重试、不改熔断、不发事件。`src/main/llm-model-list.ts` 负责请求解析、Key 注入安全边界、2s 节流 + 单飞 + 60s 缓存；`runtime.panel().fetchModels()` 只造临时客户端。面板表单改为 `<input list>` + `<datalist>` + `🔄` + 状态行 + chips；失败仍可手填保存。真机手动截图 `npm run panel:opencode`：真实 OpenCode Go `/models` 返回 30 个模型，`logs/evidence/panel-opencode-models.png`。测试：`llm-model-list.test.ts` 12 条 + `llm-client.test.ts` 新增 5 条（Ollama/OpenAI/401/404/OpenCode Go headers）
+- **测试**：`llm-providers.test.ts` 8 条、`llm-client.test.ts` 新增 7 条（health/401/404 降级/chat/超时/分发）+ 5 条（fetchModels）、`llm-model-list.test.ts` 12 条、`panel-config.test.ts` 新增 4 条；`panel:shot` 新增 3 + 4 项断言与 `panel-providers.png` / `panel-models.png`。
+
+### 未完成
+- 提供商级自动重试/自动切换（§9.1 仍只降级到规则/兜底，不静默换提供商）
+- 流式输出、多 Key 轮换
+- Key 加密存储（当前按 ADR 0055 明示只存本机 `config.json`）
+- 模型清单的自动刷新/搜索/分组/收藏（ADR 0056 D7 明确不做；只在用户点 🔄 时拉取）
+
+### 对外暴露
+- `PanelAction` 新增：`providers` / `provider-save{provider}` / `provider-delete{id}` / `provider-activate{id}` / `provider-test{id}`。
+- `cmd:fetch-models`（ADR 0056）：面板 → 主进程只读模型列表；载荷 `PanelFetchModelsRequest`，应答 `PanelFetchModelsResult`；preload 暴露 `petPanel.fetchModels`。
+- `LLMProvider.fetchModels(request?: { timeoutMs?: number }): Promise<LlmModelListResult>`。
+- `PanelProviderFacts` / `PanelProviderTestFacts`（见 `src/shared/panel.ts`）。
+
+### 消费事件
+- 不新增事件；提供商切换不产生 `intent_resolved` / `llm_failed`，真实对话失败才走 §9.1/§11。
+
+### 已知坑位
+- `config.json` 里 API Key 是明文（威胁模型是本机用户；UI/日志/ADR 均已标注）。
+- OpenAI 兼容端点的 `/models` 行为不一致：404/405 会退化到一次 1-token 对话，测试因此可能产生极少量 token 消耗（激活/手动测试时才发生，不会周期性打）。
+- 远程端点意味着请求离开本机；只允许用户显式添加的提供商，默认仍只连回环。
+- **模型列表失败不等于提供商不可用**：`/models` 401/404/超时只让面板显示红字，用户仍可手填模型名保存；真正的连通性由 `provider-test` / 下一轮对话暴露（ADR 0056 D6）。
+- **改 Base URL 后不能沿用旧 Key**：主进程只在 `type` + 归一化 `baseUrl` 都与已保存项一致时注入 Key；地址一改就必须重新输入（防"改地址泄 Key"）。面板会提前显示红色提示。
+- **OpenCode Go 的真实 `/models` 已验证端点与响应形状**：2026-11-08 用 `curl` 访问 `https://opencode.ai/inference/go/openai/v1/models`——无 Key 返回 **200**，`data[].id/name` 与解析一致；带无效 `Bearer` 返回 **401**（对应面板红色提示）；带 `x-opencode-session` 返回 **200**。本机没有用户的真实订阅 Key，所以"带有效 Key 成功拉取"由真实端点形状 + `llm-client.test.ts` 的 Bearer/Headers 断言 + `panel:shot` 的本地桩共同覆盖，不声称已用真实 Key 跑过。
+- **2s 节流按配置键缓存**：同一配置在 2s 内重复点 🔄 返回上次结果（成功/失败都缓存）；换 Key / 换地址会立即重新请求。缓存 60s 后失效，不会持久化。
+- **`npm run panel:opencode` 是手动诊断**：它用真实 OpenCode Go `/models`（无 Key 公开清单）截 `panel-opencode-models.png`；网络不可达时只把错误写进 `panel-opencode-models.json`，不影响默认 `panel:shot` 与任何测试。
+
+### TODO
+- 若需要"远程失败自动回退本地"，单独开 ADR（带重试/预算/用户可见性），不要塞进本轮。
+- 若要支持"模型清单自动刷新/搜索"，单独开 ADR（ADR 0056 D7 明确不做，避免启动/空闲打远程端点）。
+
 ## 模块：voice
 
 ### 已完成
@@ -831,9 +908,10 @@
 - **三层降级（ADR 0020 D7）**：文件库打不开 → 自动用 `:memory:`（同 schema，本次会话可写可检索）；再失败 → `mode='disabled'`（`retrieve→[]`、`write` 空操作）；单条操作异常只记 `lastError` + WARN。`init()` 只在最后一层 reject，`runtime` 仍 `try/catch` 兜住（记忆不是启动必需项）
 - **WAL 与并发（ADR 0020 D1）**：`journal_mode=WAL`（`:memory:` 恒为 `memory`）、`synchronous=NORMAL`、`busy_timeout=2000`；单测实测"另一连接持有未提交写事务时，主连接检索**不被阻塞**且看不到未提交行，提交后立即可见"
 - **诊断**：`snapshot()` 返回 `enabled/mode/path/wal/fts/schemaVersion/rows/lastWriteAt/lastRetrieve{query,terms,count,ms,fts}/lastError`；`runtime.snapshot().memory` 直接可用；检索 >50ms 会记一条 WARN
-- **单测 21 个（`npm run test:memory`，跑在 Electron 的 Node 里）**：初始化/迁移幂等、`:memory:` 降级、长词 FTS 命中、短词 LIKE 命中、未命中、注入与通配符、limit 钳制与排序（命中数优先 / 同分新近优先）、持久化（close → 重新 init 等价"重启"）、WAL 并发读、写/读失败降级、非法 kind、事实标签（中/日、否定）、标签参与检索、纯函数（切词/转义/匹配式）、**500 行 × 20 次平均 ≤ 50ms**
+- **单测 29 个（`npm run test:memory`，跑在 Electron 的 Node 里；本次由 21 增至 29）**：初始化/迁移幂等、`:memory:` 降级、长词 FTS 命中、短词 LIKE 命中、未命中、注入与通配符、limit 钳制与排序（命中数优先 / 同分新近优先）、持久化（close → 重新 init 等价"重启"）、WAL 并发读、写/读失败降级、非法 kind、事实标签（中/日、否定）、标签参与检索、纯函数（切词/转义/匹配式）、**500 行 × 20 次平均 ≤ 50ms**、管理视图四条（`listRecent` 顺序/上限/无 `score`、`deleteById` 真值与 FTS 同步、`clearAll` 计数与清空后检索为空、未初始化时安全）
 - **实测**：500 行库上 5 个查询词轮转 20 次，平均 ≈1–2ms（预算 50ms）；单轮 `retrieve` 在 `logs/pet.log` 里记 `记忆检索 {query,terms,count,ms,fts}`
 - **淘汰策略（2026-10-31，ADR 0025）**：`prune()` 按 `at ASC, id ASC` 删除超出 `MEMORY_MAX_ROWS=2000` 的行，单次最多 `MEMORY_PRUNE_BATCH_MAX=200` 行（最坏耗时锁在毫秒级）；`write()` 之后用 `setImmediate` 排期，不阻塞调用方；FTS5 是 external-content 表，`AFTER DELETE` 触发器自动同步索引（单测直接数 `memories_fts` 行数验证）。`snapshot().lastPrune` 暴露最近一次的 `{at, deleted, rows}`
+- **管理视图（2026-11-06，ADR 0053）**：新增 `listRecent(limit)`（时间倒序，返回 `MemoryRecord` = `id/at/kind/text/tags`，不含 `score`；`limit` 默认 20 / 上限 50）、`deleteById(id)`（返回是否真的删到；FTS 索引随触发器一起删）、`clearAll()`（返回删除行数，连 FTS 一起清空）。三者都**同步**、只由主进程控制面板经 `runtime.panel()` 调用；`memory.test.ts` 新增 4 条（列表顺序与上限、按 id 删除与不存在 id、清空后 `rows=0` 且 FTS 无残留、`:memory:`/disabled 模式下行为安全）
 
 ### 未完成
 - 跨语言召回（中文提问查不到日文记忆）——不做 Embedding 就无解，见已知坑位
@@ -849,6 +927,9 @@
 | `retrieve` | `retrieve(query: string, limit?: number): MemoryFact[]` | 契约 §7.5（同步、失败返回 `[]`、目标 ≤50ms） |
 | `write` | `write(event: MemoryWrite): void` | 契约 §7.5（同步、自吞异常；写后 `setImmediate` 触发淘汰） |
 | `prune` | `prune(): number` | 契约 §7.5（ADR 0025）：按 `at` 升序删超额行，单次 ≤200 行，返回删除数 |
+| `listRecent` | `listRecent(limit: number): MemoryRecord[]` | 契约 §7.5（ADR 0053）：管理视图，时间倒序、不含 `score`；只由控制面板经 `runtime.panel()` 调用 |
+| `deleteById` | `deleteById(id: number): boolean` | 契约 §7.5（ADR 0053）：返回是否真的删到；FTS 由触发器同步 |
+| `clearAll` | `clearAll(): number` | 契约 §7.5（ADR 0053）：返回删除行数；"让她失忆"的唯一入口 |
 | `close` | `close(): void` | 非契约（内部）：停机释放句柄 |
 | `snapshot` | `snapshot(): MemorySnapshot` | 非契约（内部诊断，不进 `RenderState`） |
 
@@ -905,6 +986,7 @@
 
 | 日期 | 模块 | 摘要 | 契约版本 |
 |---|---|---|---|
+| 2026-11-07 | shell、orchestrator、全局 | **视觉查询（截图 → OCR → 段 3.6）**（ADR 0054）：① 新增 `shared/vision.ts`（`VisionContext` / `VisionResult` / `VisionSnapshot`）与 `src/main/vision/`（`capture.ts` 平台注入的 desktopCapturer 截图、`vision-service.ts` OpenAI 兼容 OCR 客户端 + CJK 空格归一化、`vision-controller.ts` 单飞/TTL/诊断）；② `config.ts` 新增 `vision`（`PET_OCR_*` / `PET_VISION_*`，`requireLoopbackUrlWithPath` 保留 `/v1`，仍只允许回环 http）；③ `orchestrator.replaceVision` + 段 3.6（≤600 字、数据非指令、只有 LLM 路径消费、过期丢弃）；④ `cmd:vision-query` + 热键 `Ctrl+Shift+V`（降级 `Ctrl+Alt+V`）+ 输入条按钮 + `bootstrap` 的 `attachVisionBackend`；⑤ `runtime.snapshot().vision` 与 `Runtime.vision()`；⑥ 单测新增 `vision-service`（5）、`vision-capture`（5）、`vision-context`（4）与 config 2 条；`npm run selftest:vision` **16/16 全过**（真 Windows OCR 桩，证据 `logs/evidence/vision-chain.json` + `vision-capture.png` / `vision-reply.png` / `vision-desktop.png`）。**未新增事件、状态、`intent`、`emotion`、`RenderState` 字段** | 1.31.0 |
 | 2026-11-02 | 全局 | **封版 `v1.1.0-visual-final`（M15 视觉完全体）**：视觉侧三件套槽位封闭 —— ① ADR 0037 全局光照 + 身体/头发 3 阶硬边 Toon（受光面 = 贴图原色，`ambient+directional=π`）；② ADR 0038 背面法描边（共享几何/骨骼、屏幕像素宽度 1.5 / 头发 0.8、深褐 `0x2a1b1a`、`smoothstep` 规避楔形黑块）；③ 面部与光环死守无光照（光环吃光实测变"脏塑料"，见 ADR 0038 D6）。**封版验收**：`npm test` 全绿（含 memory 25/25）、四套自检 **136 / 29 / 30 / 4** 全 exit 0、`tsc --noEmit` 0 错。**所有者拍板**：宽度与颜色不再调；"合并材质外壳消除头发叠线"明确不做（性价比低、易破坏模型，留在 TODO）；官方表情差分随缘。0 新依赖 / 0 新 pass / 0 按次计费调用 | 1.15.0 |
 | 2026-11-02 | render、全局 | **背面法描边 + 光环定论（ADR 0038）**：① 新增 `outline.ts`：`applyOutline(mesh)` = 克隆同一几何（`SkinnedMesh.copy()` 共享 `Skeleton`）+ `ShaderMaterial{side:BackSide}` + 顶点里 `#include <skinning_*>` 后按视空间法线外扩；`OutlineSet` 负责装配/开关/诊断/销毁。**宽度按屏幕像素**（身体/脸 1.5、头发 0.8）——模型单位 0.003 在本资产等于 172px，已实测否掉。② 范围：Body/Hair/Face 描边；EyeMouth/Eyebrow/Halo/配件不描。③ 两个实测修正：`viewNormal.xy` **不能归一化**（否则正对镜头的面被噪声放大成楔形黑块），改 `smoothstep(0.02,0.30,len)`；头发卡片会叠线，单独降到 0.8px。④ **光环对照定论：保持 `MeshBasicMaterial`**（亮度 198.2→193.0、暗像素 13.2%→16.7%，观感变"脏塑料"），`setHaloToon` 只作诊断。⑤ 诊断：`RenderDiagnostics.outline`（含 `tracked/matrixDelta`）与 `render`（calls/triangles/frameMs）；`PET_OUTLINE_DIAG=1` / `PET_HALO_DIAG=1`，A/B 用 16×16 缩略图做姿态对齐。**实测**：draw call 7→10、帧时间 EMA 16.7→16.7ms、`matrixDelta=0`（不穿模不滞后）。契约 **1.15.0**（§7.3 描边规则表、§11 降级行）。单测 +6（outline）、`tsc` 0 错、主链路自检 **136/136**、输入条 29 / 语音 30 / 缺失模型 4 均 exit 0；0 新依赖 / 0 新 pass / 0 新 IPC / `RenderState` 未增删字段 | 1.15.0 |
 | 2026-11-02 | render、全局 | **资产审查 + 全局光照 / Toon（ADR 0037）**：① 新增只读工具 `tools/audit-glb-assets.mjs`（自带 PNG 解码、按通道统计、判定 Mask/Ramp、统计 `COLOR_0` 直方图并按骨骼归类）：实测 **8 张贴图全是 RGBA8 颜色图、10 个材质只有 baseColor 槽、无 Mask/Ramp、无第二套 UV**；`COLOR_0` 的 **RGB 是常量、alpha 才是数据**（8bit 量化值，`Eyebrow`/`EyeMouth` 恒为 0 → 绝不能接进 alphaTest）。② 新增 `toon-shading.ts`：主方向光（2.6，斜上方偏左前）+ 极低环境光（0.55），**`ambient+directional=π`** 让受光面等于贴图原色；代码生成 **3 阶** `DataTexture` 色阶（32×1 / NearestFilter / NoColorSpace，`dot≤0.12→0.58 / ≤0.38→0.80 / >0.38→1.00`）；只替换 `CH0335_Body` 与 `CH0335_Hair` 为 `MeshToonMaterial`（显式 `vertexColors:false`）。③ **面部死守**：`Face`/`EyeMouth`/`Eyebrow*` 正则双重排除，永不参与。④ **ADR 0036 的手部顶点色烘焙整体废止**（删 `skin-shading.ts` / 单测 / `setSkinBake` / `shadeSkin` / `setShading`），`dominantBoneNames`/`matchesSkinBone` 迁入 `material-diagnostics.ts`。⑤ 诊断 `RenderDiagnostics.skin` → `toon`；`window.diagnostics.setToon(bool)`；`PET_TOON_DIAG=1` 连拍 before/after 并取脸部统计最接近的一对。**A/B 实测**：外套近白 38.6%→30.6%、左手 35.1%→19.3%、全身亮度只降 4.2%（不灰）。契约 **1.14.0**（§7.3 着色规则表、§11 一行降级）。单测 +6（toon）/ −6（skin）、`tsc` 0 错、主链路自检 **131/131**、其余三套 exit 0；0 新依赖 / 0 新 IPC / 0 新事件 / `RenderState` 未增删字段 | 1.14.0 |
@@ -945,3 +1027,4 @@
 | 2026-11-05 | render、全局 | **待机重构：删除空闲 shy + 七个正面静态站姿轮换**（ADR 0050）：① **删除** `fidget.shy`（`Cafe_Reaction` 3.2–4.9s 掩面缩身）、`fidget.ts` 调度模块、`RenderDiagnostics.fidget` 与"启动后 45s 冷却"整套机制；空闲路径不再引用 `Cafe_Reaction`，同时消除换姿势时"手绕着手腕突然垂下"的扭曲（片段过渡被淡入截断所致，不再触发）。② **新增** `idle-variation.ts`（纯逻辑）：44 段筛出 **7 个正面静态循环待机**（`Cafe_Idle` / `Formation_Idle` / `Carrier_Idle` / `Victory_End_Random` / `Carrier2_Idle` / `Victory_End` / `Formation_Idle_Random`），每 **20–45s** 抽一个非当前且可用的角色，`playRole(..., 0.8s, 'idle')` 交叉淡入；间隔/淡入常量集中在 `shared/constants.ts`。③ **上下文门**：拖拽 / 坐姿 / 行走 / 说话 / 一次性演出期间不换；到点不满足则从恢复时刻重新计时；片段缺失只跳过候选，不回退程序化。④ 呼吸（片段自带）与视线（`gaze.ts` 三层阻尼）不换轨；顺手补 `IDLE_MICRO_POOL` 漏掉的 `speaking` 门。⑤ 自检新增 8 条（生产常量 / 候选池 / 压缩抽签 / 无 `Cafe_Reaction` / 中段权重证明交叉淡入 / 7 张站姿截图 / 交叉淡入 4 帧 / 角色表 ×7），主链路 **189/189**、`npm test` exit 0、`tsc` 0 错；截图 `idle-pose-00..06.png`、`idle-crossfade-00..03.png`；另修掉 `clicked` / `window-gone` 两条瞬态 `startle` 假失败（改为同时接受渲染侧稳定日志）。**未新增/删除状态名、事件、`intent`、`emotion`、IPC 通道、模块接口方法或 `RenderState` 字段** | 1.27.0 |
 | 2026-11-05 | render、全局 | **坐姿两段式 + 临界阻尼下坐 + 看镜头**（ADR 0051）：① **窗口** 14.5–14.7 → **14.2–16.2s**；阶段 A（14.2–16.0）正放官方"坐下 + 第一次张望"（14.95s 头部 0.253rad 转头），阶段 B 16.0–16.2 停帧。② **覆盖** 0.3s `easeInOutCubic` 淡入站立上半身，`upperBlend = stageBBlend × sitGain × sitDrop`；覆盖链三根 → **下背/胸/颈/头四根**，采集改到 `beginFrame()` 后用 `animationBase()`（不读含视线偏移的 `bone.quaternion`）；实测 `headOrientation.pitch` **0.59 → 0.0102rad**。③ **下坐弹簧** `sit-drop.ts`（k=180 / c=26.8 / 1/240s 子步长 / dt≤0.05s），`sitDrop` 0→1，所有补偿/侧身/覆盖乘 `sitGain × sitDrop`。④ **看镜头**：张望 1/3 概率 `camera`（yaw/pitch=0），其余随机；过渡 800–1200ms、到位静止 ≥2s。⑤ 自检新增 6 条（A 无覆盖 / B 0.3s 到 1 / 16ms 头部步进 <0.15rad / 弹簧无过冲 / A/B 截图 / targetKind=camera）；主链路 **189→195**、`npm test` exit 0、`tsc` 0 错。**0 新依赖 / 0 新定时器 / 0 新 IPC / `RenderState` 未增删字段** | 1.28.0 |
 | 2026-11-06 | render、全局 | **坐姿手感标定 + A/B 封版**（ADR 0051 D7）：① 新增 `SIT_PHASE_A_HEAD_TUNE_RAD`（默认 **0**）——阶段 A（14.2–16.0s）头骨俯仰按 `sitPoseGain × (1 − stageBBlend)` 淡入淡出，负值 = 抬头；② 新增 `SIT_SPINE_OVERLAY_WEIGHT`（默认 **1.0**）——只乘下背 `Spine` 的覆盖权重（0.85 = 保留 15% 片段前倾），胸/颈/头仍是完整 `upperBlend`；③ 诊断 `sit.{phaseAHeadTuneRad,phaseAHeadAppliedRad,spineOverlayWeight,spineOverlayApplied}` 与 `sitSequence()`，**未新增状态/事件/IPC/接口方法/`RenderState` 字段**；④ A/B 两组（0/1.0 与 -0.12/0.85）各跑 `tsc` + 主链路自检，均 **198/0**；自检新增"A/B 特写已产出"1 条，产出 `sit-ab-stage-{a,b}.png` 与对比图 `logs/evidence/sit-ab-compare.png`（`tools/compose-sit-ab.py`）；⑤ 本轮 `npm test` **525/0**（52 文件）、四套自检 **198 / 29 / 33 / 4** 全 exit 0，封版 `v1.7.0-sit-final` | 1.28.1 |
+| 2026-11-06 | render、全局 | **控制面板 / 参数热更新**（ADR 0052）：① 新增第三个窗口（`shell/panel.ts` + `panel-window.ts` + 独立 preload `preload/panel.ts`，800×600、不可缩放、无边框、置顶、不占任务栏），入口 `Ctrl+Shift+P` + 托盘第一项，`Esc` 收起；② 五项可调参数（`sit.phaseAHeadTuneRad` / `sit.spineOverlayWeight` / `gaze.{eye,head,spine}Stiffness`）唯一出处 `shared/tunable-params.ts`（默认值引用 `shared/constants.ts`），夹取唯一一份 `clampTunableValue`（越界夹取、非法退默认、`-0` 归一）；③ 热更新链路 `cmd:panel{set}` → 主进程夹取 → `cmd:tuning` → 渲染侧 `tunables-store`，**不重启渲染进程、不重播坐姿**；④ `config.json` 持久化（只写改动项、保留未知顶层键、`tmp+rename` 原子写、坏文件降级、`PET_PANEL_CONFIG` 可覆盖）；⑤ 只读状态页 4Hz（复用 16ms 轮询器、仅面板可见时）+ Ollama 3s 探测三态（只诊断，不碰熔断/事件/托盘）；⑥ 新增 5 条控制面 IPC 通道 `cmd:panel` / `cmd:panel-state` / `cmd:tuning` / `cmd:state-poll` / `cmd:state-report`，**未新增/删除状态名、事件、`intent`、`emotion`、模块接口方法或 `RenderState` 字段**；⑦ 取证 `npm run panel:shot` 7 项断言全过（渲染侧收到 `-0.12/0.85/16`、面板数字框、状态页、`config.json`），`npm test` **552/0**（56 文件）、`tsc` 0 错 | 1.29.0 |

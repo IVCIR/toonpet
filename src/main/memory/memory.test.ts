@@ -449,3 +449,68 @@ test('write 之后会自动排期淘汰（不阻塞调用方）', async (t) => {
   assert.equal(memory.snapshot().rows, 2000);
   assert.ok(memory.snapshot().lastPrune !== null, '应记录最近一次淘汰');
 });
+
+// ---------------------------------------------------------------------------
+// 管理视图（ADR 0053）：listRecent / deleteById / clearAll
+// ---------------------------------------------------------------------------
+
+test('listRecent：时间倒序、默认与上限夹取、不含 score', async (t) => {
+  const { memory, dbPath } = makeHarness(t);
+  await memory.init(dbPath);
+
+  for (let index = 0; index < 30; index += 1) {
+    memory.write({ kind: index % 2 === 0 ? 'user' : 'pet', text: `記憶 ${index}`, at: 1_000 + index });
+  }
+
+  const recent = memory.listRecent();
+  assert.equal(recent.length, 20, '默认取最近 20 条');
+  assert.equal(recent[0]?.text, '記憶 29', '第一条必须是最新的');
+  assert.equal(recent[19]?.text, '記憶 10');
+  assert.equal(
+    (recent[0] as unknown as Record<string, unknown>)['score'],
+    undefined,
+    '管理视图不带检索分数',
+  );
+  assert.ok(Array.isArray(recent[0]?.tags));
+
+  assert.equal(memory.listRecent(5).length, 5);
+  assert.equal(memory.listRecent(10_000).length, 30, '超上限按上限夹取');
+});
+
+test('deleteById：删到返回 true、不存在返回 false、行数与索引同步', async (t) => {
+  const { memory, dbPath } = makeHarness(t);
+  await memory.init(dbPath);
+
+  memory.write({ kind: 'user', text: '好きなコーヒーはカフェラテ', at: 2_000 });
+  const [row] = memory.listRecent(1);
+  assert.ok(row, '必须有一条记录');
+  assert.equal(memory.snapshot().rows, 1);
+  assert.equal(memory.retrieve('カフェラテ').length, 1);
+
+  assert.equal(memory.deleteById(row!.id), true);
+  assert.equal(memory.snapshot().rows, 0);
+  assert.equal(memory.retrieve('カフェラテ').length, 0, 'FTS 索引必须一起删掉');
+  assert.equal(memory.deleteById(row!.id), false, '重复删除返回 false');
+});
+
+test('clearAll：返回删除行数、清空后检索与列表都为空', async (t) => {
+  const { memory, dbPath } = makeHarness(t);
+  await memory.init(dbPath);
+
+  for (let index = 0; index < 6; index += 1) {
+    memory.write({ kind: 'user', text: `記憶 ${index}`, at: 3_000 + index });
+  }
+  assert.equal(memory.clearAll(), 6);
+  assert.equal(memory.snapshot().rows, 0);
+  assert.equal(memory.listRecent(20).length, 0);
+  assert.equal(memory.retrieve('記憶').length, 0);
+  assert.equal(memory.clearAll(), 0, '空库再清一次返回 0');
+});
+
+test('管理视图：未初始化 / 关闭后安全（不抛、返回空值）', async (t) => {
+  const { memory } = makeHarness(t);
+  assert.deepEqual(memory.listRecent(), []);
+  assert.equal(memory.deleteById(1), false);
+  assert.equal(memory.clearAll(), 0);
+  assert.equal(memory.deleteById(Number.NaN), false, '非法 id 不抛');
+});

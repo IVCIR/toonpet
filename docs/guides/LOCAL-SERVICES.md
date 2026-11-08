@@ -70,7 +70,8 @@ ollama pull qwen3:4b
 
 - 契约 §9.4 的默认模型是 `qwen3:4b`（4B 级、Ollama 默认量化）。
 - 体积约 2.5 GB，视网络 5–30 分钟。
-- **不要**在应用里配置云端模型：`PET_LLM_URL` 只接受回环地址（ADR 0015 D6，启动期校验，配错直接拒绝启动）。
+- **不要**在 `.env` 里配置云端模型：`PET_LLM_URL` 只接受回环地址（ADR 0015 D6，启动期校验，配错直接拒绝启动）。
+- 需要 OpenAI 兼容 / OpenCode Go 时，走控制面板 →「AI 人格」→「LLM 提供商」显式添加（ADR 0055）；它写进 `config.json.llm.providers[]`，默认仍保留本地 Ollama。远程请求会离开本机，可能产生订阅/接口费用。
 
 ### 1.3 验证 `/api/tags`
 
@@ -366,8 +367,16 @@ $env:PET_TTS_TOTAL_TIMEOUT_MS      = "120000"
 | `PET_MODEL_PATH` | `<appRoot>/CH0335.glb` | 角色模型 |
 | `PET_FRAME_EXCLUDE` | `weapon\|prop\|brush\|outline` | 不参与取景/窗口尺寸的网格 |
 | `PET_HIDE_ATTACHMENTS` | 与上一行同源 | 运行期隐藏的配件网格 |
+| `PET_OCR_URL` | `http://127.0.0.1:8000/v1` | OpenAI 兼容 OCR 端点（必须回环；保留 `/v1` 路径；ADR 0054） |
+| `PET_OCR_MODEL` | `glm-ocr` | OCR 模型名 |
+| `PET_OCR_TIMEOUT_MS` | `20000` | 单次 OCR 超时（1000–120000） |
+| `PET_OCR_API_KEY` | 空 | 可选 `Authorization: Bearer` |
+| `PET_VISION_DISABLE` | 未设置 | `1/true/yes/on` → 关闭视觉（热键/`cmd:vision-query` 返回 `disabled`） |
+| `PET_VISION_SOURCE` | `foreground` | `foreground`（前台窗口，匹配失败降级整屏）或 `screen`（整屏） |
+| `PET_VISION_MAX_WIDTH` | `1600` | 送 OCR 前的最大宽度（640–2560） |
+| `PET_VISION_CONTEXT_TTL_MS` | `120000` | 视觉上下文保鲜期（5000–600000） |
 
-> 两个 URL 都有"只允许回环"的启动期校验（ADR 0015 D6）；写成外网地址会直接启动失败并落 ERROR 日志。
+> LLM / TTS / OCR 三个 URL 都有"只允许回环"的启动期校验（ADR 0015 D6、ADR 0054 D1）；写成外网地址或 `https` 会直接启动失败并落 ERROR 日志。
 >
 > 以上变量都可以写进工程根目录的 `.env`（模板：`.env.example`）。读取顺序见 ADR 0018 D1：**进程环境变量 > `.env` > 代码默认值**；`.env` 只补空缺，且只记键名不记值。
 
@@ -492,6 +501,69 @@ npm run test:memory   # = node build.mjs && node scripts/run-electron-test.mjs d
 | 版本 | `PRAGMA user_version`（当前 1） |
 | 清空 | 退出应用后删掉 `data/memory.db*` 即可（下次启动重建） |
 | 关闭 | `PET_MEMORY_DISABLE=1`（不打开数据库，段 3 恒为「（无）」） |
+
+---
+
+## 8.5 视觉 / OCR（可选，ADR 0054）
+
+视觉查询是**可选**功能：没有 OCR 服务时应用照常启动，按 `Ctrl+Shift+V` 只会记一条 WARN
+并在输入条恢复按钮，不会弹窗、不会影响对话。
+
+### 8.5.1 默认端点
+
+```
+PET_OCR_URL=http://127.0.0.1:8000/v1
+PET_OCR_MODEL=glm-ocr
+```
+
+要求是 **OpenAI 兼容**的 `POST /v1/chat/completions`，且支持 `image_url` 多模态输入。
+GLM-OCR（vLLM / 官方 serving）默认就是 8000；llama.cpp 的 `llama-server` 也能用，但模型要支持视觉。
+路径会被保留：`.../v1` → `.../v1/chat/completions`；裸 `http://127.0.0.1:8000` 会自动补 `/v1`。
+
+### 8.5.2 验证（手动发一张图）
+
+```powershell
+$png = [Convert]::ToBase64String([IO.File]::ReadAllBytes('D:\shot.png'))
+$body = @{
+  model = 'glm-ocr'
+  stream = $false
+  messages = @(@{ role='user'; content=@(
+    @{ type='text'; text='只提取画面中的文字，原样输出，不要解释。' },
+    @{ type='image_url'; image_url=@{ url="data:image/png;base64,$png" } }
+  )})
+} | ConvertTo-Json -Depth 8
+Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8000/v1/chat/completions' `
+  -ContentType 'application/json' -Body $body | ConvertTo-Json -Depth 6
+```
+
+能在 `choices[0].message.content` 里看到文字，就说明端点可用。
+
+### 8.5.3 不带 OCR 服务时怎么验收
+
+`npm run selftest:vision` **不需要 GLM-OCR**：脚本会起一个本地 OCR 桩（`127.0.0.1:8003`），
+把应用发来的 PNG 落盘后调用 Windows 自带的 `Windows.Media.Ocr`（`scripts/win-ocr.ps1`，
+离线、无需安装），再把文字按 OpenAI 响应返回。整条链路（截图 → OCR → 段 3.6 → LLM → TTS → 字幕）
+都是真的，只有"GLM-OCR 模型"被替换。
+
+```powershell
+npm run selftest:vision
+# 证据：logs/evidence/vision-chain.json
+#       dist/selftest/vision-capture.png（OCR 实际收到的截图）
+#       dist/selftest/vision-reply.png（带字幕的她）
+#       dist/selftest/vision-desktop.png（整屏）
+```
+
+### 8.5.4 常见问题
+
+| 现象 | 原因 / 处理 |
+|---|---|
+| 热键没反应 | `Ctrl+Shift+V` 被占用时会降级到 `Ctrl+Alt+V`；看 `logs/pet.log` 的 `视觉热键状态` |
+| 返回 `unavailable` | OCR 端点没起、端口不对、或路径不是 OpenAI 兼容（看 `detail` 里的 HTTP 状态/`fetch failed`） |
+| 返回 `timeout` | 首次加载模型慢；调大 `PET_OCR_TIMEOUT_MS`（最大 120000） |
+| 返回 `empty` | 画面里没有可识别文字，或 OCR 服务返回了空 `content` |
+| 截到的是整个屏幕 | `PET_VISION_SOURCE=foreground` 时前台窗口标题匹配失败会自动降级整屏；这是刻意行为 |
+| 画面认错字 | 截图会先缩到 `PET_VISION_MAX_WIDTH`（默认 1600）；小字/艺术字可调到 2560，但仍受 OCR 能力限制 |
+| 不想用 | `PET_VISION_DISABLE=1`；或在 `.env` 里注释掉 `PET_OCR_*`（端点连不上时同样只降级） |
 
 ---
 

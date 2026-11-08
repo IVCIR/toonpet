@@ -8,10 +8,11 @@
  */
 import { app, BrowserWindow, desktopCapturer, globalShortcut, screen } from 'electron';
 import type { NativeImage } from 'electron';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Rect } from '../shared/geometry';
 import { SIT_HEAD_TUNE_RAD } from '../shared/constants';
+import type { VisionResult } from '../shared/vision';
 import { logInfo, logWarn } from './log';
 import { getRuntime } from './runtime';
 import { SELFTEST_LLM_MODEL, SELFTEST_TTS_PORT, startSelftestStubs } from './selftest-stubs';
@@ -545,6 +546,22 @@ async function readSubtitle(window: BrowserWindow): Promise<SubtitleFacts> {
   }
 }
 
+/** ADR 0054：等字幕出现某段文字（TTS 桩要先把 WAV 合成完，字幕不早于 speech_started） */
+async function waitForSubtitleText(
+  window: BrowserWindow,
+  needle: string,
+  timeoutMs = 12000,
+): Promise<SubtitleFacts> {
+  const deadline = Date.now() + timeoutMs;
+  let last: SubtitleFacts = { text: null, visible: false };
+  while (Date.now() < deadline) {
+    last = await readSubtitle(window);
+    if (last.visible && (last.text ?? '').includes(needle)) return last;
+    await sleep(100);
+  }
+  return last;
+}
+
 async function readVoiceDiagnostics(window: BrowserWindow): Promise<VoiceDiagnostics | null> {
   try {
     const raw = (await window.webContents.executeJavaScript(
@@ -1068,12 +1085,13 @@ async function runInputSuite(window: BrowserWindow, checks: AcceptanceCheck[]): 
     tray.stats,
   );
   check(
-    '托盘：菜单项为 两行诊断 + 呼出输入条 / 吸附 / 离开 / 重新加载桌宠 / 退出（ADR 0028 D4）',
+    '托盘：菜单项为 两行诊断 + 呼出输入条 / 控制面板 / 吸附 / 离开 / 重新加载桌宠 / 退出（ADR 0028 D4、ADR 0052 D1）',
     JSON.stringify(tray.menuLabels) ===
       JSON.stringify([
         '今天主动交互: 0 次',
         '上次未主动原因: disabled（主动性已关闭）',
         '呼出输入条',
+        '控制面板…',
         '吸附到前台窗口（Ctrl+Shift+S）',
         '离开窗口边缘',
         '重新加载桌宠',
@@ -1644,6 +1662,230 @@ async function runSpeechSuite(window: BrowserWindow, checks: AcceptanceCheck[]):
   });
   await shell.stop();
   app.exit(failed.length === 0 ? 0 : 1);
+}
+
+/**
+ * ADR 0054：视觉/OCR 全链路验收。
+ *
+ * 顺序刻意是"先失败、后成功"：
+ * 1. OCR 桩还没起 → 查询必须返回 `unavailable`，且编排层的视觉上下文仍是空的；
+ * 2. 起桩 + 在屏幕上放一个写着 `VISIONTEST` 的测试窗口 → 走真实
+ *    `cmd:vision-query`（渲染页 preload → 主进程 → desktopCapturer → OCR 桩 → 段 3.6）；
+ * 3. 提交一句"画面里写了什么" → LLM 桩只有在 system 段里看到 OCR 文字时才回带标记的答案；
+ * 4. 截图 + 落 JSON，证明"截到的画面 / 识别出的文字 / 最终回复"三者一致。
+ */
+async function runVisionSuite(window: BrowserWindow, checks: AcceptanceCheck[]): Promise<void> {
+  const check = (name: string, pass: boolean, detail?: unknown): void => {
+    checks.push({ name, pass, detail });
+  };
+  const outputDir = path.join(app.getAppPath(), 'dist', 'selftest');
+  const evidenceDir = path.join(app.getAppPath(), 'logs', 'evidence');
+  const screenshots: string[] = [];
+  let noteWindow: BrowserWindow | null = null;
+  let stubs: Awaited<ReturnType<typeof startSelftestStubs>> | null = null;
+
+  try {
+    // ------------------------------------------------------------------
+    // 1) 失败降级：OCR 端点不存在时，查询返回失败但不抛、不产生上下文
+    // ------------------------------------------------------------------
+    const beforeAnyStub = await shell.queryVision('screen');
+    check(
+      '降级：OCR 端点未启动 → 查询返回失败（不抛异常）',
+      beforeAnyStub !== null && beforeAnyStub.ok === false,
+      beforeAnyStub,
+    );
+    check(
+      '降级：失败原因是 unavailable / timeout',
+      beforeAnyStub !== null &&
+        (beforeAnyStub.reason === 'unavailable' || beforeAnyStub.reason === 'timeout'),
+      beforeAnyStub?.reason ?? null,
+    );
+    check(
+      '降级：截图仍然成功（失败发生在 OCR，而不是截图）',
+      beforeAnyStub?.image !== null && (beforeAnyStub?.image?.bytes ?? 0) > 0,
+      beforeAnyStub?.image ?? null,
+    );
+    check(
+      '降级：失败不产生视觉上下文',
+      getRuntime()?.snapshot().orchestrator.visionAvailable === false,
+      getRuntime()?.snapshot().orchestrator ?? null,
+    );
+
+    // ------------------------------------------------------------------
+    // 2) 屏幕上放一个可被 OCR 读到的测试窗口
+    // ------------------------------------------------------------------
+    noteWindow = await createVisionTestWindow();
+    stubs = await startSelftestStubs();
+    logInfo('selftest', '视觉自检桩已启动', {
+      ocrPort: 8003,
+      llmModel: SELFTEST_LLM_MODEL,
+      ttsPort: SELFTEST_TTS_PORT,
+    });
+
+    const diagnostics = await waitFor(
+      window,
+      MODEL_LOAD_TIMEOUT_MS,
+      (d) => d !== null && (d.ready || (!d.loading && d.error !== null)),
+    );
+    check('模型：已就绪（视觉自检不需要 LLM 真模型，但仍要有渲染页）', diagnostics !== null, diagnostics?.error ?? null);
+
+    // ------------------------------------------------------------------
+    // 3) 走真实 IPC：渲染页 preload → 主进程 → 截图 → OCR 桩（Windows OCR）
+    // ------------------------------------------------------------------
+    const ipcResult = (await window.webContents.executeJavaScript(
+      `window.petShell.queryVision({ source: 'screen' })`,
+      true,
+    )) as VisionResult;
+    check('IPC：cmd:vision-query 返回 ok=true', ipcResult.ok === true, ipcResult);
+    check(
+      'OCR：识别文本包含屏幕上的标记 "VISIONTEST"',
+      ipcResult.text.includes('VISIONTEST'),
+      { chars: ipcResult.chars, textHead: ipcResult.text.slice(0, 400) },
+    );
+    check(
+      '截图：PNG 非空且尺寸合理（>= 1000px 宽）',
+      ipcResult.image !== null && ipcResult.image.bytes > 5000 && ipcResult.image.width >= 1000,
+      ipcResult.image,
+    );
+    check(
+      '上下文：成功查询后编排层 visionAvailable=true',
+      getRuntime()?.snapshot().orchestrator.visionAvailable === true,
+      getRuntime()?.snapshot().orchestrator ?? null,
+    );
+    check(
+      '桩统计：OCR 收到图片并真的识别（imageBytes > 0）',
+      stubs.stats.ocrCalls >= 1 && stubs.stats.ocrImageBytes > 0,
+      { calls: stubs.stats.ocrCalls, bytes: stubs.stats.ocrImageBytes, failures: stubs.stats.ocrFailures },
+    );
+
+    // 把 OCR 桩实际收到的那张图留作证据（就是 desktopCapturer 截出来的原图）
+    await mkdir(outputDir, { recursive: true });
+    const capturedSource = path.join(app.getAppPath(), 'logs', 'selftest', 'vision-request.png');
+    const capturedCopy = path.join(outputDir, 'vision-capture.png');
+    await copyFile(capturedSource, capturedCopy);
+    screenshots.push(capturedCopy);
+
+    // ------------------------------------------------------------------
+    // 4) 提交话语：LLM 桩只有看到 system 段里的 OCR 文字才回带标记的答案
+    // ------------------------------------------------------------------
+    const baseline = await countInLog('intent_resolved 已发');
+    await submitUtterance(window, 'この画面に書いてある文字を教えて。');
+    const resolved = await waitForLog('intent_resolved 已发', baseline + 1, 15000);
+    check('对话：提交后产生 intent_resolved', resolved >= baseline + 1, {
+      baseline,
+      resolved,
+    });
+
+    const subtitle = await waitForSubtitleText(window, 'VISIONTEST', 15000);
+    check(
+      '段 3.6：回复引用了画面文字（LLM 桩只在 system 段里看到标记时才这样回）',
+      subtitle.visible && (subtitle.text ?? '').includes('VISIONTEST'),
+      subtitle,
+    );
+    check('桩统计：LLM 请求的 system 段里确实带上了 OCR 文字', stubs.stats.llmVisionPrompt === true);
+    check(
+      '一次性：这一轮消费后视觉上下文已清空',
+      getRuntime()?.snapshot().orchestrator.visionAvailable === false,
+      getRuntime()?.snapshot().orchestrator ?? null,
+    );
+
+    // ------------------------------------------------------------------
+    // 5) 截图：她带着字幕的样子 + 整屏（左边测试窗口、右边她）
+    // ------------------------------------------------------------------
+    await sleep(350);
+    screenshots.push(await captureScreenshot(window, 'vision-reply.png', 'vision'));
+    const desktop = await captureDesktop('vision-desktop.png');
+    if (desktop) screenshots.push(desktop.pngPath);
+
+    const hotkey = shell.visionHotkeySnapshot();
+    check(
+      '热键：视觉热键已注册（Ctrl+Shift+V，或降级 Ctrl+Alt+V）',
+      hotkey !== null && typeof hotkey.accelerator === 'string',
+      hotkey,
+    );
+    check(
+      '诊断：runtime.vision 记录了查询次数与最近结果',
+      (getRuntime()?.snapshot().vision.queries ?? 0) >= 2,
+      getRuntime()?.snapshot().vision ?? null,
+    );
+
+    await mkdir(evidenceDir, { recursive: true });
+    await writeFile(
+      path.join(evidenceDir, 'vision-chain.json'),
+      JSON.stringify(
+        {
+          at: new Date().toISOString(),
+          checks,
+          runtime: getRuntime()?.snapshot() ?? null,
+          ocr: {
+            ok: ipcResult.ok,
+            reason: ipcResult.reason,
+            chars: ipcResult.chars,
+            durationMs: ipcResult.durationMs,
+            image: ipcResult.image,
+            text: ipcResult.text,
+          },
+          stubStats: stubs.stats,
+          screenshots,
+        },
+        null,
+        2,
+      ),
+      'utf8',
+    );
+  } catch (error) {
+    check('视觉套件未抛异常', false, String(error));
+  } finally {
+    if (noteWindow && !noteWindow.isDestroyed()) noteWindow.destroy();
+    await stubs?.close().catch(() => undefined);
+  }
+
+  const failed = checks.filter((item) => !item.pass);
+  logInfo('selftest', '视觉/OCR 全链路验收', {
+    total: checks.length,
+    failed: failed.length,
+    checks,
+  });
+  await shell.stop();
+  app.exit(failed.length === 0 ? 0 : 1);
+}
+
+/**
+ * ADR 0054：自检专用的"可被 OCR 读到的窗口"。
+ *
+ * 用纯白底 + 超大字号（84px），保证 Windows OCR 在 1600×1000 的整屏截图里也能稳定读出；
+ * 放在左上角避开桌宠，`showInactive()` 不抢焦点（截图走整屏，不依赖前台）。
+ */
+async function createVisionTestWindow(): Promise<BrowserWindow> {
+  const noteWindow = new BrowserWindow({
+    width: 1040,
+    height: 300,
+    x: 40,
+    y: 60,
+    frame: false,
+    show: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    backgroundColor: '#ffffff',    webPreferences: { sandbox: true, contextIsolation: true },
+  });
+  const html = `<!doctype html><html><head><meta charset="utf-8"><style>
+    html,body{margin:0;padding:0;background:#fff;color:#000;overflow:hidden}
+    .box{padding:30px 40px;font-family:'Segoe UI','Microsoft YaHei',sans-serif}
+    .big{font:700 96px/1.05 Consolas,'Segoe UI',monospace;letter-spacing:0}
+    .sub{margin-top:14px;font-size:38px;font-weight:400;line-height:1.2}
+  </style></head><body><div class="box">
+    <div class="big">VISIONTEST</div>
+    <div class="sub">桌宠视觉链路：截屏 → OCR → 提示词</div>
+  </div></body></html>`;
+  await noteWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
+  // 必须比普通 always-on-top 窗口更高：实测 QQ 的悬浮聊天窗会盖住测试窗口，
+  // OCR 只读到半个 "VISION"。screen-saver 与桌宠同层，且本窗口创建更晚，稳定在上。
+  noteWindow.setAlwaysOnTop(true, 'screen-saver');
+  noteWindow.moveTop();
+  noteWindow.showInactive();
+  // 等一帧合成：desktopCapturer 抓的是合成后的桌面，不是画布内容
+  await sleep(800);
+  return noteWindow;
 }
 
 async function dispatchPointerFor(
@@ -2798,6 +3040,11 @@ export async function runSelfTestIfRequested(): Promise<void> {
 
   if (inputMode) {
     await runInputSuite(window, checks);
+    return;
+  }
+
+  if (process.env.PET_SELFTEST_VISION === '1') {
+    await runVisionSuite(window, checks);
     return;
   }
 
@@ -5619,3 +5866,5 @@ export async function runSelfTestIfRequested(): Promise<void> {
   await shell.stop();
   app.exit(failed.length === 0 ? 0 : 1);
 }
+
+

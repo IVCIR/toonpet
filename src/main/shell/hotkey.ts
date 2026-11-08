@@ -10,6 +10,12 @@
 export const INPUT_HOTKEY_DEFAULT = 'Control+Shift+B';
 export const INPUT_HOTKEY_FALLBACK = 'Control+Alt+B';
 
+/** 控制面板（ADR 0052）：`Ctrl+Shift+P`；被占用退到 `Ctrl+Alt+P`。 */
+export const PANEL_HOTKEY = {
+  preferred: 'Control+Shift+P',
+  fallback: 'Control+Alt+P',
+} as const;
+
 export type HotkeyLogLevel = 'info' | 'warn' | 'error';
 
 export interface HotkeyDeps {

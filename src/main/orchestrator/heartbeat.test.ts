@@ -409,8 +409,7 @@ test('ADR 0033：预热中的异常不会让节拍器停摆（下一拍照常重
   assert.equal(h.heartbeat.snapshot().warmedUp, true, '第二次成功');
 });
 
-test('ADR 0033：snapshot 给出可诊断的默认值与字段', () => {
-  const h = setup();
+test('ADR 0033：snapshot 给出可诊断的默认值与字段', () => {  const h = setup();
   const before = h.heartbeat.snapshot();
   assert.deepEqual(before, {
     enabled: true,
@@ -427,4 +426,31 @@ test('ADR 0033：snapshot 给出可诊断的默认值与字段', () => {
 
   h.start();
   assert.equal(h.heartbeat.snapshot().running, true);
+});
+
+test('ADR 0053：retarget 换模型后清零预热状态，新模型重新预热', async () => {
+  const h = setup({ llm: makeLlm({ warmup: async () => ({ ok: true, loadMs: 5 }) }) });
+  h.start();
+  h.tick();
+  await flush();
+  assert.equal(h.heartbeat.snapshot().warmedUp, true);
+  assert.equal(h.llm.warmupCalls, 1);
+  // 热过之后不再预热
+  h.tick();
+  await flush();
+  assert.equal(h.llm.warmupCalls, 1);
+
+  // 换模型：新客户端 + 状态清零
+  const next = makeLlm({ warmup: async () => ({ ok: true, loadMs: 7 }) });
+  h.heartbeat.retarget(next, 'panel');
+  const snapshot = h.heartbeat.snapshot();
+  assert.equal(snapshot.warmedUp, false, '新模型没热过，不能继承旧模型的 warmedUp');
+  assert.equal(snapshot.attempts, 0, '尝试次数也清零，否则一旦旧模型耗尽了次数新模型就永远不热');
+
+  h.advance(LLM_WARMUP_RETRY_MS + 1);
+  h.tick();
+  await flush();
+  assert.equal(next.warmupCalls, 1, '心跳改用新客户端');
+  assert.equal(h.llm.warmupCalls, 1, '旧客户端不再被调用');
+  assert.equal(h.heartbeat.snapshot().warmedUp, true);
 });

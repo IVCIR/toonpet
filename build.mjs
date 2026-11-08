@@ -55,6 +55,23 @@ const bundles = [
     target: 'chrome130',
   },
   {
+    // ADR 0052：控制面板 preload（最小出口：invoke(cmd:panel) + onState(cmd:panel-state)）
+    entry: 'src/preload/panel.ts',
+    outfile: 'dist/preload/panel.js',
+    platform: 'node',
+    format: 'cjs',
+    target: 'node20',
+    external: ['electron'],
+  },
+  {
+    // ADR 0052：控制面板页面（与角色页/输入条一样走 file://，不起本地 Web Server）
+    entry: 'src/renderer/panel/panel.ts',
+    outfile: 'dist/renderer/panel/panel.js',
+    platform: 'browser',
+    format: 'iife',
+    target: 'chrome130',
+  },
+  {
     entry: 'src/shared/mask.test.ts',
     outfile: 'dist/tests/mask.test.mjs',
     platform: 'node',
@@ -377,6 +394,13 @@ const bundles = [
     target: 'node20',
   },
   {
+    // ADR 0056：动态模型列表（Key 注入安全边界 / 2s 节流 / 单飞 / 空清单）
+    entry: 'src/main/llm-model-list.test.ts',
+    outfile: 'dist/tests/llm-model-list.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },  {
     // ADR 0031 D2：主动性的全部时间与状态边界（纯函数，假时钟）
     entry: 'src/main/orchestrator/idle-drive.test.ts',
     outfile: 'dist/tests/idle-drive.test.mjs',
@@ -432,6 +456,78 @@ const bundles = [
     target: 'node20',
   },
   {
+    // ADR 0052：控制面板参数契约（夹取/部分更新/与默认值的差）
+    entry: 'src/shared/tunable-params.test.ts',
+    outfile: 'dist/tests/tunable-params.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0052 D3：渲染进程的参数表（热更新 / 非法输入忽略 / 变化 id）
+    entry: 'src/renderer/render/tunables-store.test.ts',
+    outfile: 'dist/tests/tunables-store.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0052 D5 / ADR 0053：config.json 的解析/夹取/保留未知键/原子写/llm.model
+    entry: 'src/main/panel-config.test.ts',
+    outfile: 'dist/tests/panel-config.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0055：LLM 提供商配置的纯校验（地址/模型/Key 脱敏）
+    entry: 'src/tests/llm-providers.test.ts',
+    outfile: 'dist/tests/llm-providers.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0054：OCR 客户端（URL 归一化 / 响应解析 / 失败降级 / 文本归一化）
+    entry: 'src/main/vision/vision-service.test.ts',
+    outfile: 'dist/tests/vision-service.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0054：截图（来源选择 / 前台窗口匹配 / 降级 / 缩放）
+    entry: 'src/main/vision/capture.test.ts',
+    outfile: 'dist/tests/vision-capture.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0054：段 3.6（一次性消费 / 过期 / 预算 / 规则路径不消费）
+    entry: 'src/main/orchestrator/vision-context.test.ts',
+    outfile: 'dist/tests/vision-context.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0053：角色卡读写（空卡拒绝 / 原子写 / 缺失降级）
+    entry: 'src/main/character-card.test.ts',
+    outfile: 'dist/tests/character-card.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
+    // ADR 0052 D6：Ollama 探测（注入 fetch，不联网；超时/缺模型/在线三态）
+    entry: 'src/main/ollama-probe.test.ts',
+    outfile: 'dist/tests/ollama-probe.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
     // 唯一需要跑在 Electron 的 Node 里的测试（原生模块 ABI，ADR 0020 D9）。
     // 由 `scripts/run-electron-test.mjs` 以 ELECTRON_RUN_AS_NODE=1 启动。
     entry: 'src/main/memory/memory.test.ts',
@@ -446,6 +542,7 @@ const bundles = [
 await rm(DIST, { recursive: true, force: true });
 await mkdir(path.join(DIST, 'renderer', 'render'), { recursive: true });
 await mkdir(path.join(DIST, 'renderer', 'input'), { recursive: true });
+await mkdir(path.join(DIST, 'renderer', 'panel'), { recursive: true });
 await mkdir(path.join(DIST, 'tests'), { recursive: true });
 
 for (const bundle of bundles) {
@@ -477,6 +574,8 @@ const staticFiles = [
   ['src/renderer/render/styles.css', 'dist/renderer/render/styles.css'],
   ['src/renderer/input/index.html', 'dist/renderer/input/index.html'],
   ['src/renderer/input/input.css', 'dist/renderer/input/input.css'],
+  ['src/renderer/panel/index.html', 'dist/renderer/panel/index.html'],
+  ['src/renderer/panel/panel.css', 'dist/renderer/panel/panel.css'],
 ];
 
 for (const [from, to] of staticFiles) {

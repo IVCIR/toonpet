@@ -102,6 +102,8 @@ window.diagnostics = {
   forceSitGaze: (kind: 'camera' | 'wander') => module.forceSitGaze(kind),
   // ADR 0049 D2：视线三级阻尼的极轻快照（自检 16ms 采样"眼→头→躯干"的时间差）
   gaze: () => module.gazeDiagnostics(),
+  // ADR 0052：当前生效的可调参数（证明控制面板的滑块真的到了渲染侧）
+  tuning: () => module.tuningValues(),
 };
 
 // --- ADR 0048 D2：键盘 ↑/↓ 现场微调坐姿头部（**默认关闭**，只在 `?tune=1` 时挂载） ---
@@ -172,6 +174,19 @@ window.petShell.onVoice((command) => {
 window.petShell.onRenderIntent((command) => {
   if (!command || typeof command !== 'object') return;
   module.handleIntent(command.intent);
+});
+
+// cmd:tuning（ADR 0052 D3）：控制面板滑块的热更新入口——只改内存值，下一帧生效。
+window.petShell.onTuning((values) => {
+  const changed = module.applyTuning(values);
+  if (changed.length > 0) {
+    console.log(`[render] 控制面板热更新：${changed.join(', ')}（ADR 0052）`);
+  }
+});
+
+// cmd:state-poll（ADR 0052 D4）：面板可见时 4Hz 回报一次极轻快照（不碰 getDiagnostics）。
+window.petShell.onStatePoll(() => {
+  window.petShell.reportState(module.panelSnapshot());
 });
 
 window.addEventListener('beforeunload', () => {

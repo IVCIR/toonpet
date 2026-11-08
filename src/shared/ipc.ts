@@ -18,6 +18,38 @@ export const IPC_CHANNELS = {
    * 位移物理与窗口写入都在主进程，`render` 只说"往哪边走、走多远"。
    */
   walk: 'cmd:walk',
+  /**
+   * ADR 0052 D3：主进程 → 角色渲染页的**热更新参数**（命令，不是事件）。
+   * 载荷是完整的一组 `TunableValues`（`shared/tunable-params.ts`），渲染侧收到即改内存值，
+   * 下一帧生效；不落盘、不重启、不重建模型。
+   */
+  tuning: 'cmd:tuning',
+  /**
+   * ADR 0052 D4：主进程 → 角色渲染页的状态轮询（命令）。
+   * 只在控制面板可见时发（复用既有 16ms 轮询器，节流 250ms = 4Hz，契约 §6.5 的口径）。
+   */
+  statePoll: 'cmd:state-poll',
+  /** ADR 0052 D4：角色渲染页 → 主进程的状态快照（`PanelRenderFacts`）。 */
+  stateReport: 'cmd:state-report',
+  /**
+   * ADR 0052 D2：控制面板 → 主进程的请求（`ipcMain.handle`，invoke/应答）。
+   * 载荷见 `shared/panel.ts` 的 `PanelAction`；只接受面板窗口这一个 sender。
+   */
+  panel: 'cmd:panel',
+  /** ADR 0052 D4：主进程 → 控制面板的状态快照（`PanelStatus`），只在面板可见时推。 */
+  panelState: 'cmd:panel-state',
+  /**
+   * ADR 0056：控制面板 → 主进程的**只读**模型列表请求（`ipcMain.handle`，invoke/应答）。
+   * 载荷 `PanelFetchModelsRequest`，应答 `PanelFetchModelsResult`；只接受面板窗口这一个 sender。
+   * 这是面板唯一的网络只读通道；写操作仍全部走 `cmd:panel`。
+   */
+  fetchModels: 'cmd:fetch-models',
+  /**
+   * ADR 0054 D6：视觉/OCR 查询（`ipcMain.handle`，invoke/应答）。
+   * 载荷 `VisionQueryRequest`，应答 `VisionResult`；**不广播**、不进 `evt:broadcast`。
+   * 只接受角色渲染页与控制面板两个 sender（截图是隐私操作，不开放给任意页面）。
+   */
+  visionQuery: 'cmd:vision-query',
 } as const;
 
 export type IpcChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];

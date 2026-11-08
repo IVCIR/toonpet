@@ -833,3 +833,86 @@ export const OUTLINE_COLOR = 0x2a1b1a;
  * 面部贴图 z-fighting（倒角只在轮廓处露出，推远不影响观感）。
  */
 export const OUTLINE_DEPTH_BIAS = 0.6;
+
+// --- 控制面板（ADR 0052） ---
+/**
+ * 面板可见时，主进程向角色渲染页请求状态快照的节流（ms）。
+ *
+ * 250ms = **4Hz**，正是契约 §6.5 允许的 `render.getState()` 轮询上限；
+ * 请求挂在既有 16ms 指针轮询器的 `tick` 上，**不新开定时器**（§12）。
+ * 面板不可见时一次都不发（零后台开销）。
+ */
+export const PANEL_STATE_POLL_MS = 250;
+/** 超过这么久没收到 `cmd:state-report`，"系统状态"就显示"等待渲染进程"（而不是展示过期读数） */
+export const PANEL_RENDER_STALE_MS = 3000;
+/** 面板里"AI 人格 / 记忆管理"只读概览的刷新间隔（ms）：卡片/词库文件都是静态的，5s 足够 */
+export const PANEL_PROFILE_REFRESH_MS = 5000;
+
+// --- 控制面板二期：人格 / 模型 / 记忆（ADR 0053） ---
+/** "记忆管理"一次列出的条数（需求：最近 20 条，按时间倒序） */
+export const PANEL_MEMORY_LIST_LIMIT = 20;
+/** 上限（面板只能要更多，不能要无限；防止一次 invoke 把整库拉过 IPC） */
+export const PANEL_MEMORY_LIST_LIMIT_MAX = 50;
+/** 角色卡正文上限：超过即拒绝保存（防止误把整本书贴进来拖垮每一轮 prompt） */
+export const PANEL_CARD_MAX_CHARS = 20000;
+/** 模型名的最大长度（Ollama 的 name:tag 实际远小于这个值） */
+export const PANEL_MODEL_NAME_MAX_CHARS = 120;
+/** "测试连通性"发出去的固定文案：只验证链路，不产生新的对话/记忆 */
+export const PANEL_TTS_TEST_TEXT = '接続テストです。聞こえますか。';
+/** TTS 连通性测试的独立预算（比真实回复短，避免按钮卡住几十秒） */
+export const PANEL_TTS_TEST_FIRST_BYTE_MS = 3000;
+export const PANEL_TTS_TEST_TOTAL_MS = 15000;
+/** 记忆管理里"清空全部"的二次确认窗口（ms）：点一次进入确认态，超时自动撤销 */
+export const PANEL_MEMORY_CLEAR_CONFIRM_MS = 5000;
+
+// --- 模型列表动态拉取（ADR 0056） ---
+/** 同一个配置（类型 + 地址 + 提供商 + Key 指纹）两次拉取之间的最小间隔（ms） */
+export const LLM_MODEL_LIST_THROTTLE_MS = 2000;
+/** 本地 Ollama 的 `/api/tags` 预算：回环服务，慢就是没起来 */
+export const LLM_MODEL_LIST_LOCAL_TIMEOUT_MS = 3000;
+/** 远程 `/models` 预算：跨公网 + 网关可能较慢，比健康检查宽 */
+export const LLM_MODEL_LIST_REMOTE_TIMEOUT_MS = 8000;
+/** 拉取结果在内存里的保留时长（ms）；超过后不再当作节流缓存返回 */
+export const LLM_MODEL_LIST_CACHE_TTL_MS = 60000;
+/** 一次最多返回多少个模型（防止异常端点把几万条塞进 IPC / DOM） */
+export const LLM_MODEL_LIST_MAX_OPTIONS = 200;
+
+// --- 视觉/OCR（ADR 0054） ---
+/**
+ * OCR 端点缺省地址：GLM-OCR 的 OpenAI 兼容服务（vLLM / SGLang 部署）默认监听 8000。
+ * 只允许回环（§10.2）；路径保留 `/v1`，客户端再拼 `/chat/completions`。
+ */
+export const VISION_OCR_BASE_URL = 'http://127.0.0.1:8000/v1';
+export const VISION_OCR_MODEL = 'glm-ocr';
+/** OCR 超时预算（ms）：认得慢就这一轮不带视觉上下文，绝不让对话卡住 */
+export const VISION_OCR_TIMEOUT_MS = 20000;
+/**
+ * 送给 OCR 服务的指令。
+ *
+ * 只要求"逐行纯文本"：GLM-OCR 会原样输出 Markdown 时要靠提示词压住，
+ * 否则模型容易回"这张图里写着……"这种说明句，进提示词后反而污染人格。
+ */
+export const VISION_OCR_PROMPT_DEFAULT =
+  '请逐行提取图片中的全部文字，按从上到下、从左到右的阅读顺序输出纯文本。' +
+  '不要翻译、不要解释、不要总结，不要输出 Markdown 代码块或前后缀。';
+/** 单次识别文本进入提示词前的硬上限（字符）：超出截断，防止一整屏代码把段 3 顶爆 */
+export const VISION_TEXT_MAX_CHARS = 1200;
+/**
+ * 视觉上下文段的字符预算（段 3.6）。
+ * 600 字 ≈ 段 3 记忆预算（360）的 1.7 倍：画面文字比记忆更"具体"，但不能压过角色卡。
+ */
+export const VISION_SEGMENT_MAX_CHARS = 600;
+/**
+ * 视觉上下文的保鲜期（ms）：截图后这么久还没被某轮对话消费，就丢弃。
+ * 120s 足够"按热键 → 输入 → 回车"；再久画面已经不是用户眼前那一屏了。
+ */
+export const VISION_CONTEXT_TTL_MS = 120000;
+/** OCR 请求的 max_tokens：一屏文字的保守上限（GLM-OCR 输出很短） */
+export const VISION_OCR_MAX_TOKENS = 1024;
+/** 截图缩放上限（像素宽）：再大对 OCR 没收益，只会把 base64 撑大 */
+export const VISION_CAPTURE_MAX_WIDTH_PX = 1600;
+export const VISION_CAPTURE_MIN_WIDTH_PX = 640;
+export const VISION_CAPTURE_HARD_MAX_WIDTH_PX = 2560;
+/** 视觉热键：默认 Ctrl+Shift+V，被占用时降级 Ctrl+Alt+V（与吸附/输入条同一套三级降级） */
+export const VISION_HOTKEY_DEFAULT = 'Control+Shift+V';
+export const VISION_HOTKEY_FALLBACK = 'Control+Alt+V';

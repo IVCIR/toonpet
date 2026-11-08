@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   INPUT_HOTKEY_DEFAULT,
   INPUT_HOTKEY_FALLBACK,
+  PANEL_HOTKEY,
   registerInputHotkey,
 } from './hotkey';
 import type { HotkeyLogLevel } from './hotkey';
@@ -70,5 +71,17 @@ test('允许调用方覆盖两个加速键（配置化前的逃生口）', () =>
   const { deps } = makeDeps(new Set(['F9']));
   const result = registerInputHotkey(deps, 'F8', 'F9');
   assert.equal(result.accelerator, 'F9');
+  assert.equal(result.fallbackUsed, true);
+});
+
+test('面板热键与其它热键不撞车：默认 Ctrl+Shift+P、降级 Ctrl+Alt+P（ADR 0052）', () => {
+  assert.equal(PANEL_HOTKEY.preferred, 'Control+Shift+P');
+  assert.equal(PANEL_HOTKEY.fallback, 'Control+Alt+P');
+  assert.notEqual(PANEL_HOTKEY.preferred, INPUT_HOTKEY_DEFAULT);
+  assert.notEqual(PANEL_HOTKEY.fallback, INPUT_HOTKEY_FALLBACK);
+
+  const { deps } = makeDeps(new Set([PANEL_HOTKEY.fallback]));
+  const result = registerInputHotkey(deps, PANEL_HOTKEY.preferred, PANEL_HOTKEY.fallback);
+  assert.equal(result.accelerator, PANEL_HOTKEY.fallback);
   assert.equal(result.fallbackUsed, true);
 });

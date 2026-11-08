@@ -22,8 +22,16 @@ import {
   MEMORY_TAG_MAX,
   MEMORY_TAG_MAX_CHARS,
   MEMORY_TEXT_MAX_CHARS,
+  PANEL_MEMORY_LIST_LIMIT,
+  PANEL_MEMORY_LIST_LIMIT_MAX,
 } from '../../shared/constants';
-import type { MemoryFact, MemoryKind, MemoryPort, MemoryWrite } from '../../shared/memory-types';
+import type {
+  MemoryFact,
+  MemoryKind,
+  MemoryPort,
+  MemoryRecord,
+  MemoryWrite,
+} from '../../shared/memory-types';
 import { extractFactTags } from './facts';
 import { buildFtsExpression, countHits, extractTerms, likePattern } from './query';
 import { currentVersion, ensureFts, migrate, type SqliteDatabase } from './schema';
@@ -75,6 +83,21 @@ export interface Memory extends MemoryPort {
    * 同步但**有界**（单次最多 `MEMORY_PRUNE_BATCH_MAX` 行）；`write` 之后异步触发。
    */
   prune(): number;
+  /**
+   * ADR 0053（非 §7.5 契约，控制面板管理用）：按 `at` 倒序取最近 N 条。
+   * 同步、只读、失败返回 `[]`；**不**走检索打分（这里要的是"最近发生过什么"）。
+   */
+  listRecent(limit?: number): MemoryRecord[];
+  /**
+   * ADR 0053：按主键删除一条。返回是否真的删到了行。
+   * 同步、失败只记 `lastError` 并返回 false（面板据此显示"没删到"，不谎报成功）。
+   */
+  deleteById(id: number): boolean;
+  /**
+   * ADR 0053：清空全部记忆（"她失忆了"）。返回删除行数。
+   * 同步、失败返回 0（`lastError` 说明原因），并重置 FTS 之外的进程内读数。
+   */
+  clearAll(): number;
   /** 非契约（内部）：停机释放句柄 */
   close(): void;
   /** 非契约（内部诊断，不进 RenderState） */
@@ -118,6 +141,16 @@ function normalizeTags(values: string[]): string[] {
 function clampLimit(limit: unknown): number {
   const value = typeof limit === 'number' && Number.isFinite(limit) ? Math.floor(limit) : MEMORY_RETRIEVE_LIMIT;
   return Math.min(MEMORY_RETRIEVE_LIMIT_MAX, Math.max(1, value));
+}
+
+/**
+ * 管理视图的上限与检索不同：面板要 20 条时不该被 §7.5 的 20 上限以外的东西干扰。
+ * 仍然封顶（`PANEL_MEMORY_LIST_LIMIT_MAX`），避免一次 invoke 把整库拉过 IPC。
+ */
+function clampRecentLimit(limit: unknown): number {
+  const value =
+    typeof limit === 'number' && Number.isFinite(limit) ? Math.floor(limit) : PANEL_MEMORY_LIST_LIMIT;
+  return Math.min(PANEL_MEMORY_LIST_LIMIT_MAX, Math.max(1, value));
 }
 
 export function createMemory(deps: MemoryDeps = {}): Memory {
@@ -376,6 +409,79 @@ export function createMemory(deps: MemoryDeps = {}): Memory {
 
     prune(): number {
       return pruneNow();
+    },
+
+    /**
+     * ADR 0053：按时间倒序取最近 N 条（面板"记忆管理"）。
+     *
+     * 与 `retrieve` 的区别是**没有查询词**：这里要的是"最近发生过什么"，
+     * 所以排序就是 `at DESC, id DESC`，不打分、不做去冗余（面板要显示原始行）。
+     * 同步、只读；失败只记 `lastError` 并返回 `[]`（面板显示"读不到"，不假装空库）。
+     */
+    listRecent(limit?: number): MemoryRecord[] {
+      try {
+        if (!db) return [];
+        const capped = clampRecentLimit(limit);
+        const rows = db
+          .prepare(
+            `SELECT id, at, kind, text, tags FROM memories ORDER BY at DESC, id DESC LIMIT ?`,
+          )
+          .all(capped) as Row[];
+        return rows.map((row) => ({
+          id: Number(row.id),
+          at: Number(row.at),
+          kind: row.kind,
+          text: row.text,
+          tags: parseTags(row.tags),
+        }));
+      } catch (error) {
+        lastError = String(error);
+        log('warn', '记忆列表读取失败', { error: String(error) });
+        return [];
+      }
+    },
+
+    /**
+     * ADR 0053：删除一条。
+     *
+     * 直接 `DELETE FROM memories WHERE id = ?`；FTS5 是 external-content 表，
+     * 由 `AFTER DELETE` 触发器维护索引，这里不需要手工同步。
+     */
+    deleteById(id: number): boolean {
+      try {
+        if (!db) return false;
+        if (typeof id !== 'number' || !Number.isFinite(id)) return false;
+        const info = db.prepare('DELETE FROM memories WHERE id = ?').run(Math.floor(id));
+        const deleted = Number((info as { changes?: unknown } | undefined)?.changes ?? 0) > 0;
+        if (deleted) log('info', '记忆已删除（ADR 0053）', { id: Math.floor(id) });
+        return deleted;
+      } catch (error) {
+        lastError = String(error);
+        log('warn', '记忆删除失败（已吞掉）', { error: String(error) });
+        return false;
+      }
+    },
+
+    /**
+     * ADR 0053：清空全部（"她失忆了"）。
+     *
+     * 返回删除行数；失败返回 0。同时把进程内读数重置为"空库"，
+     * 否则面板会显示"0 行"但 `lastRetrieve` 还挂着上一次的 5 条，看上去像没清干净。
+     */
+    clearAll(): number {
+      try {
+        if (!db) return 0;
+        const info = db.prepare('DELETE FROM memories').run();
+        const deleted = Number((info as { changes?: unknown } | undefined)?.changes ?? 0);
+        lastRetrieve = null;
+        lastPrune = null;
+        log('info', '记忆已清空（ADR 0053）', { deleted });
+        return deleted;
+      } catch (error) {
+        lastError = String(error);
+        log('warn', '记忆清空失败（已吞掉）', { error: String(error) });
+        return 0;
+      }
     },
 
     close(): void {

@@ -82,6 +82,7 @@ export function createShellTray(
   actions: TrayActions,
   log: TrayLog,
   initialStats: TrayStatsView = TRAY_ZERO_STATS,
+  onDoubleClick?: () => void,
 ): ShellTray | null {
   let tray: Tray | null = null;
   let stats: TrayStatsView = { ...initialStats };
@@ -99,6 +100,16 @@ export function createShellTray(
 
     tray = new Tray(icon);
     tray.setToolTip(TRAY_TOOLTIP);
+    // ADR 0052 D1：双击托盘图标打开控制面板（菜单项是另一条等价入口）
+    if (onDoubleClick) {
+      tray.on('double-click', () => {
+        try {
+          onDoubleClick();
+        } catch (error) {
+          log('warn', '托盘双击回调抛错（已忽略）', { error: String(error) });
+        }
+      });
+    }
     const initialItems = buildTrayMenuItems(actions, stats);
     labels = initialItems.map((item) => item.label);
     tray.setContextMenu(Menu.buildFromTemplate(toTemplate(initialItems)));

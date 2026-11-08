@@ -1,0 +1,385 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <!-- 零外链、零内联脚本：面板只能加载本目录下的静态文件（ADR 0052 D1） -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'"
+    />
+    <title>桌宠控制面板</title>
+    <link rel="stylesheet" href="./panel.css" />
+  </head>
+  <body>
+    <div class="app">
+      <!-- ── 左侧导航 ─────────────────────────────────────────────── -->
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <path d="M12 3.2 19 7v10l-7 3.8L5 17V7l7-3.8Z" stroke-linejoin="round" />
+              <circle cx="12" cy="12" r="3.1" />
+              <path d="M12 8.9v-2.1M12 17.2v-2.1M8.9 12H6.8M17.2 12h-2.1" stroke-linecap="round" />
+            </svg>
+          </div>
+          <div class="brand-text">
+            <h1>桌宠控制面板</h1>
+            <p>凯伊 · 参数调校台</p>
+          </div>
+        </div>
+
+        <nav class="nav" role="tablist" aria-label="面板分区">
+          <button class="nav-item is-active" data-tab="physics" role="tab" aria-selected="true">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+                <path d="M4 7h7M15 7h5M4 17h4M12 17h8" stroke-linecap="round" />
+                <circle cx="13" cy="7" r="2.1" />
+                <circle cx="10" cy="17" r="2.1" />
+              </svg>
+            </span>
+            <span class="nav-label">物理手感<span class="nav-sub">坐姿 · 视线阻尼</span></span>
+          </button>
+          <button class="nav-item" data-tab="status" role="tab" aria-selected="false">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+                <path d="M4 15.5 8.5 11l3.2 3.2L20 6" stroke-linecap="round" stroke-linejoin="round" />
+                <path d="M4 20h16" stroke-linecap="round" />
+              </svg>
+            </span>
+            <span class="nav-label">系统状态<span class="nav-sub">HFSM · 动画 · 服务</span></span>
+          </button>
+          <button class="nav-item" data-tab="persona" role="tab" aria-selected="false">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+                <circle cx="12" cy="8.2" r="3.4" />
+                <path d="M5.2 20c.7-3.5 3.4-5.6 6.8-5.6s6.1 2.1 6.8 5.6" stroke-linecap="round" />
+              </svg>
+            </span>
+            <span class="nav-label">AI 人格<span class="nav-sub">角色卡 · 台词池</span></span>
+          </button>
+          <button class="nav-item" data-tab="memory" role="tab" aria-selected="false">
+            <span class="nav-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+                <ellipse cx="12" cy="6.3" rx="7" ry="2.8" />
+                <path d="M5 6.3v11.4c0 1.5 3.1 2.8 7 2.8s7-1.3 7-2.8V6.3" />
+                <path d="M5 12c0 1.5 3.1 2.8 7 2.8s7-1.3 7-2.8" />
+              </svg>
+            </span>
+            <span class="nav-label">记忆管理<span class="nav-sub">SQLite · 本地</span></span>
+          </button>
+        </nav>
+
+        <div class="sidebar-foot">
+          <div class="foot-line">
+            <span class="foot-key">配置文件</span>
+            <code class="foot-path" id="config-path" title="">—</code>
+          </div>
+          <div class="foot-line">
+            <span class="foot-key">上次保存</span>
+            <strong class="foot-value" id="saved-at">从未保存</strong>
+          </div>
+          <div class="live-pill" id="live-pill"><i></i>拖动即生效 · 无需重启</div>
+        </div>
+      </aside>
+
+      <!-- ── 右侧内容 ─────────────────────────────────────────────── -->
+      <main class="stage">
+        <header class="head">
+          <div class="head-text">
+            <h2 id="page-title">物理手感</h2>
+            <p id="page-desc">拖动滑块即刻生效。满意后点「保存并应用」写入 config.json，重启后仍然生效。</p>
+          </div>
+          <div class="head-side">
+            <span class="chip" id="changed-chip">默认参数</span>
+          </div>
+        </header>
+
+        <div class="pages" id="pages">
+          <!-- 1) 物理手感（唯一可写页） -->
+          <section class="page is-active" data-page="physics">
+            <div id="param-sections" class="param-sections"></div>
+            <p class="note">
+              这些值相当于原先改 <code>shared/constants.ts</code> 再重启。现在：<b>拖动 = 实时生效</b>，
+              <b>保存 = 持久化</b>。同一组值也写进日志，方便回填常量。
+            </p>
+          </section>
+
+          <!-- 2) 系统状态（只读） -->
+          <section class="page" data-page="status">
+            <div class="stat-grid" id="status-grid">
+              <div class="stat-card">
+                <span class="stat-label">主状态（Base / Overlay / Physics）</span>
+                <strong class="stat-value" id="stat-state">—</strong>
+                <span class="stat-foot" id="stat-sit">不在坐姿</span>
+              </div>
+              <div class="stat-card">
+                <span class="stat-label">当前动画片段</span>
+                <strong class="stat-value mono" id="stat-clip">—</strong>
+                <span class="stat-foot" id="stat-clip-time">—</span>
+              </div>
+              <div class="stat-card">
+                <span class="stat-label">本地推理（Ollama）</span>
+                <strong class="stat-value" id="stat-ollama">
+                  <span class="dot dot-unknown"></span><span>未探测</span>
+                </strong>
+                <span class="stat-foot" id="stat-ollama-detail">—</span>
+              </div>
+              <div class="stat-card">
+                <span class="stat-label">渲染侧生效参数</span>
+                <strong class="stat-value mono" id="stat-tuning-count">—</strong>
+                <span class="stat-foot" id="stat-tuning-detail">—</span>
+              </div>
+            </div>
+
+            <div class="panel-card">
+              <div class="panel-card-head">
+                <h3>渲染侧实况</h3>
+                <span class="panel-card-tag" id="status-freshness">等待渲染进程…</span>
+              </div>
+              <dl class="kv" id="render-kv">
+                <div><dt>状态</dt><dd id="kv-state">—</dd></div>
+                <div><dt>坐姿阶段</dt><dd id="kv-sit-stage">—</dd></div>
+                <div><dt>坐姿姿态增益</dt><dd id="kv-sit-gain">—</dd></div>
+                <div><dt>阶段 A 抬头（实际）</dt><dd id="kv-phase-a">—</dd></div>
+                <div><dt>下背覆盖（实际）</dt><dd id="kv-spine">—</dd></div>
+                <div><dt>片段权重</dt><dd id="kv-clip-weight">—</dd></div>
+              </dl>
+              <p class="tiny">
+                这组读数来自 <code>cmd:state-poll → cmd:state-report</code>（4Hz，仅面板可见时）。
+                它证明滑块真的进了渲染进程，而不是只改了面板自己的数字。
+              </p>
+            </div>
+          </section>
+
+          <!-- 3) AI 人格（ADR 0053：可写；ADR 0055：提供商） -->
+          <section class="page" data-page="persona">
+            <div class="panel-card" id="provider-card">
+              <div class="panel-card-head">
+                <h3>LLM 提供商</h3>
+                <span class="panel-card-tag" id="provider-active-badge">—</span>
+              </div>
+              <p class="field-hint">
+                默认是本地 Ollama；也可以加一个 OpenAI 兼容端点，或 OpenCode Go 订阅。
+                切换后<b>下一轮对话生效</b>，并会清零熔断与预热状态。API Key 只存在本机
+                <code>config.json</code>，不会写进日志。
+              </p>
+              <ul class="provider-list" id="provider-list"></ul>
+              <p class="empty" id="provider-empty">还没有配置任何提供商（默认会用本地 Ollama）。</p>
+
+              <div class="provider-form" id="provider-form">
+                <div class="provider-form-head">
+                  <strong id="provider-form-title">添加提供商</strong>
+                  <button class="btn tiny ghost" id="provider-new" type="button">新建</button>
+                </div>
+                <div class="field-row">
+                  <div class="field-main">
+                    <label class="field-label" for="provider-type">类型</label>
+                    <p class="field-hint" id="provider-type-hint">本地 Ollama：只连 127.0.0.1。</p>
+                  </div>
+                  <div class="field-side">
+                    <select id="provider-type" class="select" aria-label="提供商类型">
+                      <option value="ollama">Ollama（本地）</option>
+                      <option value="openai">OpenAI 兼容</option>
+                      <option value="opencode-go">OpenCode Go</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="field-row">
+                  <div class="field-main">
+                    <label class="field-label" for="provider-name">名称</label>
+                    <p class="field-hint">显示在列表里，可写中文。</p>
+                  </div>
+                  <div class="field-side">
+                    <input id="provider-name" class="input" type="text" maxlength="40" placeholder="例如 OpenCode Go" />
+                  </div>
+                </div>
+                <div class="field-row">
+                  <div class="field-main">
+                    <label class="field-label" for="provider-baseurl">Base URL</label>
+                    <p class="field-hint" id="provider-baseurl-hint">本地地址，只允许回环。</p>
+                  </div>
+                  <div class="field-side">
+                    <input id="provider-baseurl" class="input mono" type="text" spellcheck="false" placeholder="http://127.0.0.1:11434" />
+                  </div>
+                </div>
+                <div class="field-row">
+                  <div class="field-main">
+                    <label class="field-label" for="provider-apikey">API Key</label>
+                    <p class="field-hint" id="provider-apikey-hint">只保存在本机；日志里只会出现"已配置"。</p>
+                  </div>
+                  <div class="field-side">
+                    <input id="provider-apikey" class="input mono" type="password" autocomplete="off" spellcheck="false" placeholder="sk-..." />
+                  </div>
+                </div>
+                <div class="field-row">
+                  <div class="field-main">
+                    <label class="field-label" for="provider-model">模型</label>
+                    <p class="field-hint" id="provider-model-hint">点 🔄 拉取可用模型；也可以手动输入。</p>
+                  </div>
+                  <div class="field-side">
+                    <input
+                      id="provider-model"
+                      class="input mono"
+                      type="text"
+                      maxlength="120"
+                      spellcheck="false"
+                      autocomplete="off"
+                      list="provider-model-options"
+                      placeholder="例如 claude-sonnet-4-20250514"
+                    />
+                    <datalist id="provider-model-options"></datalist>
+                    <button
+                      class="btn tiny ghost"
+                      id="provider-model-refresh"
+                      type="button"
+                      title="拉取可用模型列表"
+                      aria-label="刷新模型列表"
+                    >🔄</button>
+                  </div>
+                </div>
+                <div class="provider-model-extra">
+                  <p class="field-status" id="provider-model-status" role="status" aria-live="polite"></p>
+                  <div class="model-chips is-hidden" id="provider-model-chips"></div>
+                </div>
+                <div class="editor-foot">
+                  <span class="tiny" id="provider-form-status">填写后点「保存并应用」</span>
+                  <div class="editor-actions">
+                    <button class="btn tiny ghost" id="provider-cancel" type="button">取消编辑</button>
+                    <button class="btn tiny primary" id="provider-save" type="button">保存并应用</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="panel-card">
+              <div class="panel-card-head">
+                <h3>本地模型（Ollama 快速切换）</h3>
+                <span class="panel-card-tag" id="model-badge">—</span>
+              </div>
+              <div class="field-row">
+                <div class="field-main">
+                  <label class="field-label" for="model-select">对话模型（Ollama）</label>
+                  <p class="field-hint">
+                    只改本地 Ollama 提供商；列表来自本机 <code>GET /api/tags</code>。当前若是远程提供商，这里的切换<b>不会</b>影响它。
+                  </p>
+                </div>
+                <div class="field-side">
+                  <select id="model-select" class="select" aria-label="本地模型"></select>
+                  <button class="btn tiny ghost" id="model-refresh" type="button">重新探测</button>
+                  <button class="btn tiny primary" id="model-apply" type="button">切换</button>
+                </div>
+              </div>
+              <p class="tiny" id="model-detail">—</p>
+            </div>
+
+            <div class="panel-card">
+              <div class="panel-card-head">
+                <h3>角色卡（System Prompt）</h3>
+                <span class="panel-card-tag" id="card-badge">—</span>
+              </div>
+              <dl class="kv">
+                <div><dt>文件</dt><dd class="mono ellipsis" id="card-path">—</dd></div>
+                <div><dt>推理地址</dt><dd class="mono" id="card-llm-url">—</dd></div>
+              </dl>
+              <textarea id="card-text" class="editor" spellcheck="false" placeholder="在这里编辑她的人格设定…"></textarea>
+              <div class="editor-foot">
+                <span class="tiny" id="card-counter">0 字</span>
+                <div class="editor-actions">
+                  <button class="btn tiny ghost" id="card-reload" type="button">重新读取</button>
+                  <button class="btn tiny primary" id="card-save" type="button">保存角色卡</button>
+                </div>
+              </div>
+              <p class="tiny">
+                保存后 <b>下一轮对话立刻生效</b>（不重启、不清空对话历史）。磁盘写入是原子的：
+                下次启动也从新人格开始。空内容会被拒绝——人格不允许静默消失。
+              </p>
+            </div>
+
+            <div class="panel-card">
+              <div class="panel-card-head">
+                <h3>语音（GPT-SoVITS）</h3>
+                <span class="panel-card-tag" id="tts-badge">—</span>
+              </div>
+              <dl class="kv">
+                <div><dt>参考音频</dt><dd class="mono ellipsis" id="tts-ref">—</dd></div>
+                <div><dt>合成地址</dt><dd class="mono" id="tts-url">—</dd></div>
+              </dl>
+              <div class="editor-foot">
+                <span class="tiny" id="tts-result">未测试</span>
+                <div class="editor-actions">
+                  <button class="btn tiny" id="tts-test" type="button">测试连通性</button>
+                </div>
+              </div>
+              <p class="tiny">
+                测试用固定短句合成一次，<b>不播放、不写记忆</b>，只验证"地址可达 + 参考音频能出声"。
+                真实回复的耗时预算与这个按钮不同（面板给按钮的预算更短）。
+              </p>
+            </div>
+          </section>
+
+          <!-- 4) 记忆管理（ADR 0053：可查看/删除/清空） -->
+          <section class="page" data-page="memory">
+            <div class="panel-card">
+              <div class="panel-card-head">
+                <h3>本地记忆库</h3>
+                <span class="panel-card-tag" id="memory-badge">—</span>
+              </div>
+              <dl class="kv">
+                <div><dt>数据库</dt><dd class="mono ellipsis" id="memory-path">—</dd></div>
+                <div><dt>文件大小</dt><dd id="memory-size">—</dd></div>
+                <div><dt>最后写入</dt><dd id="memory-updated">—</dd></div>
+                <div><dt>条数</dt><dd id="memory-rows">—</dd></div>
+                <div><dt>状态</dt><dd id="memory-enabled">—</dd></div>
+              </dl>
+              <div class="editor-foot">
+                <span class="tiny">读写都在主进程；面板只发请求，不直接碰 SQLite。</span>
+                <div class="editor-actions">
+                  <button class="btn tiny" id="memory-refresh" type="button">刷新列表</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="panel-card">
+              <div class="panel-card-head">
+                <h3>最近记忆</h3>
+                <span class="panel-card-tag" id="memory-count">—</span>
+              </div>
+              <ul class="memory-list" id="memory-list"></ul>
+              <p class="empty" id="memory-empty">还没有任何记忆。和她聊几句就会出现在这里。</p>
+            </div>
+
+            <div class="panel-card danger">
+              <div class="panel-card-head">
+                <h3>危险操作</h3>
+                <span class="panel-card-tag bad">不可撤销</span>
+              </div>
+              <p class="tiny">
+                清空后她将忘记所有对话记忆（角色卡与物理参数不受影响）。
+                下一轮注入的记忆段会变成「（无）」——这就是"她失忆了"。
+              </p>
+              <div class="editor-foot">
+                <span class="tiny" id="clear-hint">需要点两次确认</span>
+                <div class="editor-actions">
+                  <button class="btn tiny danger" id="memory-clear" type="button">清空所有记忆</button>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <footer class="actions" id="actions">
+          <div class="action-hint">
+            只改内存，不会自动写盘。<kbd>Ctrl</kbd> + <kbd>S</kbd> 保存 · <kbd>R</kbd> 恢复默认
+          </div>
+          <div class="action-buttons">
+            <button class="btn ghost" id="reset" type="button">恢复默认</button>
+            <button class="btn primary" id="save" type="button">保存并应用</button>
+          </div>
+        </footer>
+      </main>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script src="./panel.js"></script>
+  </body>
+</html>

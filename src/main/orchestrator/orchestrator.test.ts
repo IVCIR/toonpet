@@ -873,3 +873,58 @@ test('ADR 0032 D4：没装配主动性时，托盘看到的是 disabled 而不�
   assert.equal(readProactiveStats().firedCount, 0);
 });
 
+// ---------------------------------------------------------------------------
+// ADR 0053：运行期换模型 / 换角色卡（控制面板 → 内部方法）
+// ---------------------------------------------------------------------------
+
+test('ADR 0053 replaceCard：换卡后下一次 prompt 用新人格，在途历史不清空', async () => {
+  const { orchestrator, llm } = setup();
+  await orchestrator.respond({ text: '今天好安静', utteranceId: 'u1' });
+  assert.match(llm.lastRequest?.messages[0]?.content ?? '', /测试角色卡/);
+  const turnsBefore = orchestrator.snapshot().historyTurns;
+
+  orchestrator.replaceCard('新的角色卡：你现在说话很冲。', 'panel');
+  assert.equal(orchestrator.snapshot().cardChars, '新的角色卡：你现在说话很冲。'.length);
+
+  await orchestrator.respond({ text: '你在想什么', utteranceId: 'u2' });
+  const system = llm.lastRequest?.messages[0]?.content ?? '';
+  assert.match(system, /新的角色卡/);
+  // 换卡不清空历史：轮数只会增加，不会回到 0
+  assert.ok(orchestrator.snapshot().historyTurns > turnsBefore, '历史轮次保留，不清空');
+});
+
+test('ADR 0053 replaceLlm：清零健康检查与熔断，新客户端重新探活', async () => {
+  // 第一个客户端永远不健康 → 一次失败即本会话熔断（§11）
+  const broken = makeLlm({ health: { ok: false, model: '' } as LlmHealth });
+  const bus = new FakeBus();
+  const voice = makeVoice({});
+  const rules = createRulePool(parseLinesFile(LINES));
+  const orchestrator = createOrchestrator({
+    bus,
+    voice,
+    llm: broken,
+    rules,
+    card: '测试角色卡',
+    memory: makeMemory(),
+    now: () => Date.now(),
+    newReplyId: (utteranceId) => `r-${utteranceId}`,
+    log: () => undefined,
+  });
+  await orchestrator.respond({ text: '这是不匹配规则的一句话', utteranceId: 'u1' });
+  assert.equal(orchestrator.snapshot().llmDisabled, true);
+  assert.equal(broken.healthCalls, 1);
+
+  // 换成健康的模型：必须允许重新探活，而不是继承旧模型的熔断
+  const healthy = makeLlm();
+  orchestrator.replaceLlm(healthy, 'panel');
+  const afterSwitch = orchestrator.snapshot();
+  assert.equal(afterSwitch.llmDisabled, false);
+  assert.equal(afterSwitch.llmHealthChecked, false);
+  assert.equal(afterSwitch.llmModel, 'fake:1b');
+
+  await orchestrator.respond({ text: '这也是不匹配规则的一句话', utteranceId: 'u2' });
+  assert.equal(healthy.healthCalls, 1, '新客户端被真正探活');
+  assert.equal(orchestrator.snapshot().llmDisabled, false);
+  assert.equal(broken.healthCalls, 1, '旧客户端不再被使用');
+});
+

@@ -4,6 +4,7 @@ import { loadProjectEnv } from './env';
 import { logError, logInfo, logWarn } from './log';
 import { getRuntime, ensureRuntime, logRuntimeFailure } from './runtime';
 import { shell } from './shell/index';
+import { runPanelShotIfRequested } from './panel-shot';
 import { runSelfTestIfRequested } from './selftest';
 
 export function bootstrap(): void {
@@ -63,7 +64,21 @@ export function bootstrap(): void {
         return;
       }
       logInfo('main', '就绪');
+      // ADR 0053：面板的 AI/记忆动作需要 runtime 的运行期后端（换模型、换角色卡、读写 SQLite）。
+      // shell 不 import runtime，这里用注入把两者接起来；runtime 装配失败时面板仍然能打开看配置。
+      shell.attachPanelBackend(() => getRuntime()?.panel() ?? null);
+      // ADR 0054：视觉热键与 cmd:vision-query 也走同一条注入路径。
+      // runtime 还在启动窗口里时 `vision()` 会抛，这里兜住返回 null（shell 记 WARN 后放弃本次热键）。
+      shell.attachVisionBackend(() => {
+        try {
+          return getRuntime()?.vision() ?? null;
+        } catch {
+          return null;
+        }
+      });
       await runSelfTestIfRequested();
+      // ADR 0052 D7：控制面板取证（PET_PANEL_SHOT=1）；正常启动时立即返回
+      await runPanelShotIfRequested();
     })
     .catch((error: unknown) => {
       logError('main', '启动失败', error);

@@ -101,7 +101,15 @@ export interface Heartbeat {
    * 立刻尝试一次预热（`model-ready` 用）。返回是否真的发出了请求。
    * 幂等且永不抛：条件不满足就静默跳过，由下一次心跳自然重试。
    */
+  /** 本次墙钟耗时（ms），只进日志 */
   warmUpNow(trigger: WarmupTrigger): boolean;
+  /**
+   * ADR 0053：换一个 LLM 客户端（控制面板切换模型）。
+   *
+   * **必须清零 `warmedUp` / `attempts`**：旧模型热过不代表新模型热过；
+   * 否则切完模型首次对话会撞冷启动 8s 预算，而且心跳永远不会为新模型预热。
+   */
+  retarget(client: LlmClient, note: string): void;
   snapshot(): HeartbeatSnapshot;
 }
 
@@ -122,6 +130,7 @@ export function createHeartbeat(options: HeartbeatOptions): Heartbeat {
   const cancel =
     options.cancel ?? ((handle: unknown) => clearInterval(handle as NodeJS.Timeout));
 
+  let currentLlm = options.llm;
   let timer: unknown = null;
   let running = false;
   let warmedUp = false;
@@ -153,7 +162,7 @@ export function createHeartbeat(options: HeartbeatOptions): Heartbeat {
   function attempt(trigger: WarmupTrigger): boolean {
     const at = now();
     if (!enabled) return skip('disabled');
-    const warmup = options.llm.warmup;
+    const warmup = currentLlm.warmup;
     if (typeof warmup !== 'function') return skip('no-warmup'); // 测试桩不实现预热 → 自然跳过
     if (warmedUp) return skip('warmed-up');
     if (inFlight) return skip('in-flight');
@@ -182,12 +191,12 @@ export function createHeartbeat(options: HeartbeatOptions): Heartbeat {
     log('info', 'LLM 预热已发出（1 token，不占对话预算）', {
       attempt: attemptNo,
       trigger,
-      model: options.llm.model,
+      model: currentLlm.model,
       userIdleMs: idle,
     });
 
     void warmup
-      .call(options.llm)
+      .call(currentLlm)
       .then((result) => {
         if (result.ok) {
           warmedUp = true;
@@ -239,7 +248,7 @@ export function createHeartbeat(options: HeartbeatOptions): Heartbeat {
       log('info', '生命周期心跳已启动（ADR 0033：只做生命周期任务，与主动性无关）', {
         intervalMs,
         reason,
-        warmupAvailable: typeof options.llm.warmup === 'function',
+        warmupAvailable: typeof currentLlm.warmup === 'function',
         retryMs: LLM_WARMUP_RETRY_MS,
         maxAttempts: LLM_WARMUP_MAX_ATTEMPTS,
       });
@@ -267,6 +276,22 @@ export function createHeartbeat(options: HeartbeatOptions): Heartbeat {
         log('warn', '预热触发异常（已忽略）', String(error));
         return false;
       }
+    },
+
+    retarget(client: LlmClient, note: string): void {
+      const previous = currentLlm.model;
+      currentLlm = client;
+      warmedUp = false;
+      attempts = 0;
+      lastAttemptAt = null;
+      lastResult = null;
+      lastSkip = null;
+      log('info', '心跳已改用新的 LLM 客户端（ADR 0053/0055）', {
+        from: previous,
+        to: client.model,
+        note,
+        warmupAvailable: typeof client.warmup === 'function',
+      });
     },
 
     snapshot(): HeartbeatSnapshot {

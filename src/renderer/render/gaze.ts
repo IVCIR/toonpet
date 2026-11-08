@@ -69,6 +69,25 @@ export interface GazeState {
 export interface GazeOptions {
   /** 注入随机源（单测用）；缺省 `Math.random` */
   random?: () => number;
+  /**
+   * ADR 0052 D3：三级阻尼刚度的**运行期来源**（控制面板滑块）。
+   *
+   * 缺省读 `shared/constants.ts` 的三个常量；给了这个回调就每帧读它的返回值，
+   * 因此拖动滑块时下一帧就改变手感，**不需要**重建控制器或重启。
+   * 回正阶段仍然固定用 `GAZE_RELEASE_STIFFNESS`（那是"缓出"的语义，不是跟随刚度）。
+   */
+  stiffness?: () => GazeStiffness;
+}
+
+/** 跟随阶段的三级刚度（1/s） */
+export interface GazeStiffness {
+  eye: number;
+  head: number;
+  spine: number;
+}
+
+function constantStiffness(): GazeStiffness {
+  return { eye: GAZE_EYE_STIFFNESS, head: GAZE_HEAD_STIFFNESS, spine: GAZE_SPINE_STIFFNESS };
 }
 
 export interface GazeController {
@@ -106,6 +125,8 @@ export function createGazeController(
   if (!head && eyes.length === 0) return null;
   const spine = bones.spine1;
   const random = options.random ?? Math.random;
+  // ADR 0052 D3：每帧读一次（O(1)），滑块一动下一帧生效
+  const readStiffness = options.stiffness ?? constantStiffness;
 
   let yaw = 0;
   let pitch = 0;
@@ -195,12 +216,13 @@ export function createGazeController(
         aimAtCursor(contentWidth, contentHeight);
       }
 
+      const live = readStiffness();
       const stiffness = (layer: number): number =>
         phase === 'release' ? GAZE_RELEASE_STIFFNESS : layer;
 
       // 1) 头部
-      yaw = damp(yaw, targetYaw, stiffness(GAZE_HEAD_STIFFNESS), dt);
-      pitch = damp(pitch, targetPitch, stiffness(GAZE_HEAD_STIFFNESS), dt);
+      yaw = damp(yaw, targetYaw, stiffness(live.head), dt);
+      pitch = damp(pitch, targetPitch, stiffness(live.head), dt);
 
       /**
        * 2) 眼球：先承担"头还没到的那一截"（`GAZE_EYE_LEAD_SHARE`），再回到
@@ -217,8 +239,8 @@ export function createGazeController(
         -GAZE_EYE_OFFSET_MAX_RAD,
         GAZE_EYE_OFFSET_MAX_RAD,
       );
-      eyeYaw = damp(eyeYaw, eyeTargetYaw, stiffness(GAZE_EYE_STIFFNESS), dt);
-      eyePitch = damp(eyePitch, eyeTargetPitch, stiffness(GAZE_EYE_STIFFNESS), dt);
+      eyeYaw = damp(eyeYaw, eyeTargetYaw, stiffness(live.eye), dt);
+      eyePitch = damp(eyePitch, eyeTargetPitch, stiffness(live.eye), dt);
 
       /**
        * 3) 躯干：最慢，而且**只在大幅偏航时**跟一点点。
@@ -226,7 +248,7 @@ export function createGazeController(
        */
       const spineTargetYaw =
         Math.sign(targetYaw) * Math.max(0, Math.abs(targetYaw) - GAZE_SPINE_YAW_THRESHOLD_RAD) * GAZE_SPINE_SHARE;
-      spineYaw = damp(spineYaw, spineTargetYaw, stiffness(GAZE_SPINE_STIFFNESS), dt);
+      spineYaw = damp(spineYaw, spineTargetYaw, stiffness(live.spine), dt);
 
       if (head) sink.add(head, yaw, pitch);
       // 眼球：叠在头部之上的额外量
