@@ -1,4 +1,4 @@
-﻿/**
+/**
  * GLB 加载管线（渲染侧，ADR 0009 D1/D3/D5/D6）。
  *
  * - 字节来自只读 `pet-asset://asset/model`（fetch → ArrayBuffer → GLTFLoader.parse），
@@ -14,10 +14,13 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { matchesHiddenAttachment } from '../../shared/attachments';
 import { pickDominantColor, type Rgb } from '../../shared/color';
+import { DRAG_SWING_PROFILE_BANDS } from '../../shared/constants';
 import {
+  MODEL_FRAME_PADDING,
   matchesFrameExclude,
   mergeBounds,
   pixelsPerUnitFor,
+  viewPaddingShare,
   type Bounds3,
 } from '../../shared/model-frame';
 
@@ -50,6 +53,26 @@ const FOOT_R_BONE = 'Bip001 R Foot';
  */
 const EYELID_L_BONE = 'Bip001 bone_eye_D_L';
 const EYELID_R_BONE = 'Bip001 bone_eye_D_R';
+/**
+ * 眼睛链的其余骨骼（ADR 0057 D3.2）。
+ *
+ * 本资产的"眼睛"不是一根骨：`eye_L/R` 是**眼卡片的根骨**（它被片段平移 -0.00016 ≈ -9px），
+ * `eye_L_1/_2` 是卡片上的子骨（坐姿片段在 16.2s 把它们各转了 ±0.077quat ≈ ±8.8°），
+ * `bone_eye_D_*` 是眼皮、`_01/_02` 是眼皮子骨（眨眼/眯眼的平移链）。
+ *
+ * 坐姿停帧时这些骨全部被冻在片段那一刻 —— 只覆盖"上半身四根 + 眼卡片旋转"不够：
+ * 眼睛看起来仍然是眯着的（真机 A/B：虹膜被上眼睑压住、眼卡片下移）。
+ * 所以坐姿阶段 B 要**照抄站立待机的整条眼睛链**（旋转 + 位置），与 ADR 0048 的
+ * "上半身照抄站立"同一条思路。
+ */
+const EYE_L1_BONE = 'Bip001 eye_L_1';
+const EYE_L2_BONE = 'Bip001 eye_L_2';
+const EYE_R1_BONE = 'Bip001 eye_R_1';
+const EYE_R2_BONE = 'Bip001 eye_R_2';
+const EYELID_L1_BONE = 'Bip001 bone_eye_D_L_01';
+const EYELID_L2_BONE = 'Bip001 bone_eye_D_L_02';
+const EYELID_R1_BONE = 'Bip001 bone_eye_D_R_01';
+const EYELID_R2_BONE = 'Bip001 bone_eye_D_R_02';
 
 /**
  * GLTFLoader 会对节点名做 `sanitizeNodeName`（空格→下划线、去掉保留字符），
@@ -84,6 +107,14 @@ const BONE_TARGETS = {
   footR: normalizeBoneName(FOOT_R_BONE),
   eyelidL: normalizeBoneName(EYELID_L_BONE),
   eyelidR: normalizeBoneName(EYELID_R_BONE),
+  eyeL1: normalizeBoneName(EYE_L1_BONE),
+  eyeL2: normalizeBoneName(EYE_L2_BONE),
+  eyeR1: normalizeBoneName(EYE_R1_BONE),
+  eyeR2: normalizeBoneName(EYE_R2_BONE),
+  eyelidL1: normalizeBoneName(EYELID_L1_BONE),
+  eyelidL2: normalizeBoneName(EYELID_L2_BONE),
+  eyelidR1: normalizeBoneName(EYELID_R1_BONE),
+  eyelidR2: normalizeBoneName(EYELID_R2_BONE),
 } as const;
 
 export interface ModelBones {
@@ -113,6 +144,18 @@ export interface ModelBones {
   /** 眼皮（`bone_eye_D_L/R`）：眨眼靠它的本地 x 平移（ADR 0044 D4） */
   eyelidL: THREE.Bone | null;
   eyelidR: THREE.Bone | null;
+  /**
+   * 眼睛链的其余骨（ADR 0057 D3.2）：`eye_*_1/_2` 是眼卡片子骨、
+   * `bone_eye_D_*_01/_02` 是眼皮子骨。缺失只是"坐姿眼睛不能完全照抄站立"，不算致命。
+   */
+  eyeL1: THREE.Bone | null;
+  eyeL2: THREE.Bone | null;
+  eyeR1: THREE.Bone | null;
+  eyeR2: THREE.Bone | null;
+  eyelidL1: THREE.Bone | null;
+  eyelidL2: THREE.Bone | null;
+  eyelidR1: THREE.Bone | null;
+  eyelidR2: THREE.Bone | null;
 }
 
 export interface LoadedModel {
@@ -130,6 +173,12 @@ export interface LoadedModel {
   hiddenMeshes: string[];
   /** 可见网格（地面校正的采样对象） */
   meshes: THREE.Mesh[];
+  /**
+   * 侧影行剖面（**已平移到"脚底中心为原点"的模型单位**，ADR 0058 D3）：
+   * 拖拽单摆的视口约束用它判断"这一摆会不会把头发/身体顶出窗口"。
+   * 空数组 = 没测到（约束退回兜底下限）。换算成 px 只需乘当前 `pixelsPerUnit`。
+   */
+  silhouette: SilhouetteBand[];
   /** 模型自带动画（44 段；由 animation-controller 选择与播放） */
   animations: THREE.AnimationClip[];
   bones: ModelBones;
@@ -282,15 +331,174 @@ export function measureAnimatedBounds(
   root: THREE.Object3D,
   meshes: readonly THREE.Mesh[],
   maxSamplesPerMesh = 4096,
-  excludePattern: RegExp = /(halo|weapon|prop|brush|outline)/i,
+  excludePattern: RegExp = DEFAULT_BODY_EXCLUDE,
 ): { minX: number; maxX: number; minY: number } | null {
+  let minX = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let measured = 0;
+
+  sampleBodyVertices(root, meshes, maxSamplesPerMesh, excludePattern, (x, y) => {
+    if (y < minY) minY = y;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    measured += 1;
+  });
+
+  if (measured === 0 || !Number.isFinite(minY) || !Number.isFinite(minX) || !Number.isFinite(maxX)) {
+    return null;
+  }
+  return { minX, maxX, minY };
+}
+
+/** 侧影行剖面的一带（root 局部单位，与 `measureAnimatedBounds` 同一坐标系）。 */
+export interface SilhouetteBand {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}
+
+/**
+ * **侧影行剖面**（ADR 0058 D3）：把身体顶点按高度分 `bands` 带，每带记 [minX, maxX]。
+ *
+ * 用途：单摆绕抓取点旋转时，判断"这一摆会不会把头发/身体顶出窗口"。
+ * 为什么不用包围盒四角：本资产的包围盒在**脚底那一行**也是 ±183px，
+ * 而真实的脚只有 ±67px —— 用四角会把"空中根本不存在的角落"当成实体，
+ * 抓头单摆只能摆到 7°（ADR 0058 D2 实测）。16 带剖面的真实侧影能摆到 16°。
+ *
+ * 只做一次（加载时，每网格 ≤4096 点），不参与逐帧；坐标是 root 局部单位，
+ * 到像素的换算由调用方按当前 `pixelsPerUnit` 做（缩放/边距变化时不需要重测）。
+ */
+export function measureSilhouette(
+  root: THREE.Object3D,
+  meshes: readonly THREE.Mesh[],
+  bands = DRAG_SWING_PROFILE_BANDS,
+  maxSamplesPerMesh = 4096,
+  excludePattern: RegExp = DEFAULT_BODY_EXCLUDE,
+): SilhouetteBand[] | null {
+  const count = Math.max(1, Math.min(64, Math.round(bands)));
+  const minYOf = new Float64Array(count).fill(Number.POSITIVE_INFINITY);
+  const maxYOf = new Float64Array(count).fill(Number.NEGATIVE_INFINITY);
+  const minXOf = new Float64Array(count).fill(Number.POSITIVE_INFINITY);
+  const maxXOf = new Float64Array(count).fill(Number.NEGATIVE_INFINITY);
+  const xOf: number[] = [];
+  const yOf: number[] = [];
+
+  sampleBodyVertices(root, meshes, maxSamplesPerMesh, excludePattern, (x, y) => {
+    xOf.push(x);
+    yOf.push(y);
+  });
+  if (xOf.length === 0) return null;
+
+  let low = Number.POSITIVE_INFINITY;
+  let high = Number.NEGATIVE_INFINITY;
+  for (const y of yOf) {
+    if (y < low) low = y;
+    if (y > high) high = y;
+  }
+  const span = high - low;
+  if (!(span > 0)) return null;
+
+  for (let i = 0; i < xOf.length; i += 1) {
+    const x = xOf[i]!;
+    const y = yOf[i]!;
+    let band = Math.floor(((y - low) / span) * count);
+    if (band < 0) band = 0;
+    if (band >= count) band = count - 1;
+    if (y < minYOf[band]!) minYOf[band] = y;
+    if (y > maxYOf[band]!) maxYOf[band] = y;
+    if (x < minXOf[band]!) minXOf[band] = x;
+    if (x > maxXOf[band]!) maxXOf[band] = x;
+  }
+
+  const out: SilhouetteBand[] = [];
+  for (let band = 0; band < count; band += 1) {
+    if (!Number.isFinite(minXOf[band]!)) continue;
+    out.push({
+      minX: minXOf[band]!,
+      maxX: maxXOf[band]!,
+      minY: minYOf[band]!,
+      maxY: maxYOf[band]!,
+    });
+  }
+  return out.length > 0 ? out : null;
+}
+
+/** 身体采样的排除规则（与 `HIDE_ATTACHMENTS` 同源：光环/武器/道具/笔刷/描边不算身体）。 */
+const DEFAULT_BODY_EXCLUDE = /(halo|weapon|prop|brush|outline)/i;
+
+/**
+ * 当前姿态下**整具模型在场景世界坐标里的包围盒**（只给诊断/取证用，ADR 0058 D4）。
+ *
+ * 与 `measureAnimatedBounds()` 的区别：那个返回 root 局部坐标、且排除光环
+ * （坐姿平移补偿用）；这里返回**世界坐标**、包含光环（"她整块有没有出画"要以看得见的东西为准），
+ * 世界单位 = CSS px，所以可以直接和内容区矩形 [0,W]×[0,H] 比较。
+ *
+ * 采样预算刻意小（2048/网格）：它只回答"有没有出画"，±2px 的精度足够。
+ */
+export function measureWorldBounds(
+  root: THREE.Object3D,
+  meshes: readonly THREE.Mesh[],
+  maxSamplesPerMesh = 2048,
+  excludePattern: RegExp = /(weapon|prop|brush|outline)/i,
+): { minX: number; maxX: number; minY: number; maxY: number } | null {
   root.updateMatrixWorld(true);
   const point = new THREE.Vector3();
   const world = new THREE.Vector3();
   let minX = Number.POSITIVE_INFINITY;
   let maxX = Number.NEGATIVE_INFINITY;
   let minY = Number.POSITIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
   let measured = 0;
+
+  for (const mesh of meshes) {
+    if (!mesh.visible) continue;
+    if (excludePattern.test(mesh.name || '')) continue;
+    const geometry = mesh.geometry;
+    const position = geometry?.getAttribute('position');
+    if (!position || position.count === 0) continue;
+    const skinned =
+      (mesh as THREE.SkinnedMesh).isSkinnedMesh &&
+      geometry.getAttribute('skinIndex') &&
+      geometry.getAttribute('skinWeight')
+        ? (mesh as THREE.SkinnedMesh)
+        : null;
+    const stride = Math.max(1, Math.floor(position.count / maxSamplesPerMesh));
+    for (let i = 0; i < position.count; i += stride) {
+      point.fromBufferAttribute(position, i);
+      if (skinned && skinned.skeleton) skinned.applyBoneTransform(i, point);
+      world.copy(point);
+      mesh.localToWorld(world);
+      if (world.x < minX) minX = world.x;
+      if (world.x > maxX) maxX = world.x;
+      if (world.y < minY) minY = world.y;
+      if (world.y > maxY) maxY = world.y;
+      measured += 1;
+    }
+  }
+  if (measured === 0) return null;
+  return { minX, maxX, minY, maxY };
+}
+
+
+/**
+ * 遍历身体网格的顶点，把每个顶点换算成 **root 局部坐标** 后交给 `visit`。
+ *
+ * 两条测量（地面最低点 / 侧影剖面）共用这一份遍历，避免"同一件事两份实现"。
+ * 采样是等步长抽稀（每网格 ≤ `maxSamplesPerMesh` 点），所以两种测量看到的
+ * 是同一批顶点 —— 诊断里两个数字互相自洽。
+ */
+function sampleBodyVertices(
+  root: THREE.Object3D,
+  meshes: readonly THREE.Mesh[],
+  maxSamplesPerMesh: number,
+  excludePattern: RegExp,
+  visit: (x: number, y: number) => void,
+): void {
+  root.updateMatrixWorld(true);
+  const point = new THREE.Vector3();
+  const world = new THREE.Vector3();
 
   for (const mesh of meshes) {
     if (!mesh.visible) continue;
@@ -317,17 +525,9 @@ export function measureAnimatedBounds(
       world.copy(point);
       mesh.localToWorld(world);
       root.worldToLocal(world);
-      if (world.y < minY) minY = world.y;
-      if (world.x < minX) minX = world.x;
-      if (world.x > maxX) maxX = world.x;
-      measured += 1;
+      visit(world.x, world.y);
     }
   }
-
-  if (measured === 0 || !Number.isFinite(minY) || !Number.isFinite(minX) || !Number.isFinite(maxX)) {
-    return null;
-  }
-  return { minX, maxX, minY };
 }
 
 /**
@@ -336,6 +536,9 @@ export function measureAnimatedBounds(
  * 约定：调用方把父节点（animationRoot）放在内容区底边中心；本函数只把模型的
  * 取景包围盒底边对齐到父节点原点、水平/前后居中，并设置统一缩放。
  * 可在 resize 时重复调用。
+ *
+ * ADR 0058 D1：内容区高度里含**头顶安全边距**（`viewPaddingShare()`），
+ * 所以她的像素尺寸只与内容高成正比、与边距无关（1.0x 与加边距之前一模一样）。
  */
 export function placeModel(
   root: THREE.Object3D,
@@ -343,7 +546,12 @@ export function placeModel(
   contentHeight: number,
 ): number {
   const frameHeightUnits = Math.max(1e-9, frame.maxY - frame.minY);
-  const pixelsPerUnit = pixelsPerUnitFor(frameHeightUnits, contentHeight);
+  const pixelsPerUnit = pixelsPerUnitFor(
+    frameHeightUnits,
+    contentHeight,
+    MODEL_FRAME_PADDING,
+    viewPaddingShare(),
+  );
   const centerX = (frame.minX + frame.maxX) / 2;
   const centerZ = (frame.minZ + frame.maxZ) / 2;
 
@@ -402,6 +610,14 @@ export async function loadModel(options: LoadModelOptions): Promise<LoadedModel>
     footR: null,
     eyelidL: null,
     eyelidR: null,
+    eyeL1: null,
+    eyeL2: null,
+    eyeR1: null,
+    eyeR2: null,
+    eyelidL1: null,
+    eyelidL2: null,
+    eyelidR1: null,
+    eyelidR2: null,
   };
   const materialNames = new Set<string>();
   let triangleCount = 0;
@@ -436,6 +652,15 @@ export async function loadModel(options: LoadModelOptions): Promise<LoadedModel>
       else if (normalized === BONE_TARGETS.footR) bones.footR = bone;
       else if (normalized === BONE_TARGETS.eyelidL) bones.eyelidL = bone;
       else if (normalized === BONE_TARGETS.eyelidR) bones.eyelidR = bone;
+      // ADR 0057 D3.2：眼睛链的其余骨（眼卡片子骨 + 眼皮子骨）
+      else if (normalized === BONE_TARGETS.eyeL1) bones.eyeL1 = bone;
+      else if (normalized === BONE_TARGETS.eyeL2) bones.eyeL2 = bone;
+      else if (normalized === BONE_TARGETS.eyeR1) bones.eyeR1 = bone;
+      else if (normalized === BONE_TARGETS.eyeR2) bones.eyeR2 = bone;
+      else if (normalized === BONE_TARGETS.eyelidL1) bones.eyelidL1 = bone;
+      else if (normalized === BONE_TARGETS.eyelidL2) bones.eyelidL2 = bone;
+      else if (normalized === BONE_TARGETS.eyelidR1) bones.eyelidR1 = bone;
+      else if (normalized === BONE_TARGETS.eyelidR2) bones.eyelidR2 = bone;
     }
     // `HaloRoot` 是光环的枢轴（`CH0335_Halo` 的父节点）：它是普通 Object3D，
     // 不在骨骼层级里，也不会被任何片段驱动 —— 角色一移动，光环就留在原地。
@@ -541,6 +766,24 @@ export async function loadModel(options: LoadModelOptions): Promise<LoadedModel>
   const pixelsPerUnit = placeModel(root, bounds.frame, options.contentHeight);
   root.updateMatrixWorld(true);
 
+  /**
+   * ADR 0058 D3：侧影行剖面**在加载时测一次**（root 局部单位，再平移到
+   * "脚底中心为原点"——与 `placeModel()` 的换算同一套：减去取景中心 x 与取景底边 y）。
+   *
+   * 采样预算比地面校正大一倍（8192/网格）：剖面要的是"最外那几个点"，
+   * 抽稀太狠会把最宽的一根头发漏掉，摆角约束就会算得太宽。
+   */
+  const frameCenterX = (bounds.frame.minX + bounds.frame.maxX) / 2;
+  const frameBaseY = bounds.frame.minY;
+  const silhouette = (measureSilhouette(root, meshes, DRAG_SWING_PROFILE_BANDS, 8192) ?? []).map(
+    (band) => ({
+      minX: Number((band.minX - frameCenterX).toFixed(6)),
+      maxX: Number((band.maxX - frameCenterX).toFixed(6)),
+      minY: Number((band.minY - frameBaseY).toFixed(6)),
+      maxY: Number((band.maxY - frameBaseY).toFixed(6)),
+    }),
+  );
+
   // 原材质与几何不再需要：材质已替换，几何由 root 持有
   for (const source of converted.keys()) source.dispose();
 
@@ -551,6 +794,7 @@ export async function loadModel(options: LoadModelOptions): Promise<LoadedModel>
     frame: bounds.frame,
     scene: bounds.scene,
     pixelsPerUnit,
+    silhouette,
     modelId: options.modelId,
     loadMs,
     hasMorphTargets,

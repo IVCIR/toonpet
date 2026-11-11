@@ -165,6 +165,103 @@ test('playOnce：片段缺失时返回 false（调用方走程序化降级）', 
   assert.equal(animations.roles.greet.name, null);
 });
 
+/**
+ * ADR 0057 D1.3：`playHold()`（坐姿停帧）与 `playOnce()`（摸头）也必须把
+ * "交叉淡入半途的第三个 action"淡出。
+ *
+ * 这是真机"姿势抽搐"的第二条根因：`crossFadeFrom(previous)` 只认上一个 action，
+ * 而待机站姿轮换有 0.8s、坐姿进场有 0.45s —— 足够让第三个 action 停在 0.5 的权重上。
+ * 它不会被任何后续操作淡出，于是"坐姿叠着站姿、起身之后还挂着"，读起来就是抽搐。
+ */
+test('playHold：停帧姿态接管时把半途的第三个 action 一并淡出（ADR 0057 D1.3）', () => {
+  const root = new THREE.Object3D();
+  const bone = new THREE.Object3D();
+  bone.name = 'Bip001_Spine';
+  root.add(bone);
+  const make = (name: string, duration = 1) =>
+    new THREE.AnimationClip(name, duration, [
+      new THREE.NumberKeyframeTrack(`${bone.name}.position[y]`, [0, duration], [0, 1]),
+    ]);
+  const animations = createModelAnimations(root, [
+    make('CH0335_Cafe_Idle'),
+    make('CH0335_Formation_Idle'),
+    make('CH0335_my_event088_pastmemory_01', 20),
+  ]);
+
+  // idle → 待机轮换淡入 alt1 到半途（0.8s 的淡入只走了 0.1s）
+  assert.equal(animations.play('idle', 0), true);
+  assert.equal(animations.playRole('idle.alt1', 0.8, 'idle'), true);
+  animations.update(0.1);
+  const staleBefore = animations.actions().find((action) => action.name === 'CH0335_Cafe_Idle');
+  assert.ok((staleBefore?.weight ?? 0) > 0.5, `半途应有残留：${String(staleBefore?.weight)}`);
+
+  // 落座：playHold 只 crossFadeFrom(alt1)，旧实现会把 Cafe_Idle 永久留在 0.5
+  assert.equal(animations.playHold('sit', 0.45), true);
+  for (let i = 0; i < 12; i += 1) animations.update(0.05);
+  const stale = animations.actions().find((action) => action.name === 'CH0335_Cafe_Idle');
+  assert.ok((stale?.weight ?? 0) < 0.05, `残留的 Cafe_Idle 必须被淡出：${String(stale?.weight)}`);
+  assert.ok(animations.roleWeight('sit') > 0.95, `坐姿权重必须独占：${animations.roleWeight('sit')}`);
+});
+
+test('playOnce：摸头接管身体时同样把半途的第三个 action 淡出（ADR 0057 D1.3）', () => {
+  const root = new THREE.Object3D();
+  const bone = new THREE.Object3D();
+  bone.name = 'Bip001_Spine';
+  root.add(bone);
+  const make = (name: string, duration = 1) =>
+    new THREE.AnimationClip(name, duration, [
+      new THREE.NumberKeyframeTrack(`${bone.name}.position[y]`, [0, duration], [0, 1]),
+    ]);
+  const animations = createModelAnimations(root, [
+    make('CH0335_Cafe_Idle'),
+    make('CH0335_Formation_Idle'),
+    make('CH0335_Victory_Start_Random', 5),
+  ]);
+
+  assert.equal(animations.play('idle', 0), true);
+  assert.equal(animations.playRole('idle.alt1', 0.8, 'idle'), true);
+  animations.update(0.1);
+  assert.equal(animations.playOnce('pat'), true);
+  for (let i = 0; i < 12; i += 1) animations.update(0.05);
+  const stale = animations.actions().find((action) => action.name === 'CH0335_Cafe_Idle');
+  assert.ok((stale?.weight ?? 0) < 0.05, `残留的 Cafe_Idle 必须被淡出：${String(stale?.weight)}`);
+});
+
+/**
+ * ADR 0057 D1.4：坐姿退场后**不许有任何坐姿相关 action 还在权重里**。
+ *
+ * 真机现象：从 sitting 回到 idle/walking 时上半身拧着、头随光标抽搐。除了骨骼覆写
+ * 没释放之外，另一半原因是"停帧的坐姿 action 权重没归零"——`clampWhenFinished` 会把
+ * action 置成 `paused`，看起来"停了"，但权重仍然是 1、姿态仍然参与混合。
+ */
+test('clearHold + play(idle)：坐姿 action 权重必须退到 0（停帧不等于停权）', () => {
+  const root = new THREE.Object3D();
+  const bone = new THREE.Object3D();
+  bone.name = 'Bip001_Pelvis';
+  root.add(bone);
+  const make = (name: string, duration = 1) =>
+    new THREE.AnimationClip(name, duration, [
+      new THREE.NumberKeyframeTrack(`${bone.name}.position[y]`, [0, duration], [0, 1]),
+    ]);
+  const animations = createModelAnimations(root, [
+    make('CH0335_Cafe_Idle'),
+    make('CH0335_my_event088_pastmemory_01', 20),
+  ]);
+
+  animations.play('idle', 0);
+  animations.playHold('sit', 0.2);
+  for (let i = 0; i < 60; i += 1) animations.update(0.05);
+  assert.ok(animations.roleWeight('sit') > 0.99, '停帧后权重仍是 1（姿态仍然生效）');
+
+  // 退场（与生产路径一致：play('idle') 内部会 fadeOutHold）
+  animations.play('idle', 0.28);
+  for (let i = 0; i < 10; i += 1) animations.update(0.05);
+  assert.ok(animations.roleWeight('sit') < 0.02, `坐姿权重必须归零：${animations.roleWeight('sit')}`);
+  const idle = animations.actions().find((action) => action.name === 'CH0335_Cafe_Idle');
+  assert.ok((idle?.weight ?? 0) > 0.95, `idle 必须独占身体：${String(idle?.weight)}`);
+  assert.equal(animations.hold(), null, '退场后不得再留下 hold 状态');
+});
+
 test('语义角色同样按窗口裁剪：坐姿保留 14.2–16.2s（ADR 0051 两段式）', () => {
   const root = new THREE.Object3D();
   const bone = new THREE.Object3D();

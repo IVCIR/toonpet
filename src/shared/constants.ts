@@ -53,11 +53,71 @@ export const DRAG_VELOCITY_WINDOW_MS = 100;
 // --- 窗口几何（契约 §3.2、§3.4 D-7、ADR 0003、ADR 0004 D8） ---
 export const WINDOW_WIDTH_PX = 480;
 export const WINDOW_HEIGHT_PX = 720;
+/**
+ * **视口安全边距**（px，1.0x 基准，ADR 0058 D1）。
+ *
+ * 窗口尺寸/正交视锥一直只按"模型静态包围盒 × 1.15"算：那个 1.15 的留白**只在头顶**
+ * （94px），左右各只剩 27px。于是拖拽摇晃时，单摆把整身绕抓取点转起来，头发和身体
+ * 边缘几帧之内就顶出窗口被裁掉——真机"头发被窗口边缘切掉"就是这一条。
+ *
+ * 这个常量是**额外**加在包围盒外面的空白：左右各一份，头顶一份（见 `computeWindowSize`）。
+ * 底边**不加**：契约 §1.2 的锚点是"窗口底边中心 = 她脚底"，加了下边距脚底就离地，
+ * 吸附/落地/行走/坐姿的坐标系会全部要重算。
+ *
+ * 36px 的取值依据（ADR 0058 D2 有实测）：1.0x 时模型宽 367px、窗口 494px，左右各 63px；
+ * 侧影最宽处在髋部（±183px），按真实侧影算，抓头单摆可摆到 ≈0.28rad（16°）才碰边，
+ * 而物理上限是 0.35rad —— 也就是说绝大多数摇晃完全用不满边距，只有极端甩动会被
+ * `maxSwingAngle()` 收敛（见下面 DRAG_SWING_* 那组常量）。
+ */
+export const MODEL_VIEW_PADDING_PX = 36;
+/**
+ * **左右两侧**的视口安全边距（px，1.0x 基准，ADR 0058 D1）。
+ *
+ * 为什么比上下大：真实机位取证（ADR 0058 D2）量到两件事——
+ * 1. `Formation_Pickup`（被拎起的悬空姿态）的长发是**横向摊开**的：她的侧影从待机的
+ *    ±183px 涨到 ±231px，而且整体偏左约 50px（片段自带根位移）；
+ * 2. 单摆绕抓取点转 θ 时，侧影左右还会再走 `py·sinθ`（实测 0.25rad 时 +18px）。
+ *
+ * 36px 只够 (2)，(1) 会直接把发梢顶到边线上（真机截图：右/左侧头发被垂直切掉一截）。
+ * 64px 覆盖 (1)+(2) 之后还留 ≈24px 余量，因此 1.0x 下摆角可以**用满物理上限**。
+ * 上下不需要这么多：下方是锚点（0px），上方本来就有包围盒的 15% 留白。
+ */
+export const MODEL_VIEW_PADDING_X_PX = 64;
+/**
+ * 1.0x 的**基准内容区高度** = 设计高度 + 头顶安全边距。
+ *
+ * 它是"缩放比例 1.0"的唯一参照：`view.scale = 内容区高 / 本值`、
+ * 掩膜分辨率 `maskSizeFor()` 也以它为 1.0x 基准（缩放后每单元覆盖的 CSS 面积不变）。
+ */
+export const BASE_CONTENT_HEIGHT_PX = WINDOW_HEIGHT_PX + MODEL_VIEW_PADDING_PX;
 export const INPUT_BAR_WIDTH_PX = 260;
 export const INPUT_BAR_HEIGHT_PX = 44;
 export const INPUT_BAR_GAP_PX = 8;
 export const WORKAREA_MIN_KEEP_WIDTH_PX = 80; // D-7
 export const WORKAREA_MIN_KEEP_HEIGHT_PX = 120; // D-7
+
+// --- 整体缩放（ADR 0057 D2、契约 §3.2 / §7.9） ---
+/**
+ * 角色缩放比例的可调范围（0.5x – 2.0x，默认 1.0x）。
+ *
+ * 语义**只有一个**：窗口内容区宽高 = 基准尺寸 × scale（等比），窗口底边中心固定不动。
+ * 模型不需要单独缩放——`placeModel()` 的 `pixelsPerUnit = 内容高 / (取景高 × 1.15)`，
+ * 所以窗口变高 = 模型同比变大，脚底仍然贴着内容区底边（ADR 0009 D4 的定标不变）。
+ */
+export const CHARACTER_SCALE_MIN = 0.5;
+export const CHARACTER_SCALE_MAX = 2.0;
+export const CHARACTER_SCALE_DEFAULT = 1.0;
+/**
+ * 缩放的**实际上限还受屏幕工作区限制**（ADR 0057 D2.3）。
+ *
+ * 2.0x 在 720 高的基准上就是 1440px 高：1080p 桌面的工作区只有约 1040px，
+ * 硬放会把她的头切在屏幕外、而且窗口超出工作区后拖不回来。因此实际生效的缩放
+ * = `min(请求值, 工作区能装下的比例)`，差额在诊断里报 `clamped=true`。
+ */
+export const CHAR_SCALE_FIT_MARGIN_PX = 0;
+/** 掩膜采集分辨率随缩放变化：每 CSS px 的采样密度保持不变（ADR 0057 D2.5） */
+export const MASK_SCALE_MIN = 0.5;
+export const MASK_SCALE_MAX = 2;
 
 // --- 编排（契约 §9.1–§9.4、§12；ADR 0015 D1） ---
 export const LLM_HEALTH_TIMEOUT_MS = 800; // 健康检查（/api/tags）
@@ -324,6 +384,61 @@ export const DRAG_SUPPORT_ACCEL_MAX = 6000;
 /** 姿态增益淡入/淡出（ms） */
 export const DRAG_POSE_RAMP_MS = 180;
 export const DRAG_RELEASE_POSE_FADE_MS = 420;
+/**
+ * 被拎起来时**离地的最低高度**（px，1.0x 基准，ADR 0058 D5）。
+ *
+ * 为什么需要一个常量而不只是补"片段造成的下沉"：绕抓取点旋转时，**脚一定会往下扫**
+ * （支点在头上、脚在下方 465px，θ=0.27 时左脚要沉到地线以下 ≈32px）。
+ * 只补下沉量的话，这个"几何下沉"会把摆角上限压到 0.02rad（等于没有单摆）。
+ *
+ * 32px（≈她身高的 5%）是"被拎离地"的视觉量：既给了摆角空间，又符合
+ * "被抱起来当然离开地面"的常识。按当前缩放同比放大。
+ */
+export const DRAG_LIFT_MIN_PX = 32;
+/**
+ * 侧影剖面在拖拽中的**重采样时刻**（ms，从 `drag_started` 起算，ADR 0058 D3）。
+ *
+ * 为什么要多次：悬空片段是**动态**的——她蜷起来的那一下，长发会甩到两侧（实测
+ * 0.2s 时还是待机的 182px，1s 后到 210px 以上），一次测量覆盖不住。
+ * 每次测完把新点**并入**已有剖面（只增不减），于是摆角上限只会往下收、不会来回抖。
+ * 4 次采样合计 ≈20ms，均摊在 1.4s 里，肉眼无感。
+ */
+export const DRAG_SWING_RECALIBRATE_MS = [220, 550, 900, 1400] as const;
+/**
+ * 摆角上限的收敛时间常数（ms）。
+ *
+ * 剖面变宽 → 上限变小。若直接跳变，正在摆的那一帧会突然少转几度（看得见的抽搐）。
+ * 用 120ms 的指数收敛把它压成"慢慢转到墙边"。
+ */
+export const DRAG_SWING_LIMIT_SMOOTH_MS = 120;
+
+// --- 单摆摆角的视口约束（ADR 0058 D3） ---
+/**
+ * 侧影行剖面的分带数：加载时把模型顶点按高度分成这么多带，每带记 [minX, maxX]。
+ *
+ * 为什么不用包围盒四角：本资产的包围盒（367×626）在**脚底那一行**也是 ±183px，
+ * 但真实的脚只有 ±67px —— 用四角会把"空中的假角落"当成实体，抓头单摆只能摆 7°。
+ * 用 16 带剖面的真实侧影，同一个窗口可以摆到 16°（实测，ADR 0058 D2）。
+ */
+export const DRAG_SWING_PROFILE_BANDS = 16;
+/**
+ * 摆角约束的求解分辨率（扫描步数）：`θ = limit × k / steps`。
+ *
+ * 32 步在 0.35rad 上限下是 0.011rad（0.63°）的粒度，肉眼看不出来；
+ * 每一步只做"带数 × 2"个点的旋转，且**只在拖拽开始/窗口缩放时算一次**（不是每帧）。
+ */
+export const DRAG_SWING_LIMIT_STEPS = 32;
+/**
+ * 摆角约束的安全余量（px）：真实侧影是从**顶点抽样**（每网格 ≤4096 点）估的，
+ * 且拖拽姿态（`Formation_Pickup`）与测量姿态（待机）不完全一致，
+ * 所以按"可用半宽 − 这个值"来解，宁可少摆 2px 也不要贴边裁掉。
+ */
+export const DRAG_SWING_SAFETY_PX = 4;
+/**
+ * 摆角的兜底下限（rad）：模型数据异常（侧影测不到、窗口过窄）时也**不能**把摆角压成 0，
+ * 否则拖拽会变成"整身硬邦邦地跟着窗口平移"。0.06rad ≈ 3.4°。
+ */
+export const DRAG_SWING_MIN_ANGLE_RAD = 0.06;
 
 /**
  * 三种抓取的单摆参数（初始标定值，实机可调）。
@@ -408,6 +523,30 @@ export const SIT_CLIP_HOLD_SECONDS = 16.2;
  * 再长则 16.2s 停帧之后还有明显两个姿态在混。
  */
 export const SIT_STAGE_B_FADE_MS = 300;
+/**
+ * **退出坐姿的交接窗口**（ms，ADR 0057 D1）。
+ *
+ * 从离开 `sitting`（拖拽 / 点击 / 命令 / 目标消失）的那一刻起算，这段时间内必须
+ * 把下面四类"坐姿残留"平滑归零、并把控制权交还 `AnimationMixer`：
+ *
+ * 1. 上半身基底覆写（`Spine` / `Spine1` / `Neck` / `Head` 的 `overrideBase`）；
+ * 2. 眼骨基底覆写与眼皮"睁眼"位置覆写（ADR 0057 D3）；
+ * 3. 下坐弹簧（`sitDrop`）与坐姿增益（`sitGain` / `sitPoseGain`）；
+ * 4. 坐姿微动作池的三个权重（`legs` / `hands` / `far`）。
+ *
+ * 为什么必须有这个窗口：`overrideBase()` 是**持续生效**的（`endFrame()` 每帧都写），
+ * 旧实现只按"坐姿权重 > 0 时提交"，权重归零后**没有一处把覆写清成 `null`**，
+ * 于是头/颈/胸/下背/眼球被永久冻在最后一次混合出的坐姿四元数上（真机：站着走路时
+ * 上半身拧着、头随光标抽搐）。
+ */
+export const SIT_UPPER_HANDOVER_MS = 300;
+/**
+ * 离开坐姿时**片段本身**的交叉淡出时长（秒）。
+ *
+ * 刻意比 `SIT_UPPER_HANDOVER_MS` 短 20ms：上半身覆写归零的那一帧，片段权重必须已经到 0，
+ * 否则"身体平移补偿（乘 sitPoseGain）"会在最后一帧掉一块（实测 0.02 的残权 ≈ 5px 位移）。
+ */
+export const SIT_EXIT_CROSSFADE_SECONDS = 0.28;
 /**
  * 阶段 A（14.2–16.0s）的**抬头补偿**（rad，正 = 低头、负 = 抬头；与 `BoneArbiter` 同口径）。
  *

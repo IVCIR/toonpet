@@ -17,7 +17,12 @@
 import * as THREE from 'three';
 import { DEFAULT_HIDE_ATTACHMENTS } from '../../shared/attachments';
 import {
+  DRAG_LIFT_MIN_PX,
   DRAG_POSE_RAMP_MS,
+  DRAG_SWING_PROFILE_BANDS,
+  DRAG_SWING_LIMIT_SMOOTH_MS,
+  DRAG_SWING_MIN_ANGLE_RAD,
+  DRAG_SWING_RECALIBRATE_MS,
   DRAG_RELEASE_POSE_FADE_MS,
   DRAG_SUPPORT_ACCEL_DEADBAND,
   DRAG_SUPPORT_ACCEL_EMA_MS,
@@ -31,7 +36,6 @@ import {
   IDLE_VARIATION_FADE_SECONDS,
   LANDING_DURATION_MS,
   LANDING_MAX_SQUASH,
-  MASK_HEIGHT,
   MICRO_POOL_MAX_MS,
   MICRO_POOL_MIN_MS,
   MICRO_POOL_TRANSITION_RATE,
@@ -51,6 +55,9 @@ import {
   SIT_MICRO_HANDS_LEG_SCALE,
   SIT_MICRO_HANDS_SPINE_PITCH_RAD,
   SIT_MICRO_POOL,
+  SIT_EXIT_CROSSFADE_SECONDS,
+  SIT_UPPER_HANDOVER_MS,
+  BASE_CONTENT_HEIGHT_PX,
 } from '../../shared/constants';
 import type { IdleMicroKind, SitMicroKind } from '../../shared/constants';
 import type { BroadcastEvent } from '../../shared/events';
@@ -66,8 +73,9 @@ import type { ActionStatus, AnimationSlot, ModelAnimations, OneShotStatus } from
 import { createBoneArbiter } from './bone-arbiter';
 import type { BoneArbiter } from './bone-arbiter';
 import type { ClipRole } from './clip-bank';
-import { createDragPendulum, pivotCompensation, stepDragPendulum, struggleOffset } from './drag-motion';
-import type { DragBand, DragPendulumState } from './drag-motion';
+import { createDragPendulum, maxSwingAngle, pendulumConfigFor, pivotCompensation, stepDragPendulum } from './drag-motion';
+import { struggleOffset } from './drag-motion';
+import type { DragBand, DragPendulumState, SwingPoint } from './drag-motion';
 import { approach, walkYawFor, EMOTION_FACE, EMOTION_FADE_MS, fadeProgress, resolveMouthOwner } from './emotion-face';
 import type { BlushLevel, EmotionFace, EyeAssetKey, MouthOwner, MouthShape } from './emotion-face';
 import { loadExpressionAssets } from './expression-assets';
@@ -101,7 +109,14 @@ import {
   tintSkinVertices,
 } from './material-diagnostics';
 import type { MeshMaterialFacts } from './material-diagnostics';
-import { loadModel, measureAnimatedMinY, measureAnimatedBounds, placeModel } from './model-loader';
+import {
+  loadModel,
+  measureAnimatedBounds,
+  measureAnimatedMinY,
+  measureSilhouette,
+  measureWorldBounds,
+  placeModel,
+} from './model-loader';
 import type { LoadedModel, ModelBones } from './model-loader';
 import { createMicroPool } from './micro-pool';
 import type { MicroPoolSnapshot } from './micro-pool';
@@ -110,7 +125,7 @@ import type { PlaceholderModel } from './placeholder';
 import { createSitMotion } from './sit-motion';
 import type { SitMotionFrame } from './sit-motion';
 import { createSitDrop } from './sit-drop';
-import { sitStageBBlend, sitStageBLocalSeconds } from './sit-sequence';
+import { sitStageBBlend, sitStageBLocalSeconds, sitUpperExitBlend } from './sit-sequence';
 import { headTiltFromBind, headWorldPitch, headWorldYaw } from './sit-head';
 import { sitPose } from './sit-pose';
 import { startleDurationMs, startlePose } from './startle';
@@ -133,9 +148,8 @@ const WALK_IN_FADE_SECONDS = 0.3;
 const WALK_OUT_FADE_SECONDS = 0.35;
 /** 回弹过程中从悬空姿态淡回 Idle（ADR 0024 D3） */
 const SETTLE_FADE_SECONDS = 0.45;
-/** 坐姿的进出淡入（ADR 0028 D8）：进 0.45s（片段本身也正"坐下去"），出 0.35s */
+/** 坐姿的进出淡入（ADR 0028 D8）：进 0.45s（片段本身也正"坐下去"），出见 constants 的 0.28s */
 const SIT_IN_FADE_SECONDS = 0.45;
-const SIT_OUT_FADE_SECONDS = 0.35;
 /** 加载期"临时切到坐姿采样"用的淡入（不能是 0：three 的权重插值需要正时长） */
 const CALIBRATION_FADE_SECONDS = 0.001;
 
@@ -376,10 +390,34 @@ export interface SitSequenceDiagnostics {
   spineOverlayApplied: number;
   headQuat: [number, number, number, number] | null;
   headWorld: { x: number; y: number } | null;
+  /**
+   * ADR 0058 D7（自检稳定性）：当前实际施加的坐姿平移补偿与它的**原值**。
+   *
+   * 为什么放进这个"轻快照"：`offsetPx = rawOffsetPx × sitPoseGain` 这条不变量
+   * 只能在**同一时刻**读三个量才有意义；而 `getDiagnostics()` 单次 ≈300ms，
+   * 按它采样会错过 0.3s 的落座弹簧（旧断言因此偶发失败）。这两个字段是 O(1) 拷贝。
+   */
+  offsetPx: { x: number; y: number };
+  rawOffsetPx: { x: number; y: number };
+  /** ADR 0057 D1：退出交接的剩余时间（ms）；null = 不在交接中 */
+  handoverRemainingMs: number | null;
+  /** ADR 0057 D3：眼皮"睁眼"覆写的实际权重（0..1） */
+  eyelidApplied: number;
+  /** ADR 0057 D1：此刻仍被覆写的骨骼数（退出后必须为 0） */
+  overrideCount: { rotation: number; position: number };
 }
 
-export interface RenderDiagnostics {
-  ready: boolean;
+/**
+ * ADR 0057 D3：眼睛链上一根骨的本地姿态（旋转 + 位置）。
+ * 绑定姿态 / 站立待机基线 / 阶段 B 起点都用这同一个结构，便于 slerp / lerp 对齐。
+ */
+interface EyePoseEntry {
+  bone: THREE.Bone;
+  quat: THREE.Quaternion;
+  pos: THREE.Vector3;
+}
+
+export interface RenderDiagnostics {  ready: boolean;
   loading: boolean;
   error: string | null;
   modelId: string | null;
@@ -421,6 +459,8 @@ export interface RenderDiagnostics {
     /** 抓取点在内容区 CSS 坐标中的位置 */
     pivot: { x: number; y: number };
     angle: number;
+    /** ADR 0058 D3：摆角的视口约束（= 物理上限表示没被夹过；0 = 还没算） */
+    angleLimit: number;
     omega: number;
     gain: number;
     supportAcceleration: { x: number; y: number };
@@ -519,6 +559,30 @@ export interface RenderDiagnostics {
     headWorld: { x: number; y: number } | null;
     /** 骨骼仲裁器对头骨的最近一帧记录（基底来源 / 提交的偏移） */
     headBase: { baseFrom: 'mixer' | 'cache' | null; yaw: number; pitch: number; roll: number } | null;
+    /**
+     * ADR 0057 D1：退出坐姿的 0.3s 交接。
+     * `active` = 正在交接（已离开 sitting 但覆写还没放完）；`remainingMs` = 剩余时间。
+     */
+    handover: { active: boolean; remainingMs: number; from: number } | null;
+    /**
+     * ADR 0057 D3：坐姿眼皮"睁眼"覆写。
+     * `applied` = 施加到眼皮位置上的插值权重（0 = 片段原样、1 = 完全照抄站立睁眼）。
+     */
+    eyelid: {
+      captured: boolean;
+      applied: number;
+      /** 眼皮骨本地 x（片段值 / 睁眼基线 / 本帧实际值）；缺失时为 null */
+      x: { clip: number | null; idle: number | null; applied: number | null };
+      positionOverridden: boolean;
+    };
+    /**
+     * ADR 0057 D1：此刻仍被坐姿覆写的骨骼名（退出坐姿后必须两个都为空）。
+     */
+    overrides: { rotation: string[]; position: string[] };
+    /**
+     * ADR 0057 D3：眼睛链"照抄站立"的规模与权重（诊断"到底改了几根骨"）。
+     */
+    eyes: { bones: number; applied: number; captured: boolean };
   };
   pat: PatDiagnostics;
   /**
@@ -538,6 +602,25 @@ export interface RenderDiagnostics {
   outline: OutlineDiagnostics;
   /** ADR 0038：上一帧的 draw call / 三角形数与帧时间 EMA（"描边有没有拖慢"的可读口径） */
   render: { calls: number; triangles: number; frameMs: number };
+  /**
+   * ADR 0057 D2：整体缩放的渲染侧事实。
+   *
+   * `scale` = 内容区高 / 基准高（ADR 0058 D1 起含头顶安全边距：756）：窗口被主进程
+   * 按比例改大改小时，`resize()` 会同时改正交视锥与 `pixelsPerUnit`，
+   * 所以模型是"同比"变大的，脚底仍贴底边。
+   * `mask` 是**当前**掩膜分辨率（随缩放自适应，见 `maskSizeFor`）。
+   */
+  view: {
+    width: number;
+    height: number;
+    scale: number;
+    pixelsPerUnit: number | null;
+    mask: { width: number; height: number };
+    faceZoom: number;
+    /** ADR 0058 D3：侧影剖面的带数（0 = 没测到）与当前摆角上限 */
+    silhouetteBands: number;
+    swingLimit: number | null;
+  };
   probePoints: { head: { x: number; y: number } | null; body: { x: number; y: number } | null };
 }
 
@@ -593,6 +676,11 @@ export interface RenderModule {
    * 即 `cmd:probe` 的原始结果）。两者都不可用 → `head = null`。
    */
   headSampleAt(x: number, y: number, maskHead: boolean | null, hit: boolean): HeadSample;
+  /**
+   * 内部（ADR 0058 D4 取证）：当前姿态下她整块在内容区 CSS 坐标里的包围盒（含光环）。
+   * 自检用它断言"拖拽摇晃期间没有任何一帧被窗口边缘裁掉"。**不进** `getDiagnostics()`。
+   */
+  silhouetteCss(): { minX: number; minY: number; maxX: number; maxY: number } | null;
   /** 内部：自检把 20–40s 的行走调度压到 1.5–2s */
   setWalkInterval(minIntervalMs: number, maxIntervalMs: number): void;
   /**
@@ -775,8 +863,40 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
   private sitStageBGain = 0;
   /** ADR 0051：本帧实际施加的坐姿增益（sitGain × sitDrop；诊断用） */
   private sitPoseGain = 0;
-  /** ADR 0051：本帧实际施加的上半身覆盖权重（stageB × sitPoseGain；诊断用） */
+  /**
+   * **本帧实际施加的上半身覆盖权重**（ADR 0051 的 `stageBBlend × sitPoseGain`；
+   * ADR 0057 D1 起，退出坐姿时它还要乘 0.3s 的交接曲线收到 0 —— 这是"交还控制权"
+   * 的唯一权重来源，`applySitMotion()` 与诊断都只读它）。
+   */
+  private sitUpperWeight = 0;
+  /** 诊断镜像：`sitUpperWeight`（名字沿用 `upperOverride`，旧日志/自检口径不变） */
   private sitUpperOverride = 0;
+  /**
+   * ADR 0057 D1：退出坐姿的交接起点（`performance.now`）；null = 不在交接中。
+   *
+   * 为什么需要显式窗口：上半身/眼球/眼皮的覆写是**持续生效**的（每帧 `endFrame()` 都写），
+   * 只要没有人把它清成 `null`，它就会一直盖在走路/待机的动画上 —— 真机表现就是
+   * "坐完站起来，上半身拧着、头随光标抽搐"。0.3s 既满足需求给的窗口，
+   * 又短于人类感知的"一次姿势切换"。
+   */
+  private sitExitAt: number | null = null;
+  /** 交接起点那一刻的上半身权重（0.3s 内从这里线性/cubic 收到 0） */
+  private sitExitFrom = 0;
+  /**
+   * ADR 0057 D3：**眼睛链**（`eye_L/R` 卡片 + `eye_*_1/_2` 子骨 + `bone_eye_D_*` 眼皮链）的三份姿态。
+   *
+   * 为什么是整条链而不是"眼皮的 x 平移"：本资产的眼睛由多根骨共同决定 ——
+   * 片段在 16.2s 把眼卡片平移了 −0.00016（≈ −9px）、把 `eye_*_1/_2` 各转了 ±0.077quat（≈ ±8.8°）、
+   * 把眼皮 x 从 0.000275 推到 0.000296。**只还原眼皮**，眼睛看上去仍然是眯的（真机 A/B）。
+   * 所以坐姿阶段 B 照抄站立待机的整条眼睛链（旋转 + 位置），与 ADR 0048 的上半身同一条思路。
+   */
+  private eyeChainBind: EyePoseEntry[] = [];
+  private eyeChainIdle: EyePoseEntry[] = [];
+  private eyeChainSitFrom: EyePoseEntry[] = [];
+  /** 诊断：眼睛链"照抄站立"的实际插值权重（0..1） */
+  private sitEyesApplied = 0;
+  /** 是否有坐姿覆写正挂在骨骼仲裁器上（避免每帧空转 `overrideBase(null)`） */
+  private sitOverridesActive = false;
   /** ADR 0051 D7：阶段 A 抬头补偿的**实际施加量**（rad；已乘 phaseA 权重） */
   private sitPhaseAHeadApplied = 0;
   /** ADR 0051 D7：下背覆盖的**实际权重**（upperOverride × SIT_SPINE_OVERLAY_WEIGHT） */
@@ -904,6 +1024,30 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
   private dragPoseGain = 0;
   /** 本帧实际提交给根节点的摆角（诊断用） */
   private dragAngle = 0;
+  /**
+   * 悬空片段的**下沉补偿**（px，向上为正，ADR 0058 D5）。
+   *
+   * 官方 `Formation_Pickup` 自带根位移：她在这段姿态里比站立时低 ≈21px（实测 1.0x），
+   * 而窗口底边就是地线 —— 不补偿的话拖着走时**靴子会被窗口底边切掉一截**（真机截图可见）。
+   * 补偿量在拖拽开始 220ms 后（片段权重已满）测一次，按 `dragPoseGain` 淡入、松手淡出。
+   *
+   * 为什么不去动窗口：窗口底边是锚点（契约 §1.2），改它等于改"地面"。
+   */
+  private dragLiftPx = 0;
+  private dragLiftTargetPx = 0;
+  private dragLiftMeasured = false;  /**
+   * 摆角的**视口约束**（ADR 0058 D3）：当前抓取点下"不把她甩出窗口"的最大角度。
+   *
+   * 分两个量：`swingLimitTargetRad` 由侧影剖面算出（拖拽中会随重采样收紧），
+   * `swingLimitRad` 是**平滑后**的提交值（120ms 收敛，避免上限跳变把摆角硬拽一下）。
+   * 0 = 还没算过（这一帧不夹）。
+   */
+  private swingLimitRad = 0;
+  private swingLimitTargetRad = 0;
+  /** 拖拽中累积的侧影采样点（px，已按下沉补偿归位）；只增不减，见 `calibrateDragPose()` */
+  private dragSwingPoints: SwingPoint[] = [];
+  /** 已经做过几次重采样（对齐 `DRAG_SWING_RECALIBRATE_MS` 的下标） */
+  private dragCalibrations = 0;
   /** 支撑点（窗口 screenX/Y）的运动滤波 */
   private supportSample: { x: number; y: number; at: number } | null = null;
   private supportVelocity = { x: 0, y: 0 };
@@ -1078,9 +1222,21 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       // ADR 0046 D1：眼球的绑定姿态本地旋转（坐姿把它当旋转基底，回到"平视"）
       const bindEye = loaded.bones.eyeL ?? loaded.bones.eyeR;
       this.eyeBindLocal = bindEye ? bindEye.quaternion.clone() : null;
+      /**
+       * ADR 0057 D3：整条**眼睛链**的绑定姿态（旋转 + 位置）= 确定性的"睁眼"口径。
+       *
+       * 为什么还要绑定姿态而不只靠待机帧：本资产的眨眼是 `bone_eye_D_*` 的 **X 平移**
+       * （睁眼 0.000275 → 闭眼 0.000435，见 `Cafe_Idle` t≈2.5s），待机每隔几秒眨一次 ——
+       * 恰好采在眨眼帧上就会把"闭眼"当成基线。绑定姿态在 `setupAnimations()` 之前采，
+       * 定义上就是睁眼；最终目标取两者里**更小**的 x（本资产 x 越大越闭）。
+       */
+      this.eyeChainBind = this.captureEyePose();
+      const bindLid = loaded.bones.eyelidL ?? loaded.bones.eyelidR;
       console.log(
         `[render] 绑定姿态基准 head=${this.headBindWorld ? 'ok' : '-'} ` +
-          `eye=${this.eyeBindLocal ? 'ok' : '-'}（ADR 0045 D2.1 / ADR 0046 D1）`,
+          `eye=${this.eyeBindLocal ? 'ok' : '-'} ` +
+          `eyelid=${bindLid ? bindLid.position.x.toFixed(6) : '-'} ` +
+          `eyeChain=${this.eyeChainBind.length} 根（ADR 0045 D2.1 / ADR 0046 D1 / ADR 0057 D3）`,
       );
 
       this.setupAnimations(loaded);
@@ -1328,12 +1484,14 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     const bandBottomRow = bbox ? headBandBottomRow(bbox) : null;
     const hold = this.animations?.hold() ?? null;
     const headBoneCss = this.headCssNow();
+    // ADR 0057 D2.5：掩膜行数不是常量（随缩放变化），换算必须用**当前**分辨率
+    const maskHeight = Math.max(1, snapshot.size.height);
     return {
       maskState: snapshot.state,
       bbox: bbox ? { ...bbox } : null,
       bandBottomRow: bandBottomRow === null ? null : Number(bandBottomRow.toFixed(2)),
       bandBottomCssY:
-        bandBottomRow === null ? null : Number(((bandBottomRow / MASK_HEIGHT) * this.height).toFixed(1)),
+        bandBottomRow === null ? null : Number(((bandBottomRow / maskHeight) * this.height).toFixed(1)),
       headBoneCss,
       headRadiusPx: this.headRadiusPx(),
       source: headBoneCss ? 'bone' : snapshot.state === 'ready' && bbox ? 'mask-bbox' : 'none',
@@ -1758,6 +1916,9 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       const due = this.sitProcedural || (hold !== null && localSeconds >= sitStageBLocalSeconds());
       if (!due) return;
       this.sitStageBStartedAt = now;
+      // ADR 0057 D3：这一刻的眼睛链姿态就是"片段把她摆成的样子"（停帧后不再被 Mixer 改写），
+      // 记下来当覆写起点，0.3s 内插值到站立待机的那一份。
+      this.captureSitEyePose();
       console.log(
         `[render] 坐姿阶段 B 开始（片段本地 ${localSeconds.toFixed(2)}s / 绝对 ` +
           `${(localSeconds + SIT_CLIP_START_SECONDS).toFixed(2)}s；` +
@@ -1765,6 +1926,84 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       );
     }
     this.sitStageBGain = sitStageBBlend(now - this.sitStageBStartedAt);
+  }
+
+  /**
+   * ADR 0057 D1：推进"退出坐姿"的 0.3s 交接，并在结束时**整块放手**。
+   *
+   * 三种情况：
+   * 1. 在坐姿里（`sitting && arrived`）：权重直接跟随 `stageBBlend × sitPoseGain`，
+   *    同时把交接状态清掉（快速"离开又吸回来"不会留下残留的退场计时）；
+   * 2. 刚离开：记下离开那一刻的权重，0.3s cubic 收到 0（`sitUpperExitBlend`）；
+   * 3. 收到 0：`finishSitExit()` 清覆写、清增益、清弹簧、清微动作池 —— 交还 Mixer。
+   */
+  private updateSitUpperHandover(now: number): void {
+    const inSit = this.sitting && this.sitArrived;
+    if (inSit) {
+      this.sitExitAt = null;
+      this.sitExitFrom = 0;
+      this.sitUpperWeight = Math.min(1, Math.max(0, this.sitStageBGain * this.sitPoseGain));
+      return;
+    }
+    // 从来没有落座过（接近阶段就离开）：没有任何覆写要放，直接收干净
+    if (this.sitExitAt === null && this.sitUpperWeight <= 0.0005) {
+      this.sitUpperWeight = 0;
+      if (this.sitPoseActive) this.finishSitExit(now);
+      return;
+    }
+    if (this.sitExitAt === null) {
+      this.sitExitAt = now;
+      this.sitExitFrom = Math.max(this.sitUpperWeight, 0);
+      console.log(
+        `[render] 坐姿退出交接开始：上半身覆盖 ${this.sitExitFrom.toFixed(3)} → 0` +
+          `（${SIT_UPPER_HANDOVER_MS}ms cubic；ADR 0057 D1）`,
+      );
+    }
+    const blend = sitUpperExitBlend(now - this.sitExitAt);
+    this.sitUpperWeight = this.sitExitFrom * (1 - blend);
+    if (blend >= 1) {
+      this.sitUpperWeight = 0;
+      this.finishSitExit(now);
+    }
+  }
+
+  /**
+   * ADR 0057 D1：退场收尾 —— 把"坐姿残留"确定性地归零。
+   *
+   * 幂等。做四件事（顺序不重要，但必须**全部**做完）：
+   * 1. 释放骨骼覆写（旋转基底 + 眼皮位置）→ 这几根骨重新由 `AnimationMixer` 写；
+   * 2. 清坐姿增益 / 弹簧 / 阶段计时 → 补偿、下沉、侧身、大腿弯曲全部回到 0；
+   * 3. `sit-motion` 与坐姿微动作池归零 → 呼吸/张望/晃腿不会在站起来之后还挂着；
+   * 4. 打一条日志，自检据此断言"交接真的走完了"。
+   */
+  private finishSitExit(now: number): void {
+    const upper = this.sitExitFrom > 0 ? this.sitExitFrom : this.sitUpperWeight;
+    this.sitExitAt = null;
+    this.sitExitFrom = 0;
+    this.sitUpperWeight = 0;
+    this.sitUpperOverride = 0;
+    this.sitEyesApplied = 0;
+    this.eyeChainSitFrom = [];
+    this.releaseSitBoneOverrides();
+
+    this.sitPoseActive = false;
+    this.sitGain = 0;
+    this.sitRoleWeight = 0;
+    this.sitFallbackGain = 0;
+    this.sitPoseGain = 0;
+    this.sitStageBStartedAt = null;
+    this.sitStageBGain = 0;
+    this.sitDropSpring.reset();
+    this.sitBodyYaw = 0;
+    this.sitPhaseAHeadApplied = 0;
+    this.sitSpineOverlay = 0;
+    this.sitMotion.reset(now);
+    // ADR 0057 D1：微动作池的权重必须在这一帧就是 0（不是再等指数衰减）
+    this.sitPool.flush(now);
+    console.log(
+      `[render] 坐姿退出收尾：上半身/眼球/眼皮覆写已释放、弹簧与微动作池归零` +
+        `（交接前 ${upper.toFixed(3)}；ADR 0057 D1）`,
+    );
   }
 
   /** 坐姿的像素补偿：身体中心 → 窗口中线，身体最低点 → 窗口底边。 */
@@ -1786,6 +2025,17 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     this.renderer.setSize(this.width, this.height, false);
     this.animationRoot.position.y = -this.height / 2;
     this.applyPlacement();
+    /**
+     * ADR 0057 D2.4/D2.5：**掩膜分辨率与命中判定一起适应新尺寸**。
+     *
+     * `setBounds()` 之后浏览器发 `resize`，这里除了改正交视锥与 `pixelsPerUnit`
+     * （`applyPlacement()` 里按内容高重算，模型因此同比放大、脚底仍贴底边），
+     * 还要让掩膜的单元覆盖面积保持不变 —— 否则 2x 之后 128×72 的掩膜一个单元
+     * 要覆盖 7.5px，点她的手指会"点不准"，摸头判定跟着变钝。
+     */
+    this.maskCapture.resize(this.width, this.height);
+    // ADR 0058 D3：视口变了 → 摆角约束也跟着变（拖拽中缩放窗口时即时生效）
+    if (this.dragging || this.dragPoseGain > 0.001) this.updateSwingLimit();
   }
 
   /**
@@ -1987,14 +2237,16 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
         // 顺序是先取消一次性演出、再进 Physics——否则 `playAnimation('held')` 之后
         // 再淡出 one-shot 会留下两个整身 action 抢同一批骨骼。
         this.animations?.cancelOneShot(DRAG_IN_CROSSFADE_SECONDS);
+        // ADR 0057 D1：拖拽直接接管 `sitting`（不经过 `exitSit`），交接必须在这里开
+        if (this.sitting) this.beginSitExit(now, 'dragged');
         // ADR 0028 D9：拖走她就离开窗口边缘（shell 也会发 snap_released，这里同时兜底）
         this.sitting = false;
         this.sitArrived = false;
         this.sitApproach = null;
         this.sitEdge = null;
         this.sitProcedural = false;
-        // ADR 0048：拖走她就不再是坐姿；上半身覆盖跟着 `frame.gain` 的 500ms 淡出
-        // 自动退场（不需要在这里清任何缓存）。
+        // ADR 0057 D1：上半身/眼球/眼皮覆写不再"自己淡出"——它们由 0.3s 交接曲线收干净，
+        // 收尾那一刻 `finishSitExit()` 会把 `overrideBase/overridePosition` 清成 null。
         this.hfsm.dragStarted(now);
         this.dragStartedAt = now;
         this.dragging = true;
@@ -2121,6 +2373,14 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     this.dragPivotCss = pivot.css;
     this.dragPendulum = createDragPendulum();
     this.dragPoseGain = 0;
+    this.dragLiftPx = 0;
+    this.dragLiftTargetPx = 0;
+    this.dragLiftMeasured = false;
+    this.dragSwingPoints = [];
+    this.dragCalibrations = 0;
+    this.swingLimitTargetRad = 0;
+    this.swingLimitRad = 0;
+    this.updateSwingLimit();
     this.supportSample = null;
     this.supportVelocity = { x: 0, y: 0 };
     this.supportAcceleration = { x: 0, y: 0 };
@@ -2128,8 +2388,67 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     this.pendingGrab = null;
     console.log(
       `[render] 拖拽抓取 band=${this.dragBand} pivot=(${Math.round(pivot.css.x)},${Math.round(pivot.css.y)}) ` +
-        `local=(${Math.round(pivot.local.x)},${Math.round(pivot.local.y)})`,
+        `local=(${Math.round(pivot.local.x)},${Math.round(pivot.local.y)}) ` +
+        `摆角上限=${this.swingLimitRad.toFixed(3)}rad（ADR 0058 D3）`,
     );
+  }
+
+  /**
+   * ADR 0058 D3：算出"这一抓能摆多大而不把她甩出窗口"。
+   *
+   * 输入是**侧影行剖面**（真实形状，不是包围盒四角）与抓取点。默认用加载时测的待机侧影；
+   * 拖拽 220ms 后 `calibrateDragPose()` 会拿悬空姿态的侧影再调一次（姿态不同、侧影不同）。
+   * 视口 = 整个内容区（正交相机铺满内容区，世界单位 = CSS px）。
+   * 侧影测不到（占位体/加载失败）时 `maxSwingAngle()` 返回兜底下限，摆角照常工作。
+   */
+  private updateSwingLimit(pointsOverride?: SwingPoint[]): void {
+    const model = this.model;
+    const config = pendulumConfigFor(this.dragBand);
+    const points: SwingPoint[] = pointsOverride ?? [];
+    const pixelsPerUnit = model?.pixelsPerUnit ?? 0;
+    if (!pointsOverride && model && pixelsPerUnit > 0) {
+      for (const band of model.silhouette) {
+        // 每一带取左右两个边缘点（剖面的极端就落在这里）
+        points.push(
+          { x: band.minX * pixelsPerUnit, y: band.minY * pixelsPerUnit },
+          { x: band.maxX * pixelsPerUnit, y: band.maxY * pixelsPerUnit },
+        );
+      }
+    }
+    this.swingLimitTargetRad = maxSwingAngle({
+      points,
+      pivot: this.dragPivot,
+      viewport: { halfWidthPx: this.width / 2, heightPx: this.height },
+      limitRad: config.angleLimitRad,
+    });
+    if (points.length > 0 && this.swingLimitTargetRad < config.angleLimitRad - 0.005) {
+      console.log(
+        `[render] 摆角受视口约束：${config.angleLimitRad.toFixed(3)} → ${this.swingLimitTargetRad.toFixed(3)}rad ` +
+          `（侧影 ${points.length / 2} 带、内容区 ${this.width}×${this.height}；ADR 0058 D3）`,
+      );
+    }
+    // 退化到兜底下限 = 连 θ≈0 都判越界，把第一个越界点打出来（否则只剩一个数字，没法查）
+    if (points.length > 0 && this.swingLimitTargetRad <= DRAG_SWING_MIN_ANGLE_RAD + 1e-6) {
+      const half = this.width / 2;
+      const bad = points.find(
+        (point) => Math.abs(point.x) > half || point.y < -1 || point.y > this.height + 1,
+      );
+      console.warn(
+        '[render] 摆角约束退到下限：侧影已经越界 ' +
+          JSON.stringify({
+            bad,
+            pivot: this.dragPivot,
+            halfWidth: half,
+            height: this.height,
+            points: points.map((point) => [
+              Number(point.x.toFixed(1)),
+              Number(point.y.toFixed(1)),
+            ]),
+          }),
+      );
+    }
+    // 第一帧（或窗口刚变）：没有历史值，直接采用，不做收敛
+    if (!(this.swingLimitRad > 0)) this.swingLimitRad = this.swingLimitTargetRad;
   }
 
   /**
@@ -2177,13 +2496,24 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
      * 两者分开：头部必须在 16.2s 停帧后 0.3s 内回到站立姿态（慢了会读成"头还在飘"），
      * 而呼吸/晃腿可以 0.5s 慢慢起来。再乘 `sitGain × sitDrop`，退场/落座都不会硬切。
      */
-    const upperBlend = Math.min(
-      1,
-      Math.max(0, this.sitStageBGain * this.sitGain * this.sitDropSpring.value()),
-    );
-    if (frame.gain <= 0.0005 && upperBlend <= 0.0005) return;
+    const upperBlend = Math.min(1, Math.max(0, this.sitUpperWeight));
+    /**
+     * ADR 0057 D1：退场期间（`sitting === false`）微动整体再乘一次交接曲线。
+     *
+     * 呼吸/张望/晃腿必须和上半身覆盖一起在 0.3s 里归零 —— 旧实现让它们各自按
+     * `sit-motion` 的 500ms 包络退场，上半身已经交还 Mixer 了，头还在"坐姿的呼吸"里。
+     */
+    const handoverGain =
+      this.sitting && this.sitArrived
+        ? 1
+        : Math.min(1, Math.max(0, this.sitUpperWeight / Math.max(1e-6, this.sitExitFrom)));
+    const gain = frame.gain * handoverGain;
+    if (gain <= 0.0005 && upperBlend <= 0.0005) {
+      // 权重已经到 0：确保覆写不再挂着（`finishSitExit()` 也会做，这里兜住标定/异常路径）
+      this.releaseSitBoneOverrides();
+      return;
+    }
     const bones = model.bones;
-    const gain = frame.gain;
     /**
      * ADR 0049 D1：**坐姿微动作池**的权重（`legs` / `hands` / `far`）。
      *
@@ -2240,6 +2570,7 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       const blended = base.clone().slerp(target, blend);
       // 基底被覆盖后，下面的 `add` 都是绕世界轴叠在这份"站立姿态"上的呼吸/张望
       arbiter.overrideBase(bone, blended);
+      this.sitOverridesActive = true;
     }
     // 呼吸：脊柱/颈的微小前屈（正 = 低头，ADR 0035 D5 的标定）
     if (bones.spine) arbiter.add(bones.spine, 0, frame.spinePitch);
@@ -2260,18 +2591,12 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       arbiter.add(bones.head, gazeYaw, gazePitch + this.sitHeadTune * upperBlend);
     }
     // ADR 0046 D1：**接管眼球**。停帧后 Mixer 不再写眼骨，片段里那份"向下看"会永远留着
-    // （死鱼眼）。把眼球的旋转基底换成**绑定姿态**（平视），再叠张望的额外量 ——
-    // 眼球从此跟着头一起转，不再呆滞看地。
-    const eyeBase = this.eyeBindLocal;
+    // （死鱼眼）。整条眼睛链的旋转/位置由 `applySitEyes()` 覆写成"站立待机"的样子（ADR 0057 D3），
+    // 这里只把张望的额外量以**加法**叠在眼卡片上（眼球跟着头转、不再呆滞看地）。
     const eyeYaw = gazeYaw * SIT_GAZE_EYE_EXTRA;
     const eyePitch = gazePitch * SIT_GAZE_EYE_EXTRA;
     for (const eye of [bones.eyeL, bones.eyeR]) {
       if (!eye) continue;
-      if (eyeBase && upperBlend > 0.0005) {
-        const clipBase = arbiter.animationBase(eye) ?? eye.quaternion;
-        // 从片段自带的眼位（阶段 A 的"四处张望"）平滑过渡到绑定姿态 + 张望
-        arbiter.overrideBase(eye, clipBase.clone().slerp(eyeBase, upperBlend));
-      }
       arbiter.add(eye, eyeYaw, eyePitch);
     }
     // 悬空晃腿：左右反相（相位差 π），大腿带小腿。ADR 0049 D1：按池条目的 `legScale`
@@ -2282,6 +2607,127 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     if (bones.calfR) arbiter.add(bones.calfR, 0, frame.calfPitchR * legScale);
     // ADR 0046 D2：**停帧不再眨眼**。眼皮骨（`bone_eye_D_*`）的平移手写眨眼已整套删除：
     // 停帧时没有动画混合与联动，只推平移会把下眼皮硬拉上去（真机"翻白眼"）。
+    //
+    // ADR 0057 D3：但停帧会把她**冻在片段 16.2s 的眼睛状态**上（眼卡片下移 9px、子骨各转 8.8°、
+    // 眼皮 x 从 0.000275 推到 0.000296 → 真机=眯眼/犯困）。这里把整条眼睛链**照抄站立待机**：
+    //   quat = slerp(片段值, 站立值, blend)、pos = lerp(片段值, 站立值, blend)
+    // 位置/旋转都是绝对覆写（不是偏移），不会像 ADR 0044 D4 那样越推越歪。
+    this.applySitEyes(upperBlend, arbiter);
+  }
+
+  /** 眼睛链当前姿态的快照（绑定姿态 / 待机基线 / 阶段 B 起点都用它） */
+  private captureEyePose(): EyePoseEntry[] {
+    const arbiter = this.arbiter;
+    return this.eyeChainBones().map((bone) => ({
+      bone,
+      // 旋转取**动画基底**（`beginFrame()` 的产物，不含视线偏移）；绑定姿态期 arbiter 还没建，
+      // 直接读 `bone.quaternion` 就是 rest 值。
+      quat: (arbiter?.animationBase(bone) ?? bone.quaternion).clone(),
+      pos: bone.position.clone(),
+    }));
+  }
+
+  /** 眼睛链的骨骼列表（眼卡片 → 眼卡片子骨 → 眼皮链） */
+  private eyeChainBones(): THREE.Bone[] {
+    const bones = this.model?.bones;
+    if (!bones) return [];
+    const list = [
+      bones.eyeL,
+      bones.eyeR,
+      bones.eyeL1,
+      bones.eyeL2,
+      bones.eyeR1,
+      bones.eyeR2,
+      bones.eyelidL,
+      bones.eyelidL1,
+      bones.eyelidL2,
+      bones.eyelidR,
+      bones.eyelidR1,
+      bones.eyelidR2,
+    ];
+    return list.filter((bone): bone is THREE.Bone => bone !== null);
+  }
+
+  /**
+   * ADR 0057 D3：坐姿阶段 B 起，把整条眼睛链照抄站立待机（旋转基底 + 位置覆写）。
+   *
+   * 权重取"上半身覆盖权重"，但**退场期间保持 1**：站起来的过程中眼睛必须一直是睁开的；
+   * `finishSitExit()` 把覆写清成 `null` 之后，站姿动画（`Cafe_Idle`）自己的眼睛/眼皮数据接管
+   * —— 那与基线几乎一致，看不到跳变。
+   */
+  private applySitEyes(upperBlend: number, arbiter: BoneArbiter): void {
+    const goal = this.eyeGoalPose();
+    if (goal.length === 0) {
+      this.sitEyesApplied = 0;
+      return;
+    }
+    const blend = this.sitting && this.sitArrived ? Math.min(1, Math.max(0, upperBlend)) : 1;
+    if (blend <= 0.0005) {
+      this.sitEyesApplied = 0;
+      return;
+    }
+    const from = this.eyeChainSitFrom;
+    for (const entry of goal) {
+      const start = from.find((item) => item.bone === entry.bone);
+      const quat = start ? start.quat.clone().slerp(entry.quat, blend) : entry.quat.clone();
+      const pos = start ? start.pos.clone().lerp(entry.pos, blend) : entry.pos.clone();
+      arbiter.overrideBase(entry.bone, quat);
+      arbiter.overridePosition(entry.bone, pos);
+    }
+    this.sitOverridesActive = true;
+    this.sitEyesApplied = blend;
+  }
+
+  /**
+   * "睁眼"目标姿态 = 站立待机那一份，但**眼皮 x 取与绑定姿态里更小的那个**
+   * （本资产 x 越大越闭；待机帧可能正好撞上眨眼，绑定的那份永远是睁的）。
+   * 待机帧还没采到时退回绑定姿态。
+   */
+  private eyeGoalPose(): EyePoseEntry[] {
+    const idle = this.eyeChainIdle;
+    const bind = this.eyeChainBind;
+    if (idle.length === 0) return bind;
+    const bindByBone = new Map(bind.map((entry) => [entry.bone, entry]));
+    return idle.map((entry) => {
+      const bindEntry = bindByBone.get(entry.bone);
+      if (!bindEntry) return entry;
+      // 只有眼皮链（`bone_eye_D_*`）需要"取更睁的 x"；眼卡片本身没有这条口径
+      if (!/bone_eye_D/i.test(entry.bone.name)) return entry;
+      const x = Math.min(entry.pos.x, bindEntry.pos.x);
+      return { bone: entry.bone, quat: entry.quat, pos: new THREE.Vector3(x, entry.pos.y, entry.pos.z) };
+    });
+  }
+
+  /** 阶段 B 开始的那一帧记下**片段给出的眼睛链姿态**（覆写起点；见 `applySitEyes`） */
+  private captureSitEyePose(): void {
+    this.eyeChainSitFrom = this.captureEyePose();
+  }
+
+  /**
+   * ADR 0057 D1：释放坐姿对骨骼的**全部覆写**（旋转基底 + 眼皮位置）。
+   *
+   * 必须在 `sitUpperWeight` 已经到 0 的那一帧调用：`BoneArbiter` 的覆写是"每帧持续写"，
+   * 不清成 `null` 就等于把这四根骨（+眼球 +眼皮）从 `AnimationMixer` 手里永久接管。
+   */
+  private releaseSitBoneOverrides(): void {
+    if (!this.sitOverridesActive) return;
+    this.sitOverridesActive = false;
+    const arbiter = this.arbiter;
+    const bones = this.model?.bones ?? null;
+    if (!arbiter || !bones) return;
+    /** 上半身四根 + 整条眼睛链（ADR 0053/0057：旋转基底与位置都要还回去） */
+    const chain = [
+      bones.spine,
+      bones.spine1,
+      bones.neck,
+      bones.head,
+      ...this.eyeChainBones(),
+    ];
+    for (const bone of chain) {
+      if (!bone) continue;
+      arbiter.overrideBase(bone, null);
+      arbiter.overridePosition(bone, null);
+    }
   }
 
   /** 内部（ADR 0044）：只读的坐姿微动快照（不含面部诊断，~微秒级）。 */
@@ -2326,6 +2772,26 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       spineOverlayApplied: Number(this.sitSpineOverlay.toFixed(3)),
       headQuat,
       headWorld,
+      offsetPx: {
+        x: Number((this.sitOffsetPx().x * this.sitPoseGain).toFixed(1)),
+        y: Number((this.sitOffsetPx().y * this.sitPoseGain).toFixed(1)),
+      },
+      rawOffsetPx: (() => {
+        const raw = this.sitOffsetPx();
+        return { x: Number(raw.x.toFixed(1)), y: Number(raw.y.toFixed(1)) };
+      })(),
+      handoverRemainingMs:
+        this.sitExitAt === null
+          ? null
+          : Math.max(0, Math.round(SIT_UPPER_HANDOVER_MS - (performance.now() - this.sitExitAt))),
+      eyelidApplied: Number(this.sitEyesApplied.toFixed(3)),
+      overrideCount: (() => {
+        const snapshot = this.arbiter?.snapshot() ?? [];
+        return {
+          rotation: snapshot.filter((item) => item.overridden).length,
+          position: snapshot.filter((item) => item.positionOverridden).length,
+        };
+      })(),
     };
   }
 
@@ -2485,6 +2951,18 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
           }
         : null,
       tuning: this.tunables.values(),
+      /**
+       * ADR 0057 D2.6：整体缩放的**渲染侧事实**（内容区尺寸 + 实际生效比例）。
+       *
+       * 面板用它显示"请求 2.00x → 实际 1.32x（受屏幕工作区限制）"：比例是
+       * `内容高 / 基准高`，主进程的 `setBounds()` 改不动这个值，只能改窗口。
+       * ADR 0058 D1 起基准高含**头顶安全边距**（720 + 36 = 756），否则 1.0x 会被读成 0.95x。
+       */
+      view: {
+        width: this.width,
+        height: this.height,
+        scale: Number((this.height / BASE_CONTENT_HEIGHT_PX).toFixed(3)),
+      },
       collectedAt: Number(performance.now().toFixed(1)),
     };
   }
@@ -2528,8 +3006,18 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       neck: (this.arbiter?.animationBase(bones.neck) ?? bones.neck.quaternion).clone(),
       head: (this.arbiter?.animationBase(bones.head) ?? bones.head.quaternion).clone(),
     };
+    /**
+     * ADR 0057 D3：同一帧采**整条眼睛链的本地姿态**（旋转 + 位置）= "她平时睁着眼"的样子。
+     *
+     * 必须和上半身同源、同一帧：这一帧是官方 `Cafe_Idle` 的纯待机（权重 ≥0.9）。
+     * 旋转走 `animationBase()`（不含视线偏移），位置直接读 `bone.position`（没有任何位置通道在写它）。
+     */
+    this.eyeChainIdle = this.captureEyePose();
+    if (this.eyeChainIdle.length === 0) {
+      console.warn('[render] 未找到眼睛链骨骼：坐姿停帧无法纠正眯眼（ADR 0057 D3）');
+    }
     console.log(
-      `[render] 站立上半身姿态已记录（下背/胸/颈/头的局部四元数；ADR 0048/0051）`,
+      `[render] 站立姿态已记录（下背/胸/颈/头四元数 + 眼睛链 ${this.eyeChainIdle.length} 根；ADR 0048/0051/0057）`,
     );
   }
 
@@ -2565,6 +3053,13 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     this.sitDropSpring.reset();
     this.sitStageBStartedAt = null;
     this.sitStageBGain = 0;
+    // ADR 0057：刚落座时"上一轮的退场交接"必须作废（连点两下吸附不会被旧计时收尾），
+    // 眼睛链覆写等阶段 B 开始时再按片段值重建。
+    this.sitExitAt = null;
+    this.sitExitFrom = 0;
+    this.sitUpperWeight = 0;
+    this.eyeChainSitFrom = [];
+    this.sitEyesApplied = 0;
     if (!held) {
       // 降级：悬空姿态 + 下沉 24px + 大腿弯曲 0.45rad（用户原始建议的路径）
       this.playAnimation('held', SIT_IN_FADE_SECONDS, 'snap_applied（无坐姿片段 → 程序化降级）');
@@ -2593,8 +3088,15 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     this.sitArrived = false;
     this.sitApproach = null;
     this.sitEdge = null;
-    // ADR 0048：上半身覆盖不在这里清 —— 它和呼吸/张望一样乘 `frame.gain`，跟着坐姿微动的
-    // 500ms 包络一起淡出；硬清空会让头在起身瞬间"啪"地低下去。
+    /**
+     * ADR 0057 D1：**从这一刻起算 0.3s 交接**。
+     *
+     * 这里刻意不"立刻清空"上半身覆盖：硬清会让头在起身瞬间"啪"地低下去（旧注释的顾虑是对的），
+     * 但旧实现只靠"覆盖权重乘 sitGain"，而 `overrideBase()` 是持续写的 —— 权重归零后
+     * 覆写还挂在仲裁器里，头/胸/下背/眼球就被永久冻在坐姿上（真机：站起来走路时上半身拧着、
+     * 头随光标抽搐）。正确做法就是这条 0.3s 曲线：先缩权重，缩到 0 再 `overrideBase(null)`。
+     */
+    this.beginSitExit(now, reason);
     this.hfsm.snapReleased(now);
     // ADR 0043 D3：不在这里把补偿清零——`playAnimation('idle')` 会交叉淡出坐姿片段，
     // `updateSitGain()` 读到的权重 1→0 就是补偿的退场曲线。
@@ -2611,8 +3113,26 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       };
       this.startleSurprised = false;
     }
-    this.playAnimation('idle', SIT_OUT_FADE_SECONDS, `snap_released(${reason}) → 站立`);
+    this.playAnimation('idle', SIT_EXIT_CROSSFADE_SECONDS, `snap_released(${reason}) → 站立`);
     console.log(`[render] sitting 结束 reason=${reason}`);
+  }
+
+  /**
+   * ADR 0057 D1：开一次退场交接（幂等；重复调用只保留最早的那一刻）。
+   *
+   * 两条入口都会走到这里：`exitSit()`（点她 / 命令 / 目标消失）与 `drag_started`
+   * （直接接管 `sitting` 的那条路径 **不经过** `exitSit`）。
+   */
+  private beginSitExit(now: number, reason: string): void {
+    if (this.sitExitAt !== null) return;
+    // 只有真的落过座才需要交接：接近阶段没有任何覆写与被冻住的姿态
+    if (!this.sitPoseActive && this.sitUpperWeight <= 0.0005) return;
+    this.sitExitAt = now;
+    this.sitExitFrom = Math.max(this.sitUpperWeight, 0);
+    console.log(
+      `[render] 坐姿退出交接开始 reason=${reason}：上半身覆盖 ${this.sitExitFrom.toFixed(3)} → 0 ` +
+        `（${SIT_UPPER_HANDOVER_MS}ms cubic）+ 眼皮/眼球基底与弹簧、微动作池同步归零（ADR 0057 D1）`,
+    );
   }
 
   setMouthFrame(frame: number): void {
@@ -3044,6 +3564,8 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
           y: Number(this.dragPivotCss.y.toFixed(1)),
         },
         angle: Number(this.dragAngle.toFixed(4)),
+        /** ADR 0058 D3：摆角的视口约束（0 = 未计算；等于物理上限 = 没被夹过） */
+        angleLimit: Number(this.swingLimitRad.toFixed(4)),
         omega: Number(this.dragPendulum.angularVelocity.toFixed(4)),
         gain: Number(this.dragPoseGain.toFixed(3)),
         supportAcceleration: {
@@ -3213,6 +3735,55 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
                 }
               : null;
           })(),
+          /** ADR 0057 D1：退出坐姿的 0.3s 交接（自检据此断言"收尾真的走完"） */
+          handover: (() => {
+            if (this.sitExitAt === null) return null;
+            const elapsed = now - this.sitExitAt;
+            return {
+              active: true,
+              remainingMs: Math.max(0, Math.round(SIT_UPPER_HANDOVER_MS - elapsed)),
+              from: Number(this.sitExitFrom.toFixed(3)),
+            };
+          })(),
+          /**
+           * ADR 0057 D3：眼睛链"照抄站立"的覆写（0 = 片段原样、1 = 完全照抄站立睁眼）。
+           * `x` 报的是眼皮骨 `bone_eye_D_L` 的本地 x（片段值 / 站立基线 / 本帧实际值）。
+           */
+          eyelid: (() => {
+            const left = this.model?.bones.eyelidL ?? null;
+            const goal = this.eyeGoalPose();
+            const goalLeft = goal.find((entry) => entry.bone === left) ?? null;
+            const fromLeft = this.eyeChainSitFrom.find((entry) => entry.bone === left) ?? null;
+            return {
+              captured: goal.length > 0,
+              applied: Number(this.sitEyesApplied.toFixed(3)),
+              x: {
+                clip: fromLeft ? Number(fromLeft.pos.x.toFixed(5)) : null,
+                idle: goalLeft ? Number(goalLeft.pos.x.toFixed(5)) : null,
+                applied: left ? Number(left.position.x.toFixed(5)) : null,
+              },
+              positionOverridden: left ? (this.arbiter?.positionOverridden(left) ?? false) : false,
+            };
+          })(),
+          /** ADR 0057 D3：眼睛链一共几根、当前施加权重（诊断"到底改了几根骨"） */
+          eyes: {
+            bones: this.eyeChainBones().length,
+            applied: Number(this.sitEyesApplied.toFixed(3)),
+            captured: this.eyeChainIdle.length > 0,
+          },
+          /**
+           * ADR 0057 D1：**此刻还有哪些骨骼被坐姿覆写**。
+           *
+           * 退出坐姿之后这两个数组必须都是空 —— 这是"控制权交还 `AnimationMixer`"的
+           * 唯一可断言事实（旧实现里它们会永远留着 spine/spine1/neck/head/eye_L/eye_R）。
+           */
+          overrides: (() => {
+            const snapshot = this.arbiter?.snapshot() ?? [];
+            return {
+              rotation: snapshot.filter((item) => item.overridden).map((item) => item.bone),
+              position: snapshot.filter((item) => item.positionOverridden).map((item) => item.bone),
+            };
+          })(),
         };
       })(),
       pat,
@@ -3229,6 +3800,39 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
         frameMs: Math.round(this.frameMsEma * 10) / 10,
       },
       probePoints: this.computeProbePoints(),
+      /** ADR 0057 D2 / ADR 0058 D1：整体缩放的渲染侧事实（视锥 / pixelsPerUnit / 掩膜分辨率） */
+      view: {
+        width: this.width,
+        height: this.height,
+        scale: Number((this.height / BASE_CONTENT_HEIGHT_PX).toFixed(3)),
+        pixelsPerUnit: this.model ? Number(this.model.pixelsPerUnit.toFixed(3)) : null,
+        mask: this.maskCapture.size(),
+        faceZoom: this.faceZoomSize,
+        /** 侧影剖面的带数（0 = 没测到，摆角约束退回兜底下限） */
+        silhouetteBands: this.model?.silhouette.length ?? 0,
+        /** 当前抓取点下"不甩出窗口"的最大摆角（rad）；0 = 本帧没有拖拽 */
+        swingLimit: this.dragging || this.dragPoseGain > 0.001 ? Number(this.swingLimitRad.toFixed(4)) : null,
+      },
+    };
+  }
+
+  /**
+   * 诊断/取证（ADR 0058 D4）：当前姿态下**她整块**在内容区 CSS 坐标里的包围盒（含光环）。
+   *
+   * 判据只有一个：`0 ≤ minX ∧ maxX ≤ width ∧ 0 ≤ minY ∧ maxY ≤ height` —— 也就是
+   * "拖拽摇晃时有没有一根头发被窗口边缘切掉"。刻意**不**进 `getDiagnostics()`
+   * （那个 4Hz 轮询），只有自检/取证脚本会调。
+   */
+  silhouetteCss(): { minX: number; minY: number; maxX: number; maxY: number } | null {
+    const model = this.model;
+    if (!model) return null;
+    const bounds = measureWorldBounds(model.root, model.meshes);
+    if (!bounds) return null;
+    return {
+      minX: Number((this.width / 2 + bounds.minX).toFixed(1)),
+      minY: Number((this.height / 2 - bounds.maxY).toFixed(1)),
+      maxX: Number((this.width / 2 + bounds.maxX).toFixed(1)),
+      maxY: Number((this.height / 2 - bounds.minY).toFixed(1)),
     };
   }
 
@@ -3270,6 +3874,100 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     return {
       head: headPoint,
       body: { x: centerX, y: bodyY },
+    };
+  }
+
+  /**
+   * ADR 0058 D3/D5：拖拽 220ms 后按**当前姿态**（`Formation_Pickup` 权重已满）重标一次。
+   *
+   * 为什么要重标两件事：
+   * 1. **侧影**：加载时测的是待机姿态；悬空姿态手臂抬起、身体下坠，侧影更宽 ——
+   *    用待机侧影算出来的摆角上限会偏乐观（实测差 30px 量级）。
+   * 2. **下沉**：官方悬空片段自带根位移，她比站立时低 8–21px（随姿态），
+   *    不补偿就会**被窗口底边切掉靴子**（真机截图可见）。
+   *
+   * 只做一次（每网格 8192 点，约一帧内的 10–20ms），不参与逐帧。
+   */
+  private calibrateDragPose(): void {
+    const model = this.model;
+    if (!model || !(model.pixelsPerUnit > 0)) return;
+    const bands = measureSilhouette(model.root, model.meshes, DRAG_SWING_PROFILE_BANDS, 2048);
+    if (!bands || bands.length === 0) return;
+    const ppu = model.pixelsPerUnit;
+    const centerX = (model.frame.minX + model.frame.maxX) / 2;
+    const baseY = model.frame.minY;
+    let lowest = Number.POSITIVE_INFINITY;
+    for (const band of bands) {
+      if (band.minY < lowest) lowest = band.minY;
+    }
+    const lowestAnimY = lowest * ppu + model.root.position.y;
+    const sink = lowestAnimY < 0 ? -lowestAnimY : 0;
+    /**
+     * 抬起量 = 片段造成的下沉 + **被拎离地的最低高度**。
+     * 后者不是"美观微调"，而是几何必需：绕抓取点转 θ 时脚会往下扫（见
+     * `DRAG_LIFT_MIN_PX` 的注释），不抬起来的话侧影的竖直判定会把摆角压成 0。
+     */
+    const minLift = DRAG_LIFT_MIN_PX * (this.height / BASE_CONTENT_HEIGHT_PX);
+    this.dragLiftTargetPx = Number((sink + minLift).toFixed(2));
+    const lift = this.dragLiftTargetPx;
+    /**
+     * 侧影点必须**按补偿后的位置**算：悬空姿态本身沉在底边以下（`lowestAnimY < 0`），
+     * 直接拿原始 y 去判"在不在视口里"，θ=0 就已经越界，`maxSwingAngle()` 只能返回兜底下限
+     * （实测就是这个 bug：上限被压成 0.06rad）。补偿后她的最低点正好落在地线上。
+     */
+    for (const band of bands) {
+      this.dragSwingPoints.push(
+        { x: (band.minX - centerX) * ppu, y: (band.minY - baseY) * ppu + lift },
+        { x: (band.maxX - centerX) * ppu, y: (band.maxY - baseY) * ppu + lift },
+      );
+    }
+    this.updateSwingLimit(this.dragSwingPoints);
+    let maxAbsX = 0;
+    let maxY = 0;
+    for (const point of this.dragSwingPoints) {
+      maxAbsX = Math.max(maxAbsX, Math.abs(point.x));
+      maxY = Math.max(maxY, point.y);
+    }
+    console.log(
+      `[render] 悬空姿态标定#${this.dragCalibrations}：下沉 ${this.dragLiftTargetPx.toFixed(1)}px、` +
+        `摆角上限 ${this.swingLimitTargetRad.toFixed(3)}rad（累计 ${this.dragSwingPoints.length / 2} 带；` +
+        `侧影 |x|max=${maxAbsX.toFixed(0)} ymax=${maxY.toFixed(0)}、半宽 ${(this.width / 2).toFixed(0)}、` +
+        `pivot=(${this.dragPivot.x.toFixed(0)},${this.dragPivot.y.toFixed(0)})；ADR 0058 D3/D5）`,
+    );
+  }
+
+  /**
+   * 诊断/取证（ADR 0058）：拖拽链路的 O(1) 摘要。
+   *
+   * 为什么不复用 `getDiagnostics()`：那个单次 ≈300ms（面贴图摘要），自检/取证要按帧采样
+   * 单摆角度与视口余量，只能走这种"只读几个字段"的入口（与 `panelSnapshot()` 同一手法）。
+   */
+  dragDigest(): {
+    phase: 'idle' | 'dragged' | 'settling';
+    band: DragBand | null;
+    angle: number;
+    angleLimit: number;
+    omega: number;
+    gain: number;
+    liftPx: number;
+    pivot: { x: number; y: number };
+    supportAcceleration: { x: number; y: number };
+    content: { width: number; height: number };
+  } {
+    return {
+      phase: this.dragging ? 'dragged' : this.dragPoseGain > 0.001 ? 'settling' : 'idle',
+      band: this.dragPoseGain > 0.001 ? this.dragBand : null,
+      angle: Number(this.dragAngle.toFixed(4)),
+      angleLimit: Number(this.swingLimitRad.toFixed(4)),
+      omega: Number(this.dragPendulum.angularVelocity.toFixed(4)),
+      gain: Number(this.dragPoseGain.toFixed(3)),
+      liftPx: Number((this.dragLiftPx * this.dragPoseGain).toFixed(2)),
+      pivot: { x: Number(this.dragPivotCss.x.toFixed(1)), y: Number(this.dragPivotCss.y.toFixed(1)) },
+      supportAcceleration: {
+        x: Number(this.supportAcceleration.x.toFixed(1)),
+        y: Number(this.supportAcceleration.y.toFixed(1)),
+      },
+      content: { width: this.width, height: this.height },
     };
   }
 
@@ -3442,7 +4140,12 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     this.updateSitStage(now, dt);
     const sitDrop = this.sitDropSpring.value();
     this.sitPoseGain = this.sitGain * sitDrop;
-    this.sitUpperOverride = Math.min(1, this.sitStageBGain * this.sitPoseGain);
+    /**
+     * ADR 0057 D1：上半身覆盖权重 = 坐姿内的 `stageBBlend × sitPoseGain`，
+     * 离开坐姿后按 0.3s cubic 从"离开那一刻的值"收到 0，收到 0 的那一帧整块放手。
+     */
+    this.updateSitUpperHandover(now);
+    this.sitUpperOverride = this.sitUpperWeight;
     /**
      * ADR 0051 D7：阶段 A 的抬头补偿。
      *
@@ -3602,6 +4305,23 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
     }
 
     // ADR 0035 D3：受迫单摆。拖拽中由支撑加速度驱动；松手后保留角速度自然衰减。
+    /**
+     * ADR 0058 D3/D5：拖拽中按 `DRAG_SWING_RECALIBRATE_MS` 重采样侧影（4 次、每次 ≈5ms），
+     * 并把摆角上限按 120ms 收敛过去。**放在积分之前**，这一帧的角度就已经用新上限。
+     */
+    if (this.dragging) {
+      const elapsed = this.dragStartedAt === null ? 0 : now - this.dragStartedAt;
+      while (
+        this.dragCalibrations < DRAG_SWING_RECALIBRATE_MS.length &&
+        elapsed >= DRAG_SWING_RECALIBRATE_MS[this.dragCalibrations]!
+      ) {
+        this.dragCalibrations += 1;
+        this.calibrateDragPose();
+      }
+      const limitAlpha = 1 - Math.exp(-dt / (DRAG_SWING_LIMIT_SMOOTH_MS / 1000));
+      this.swingLimitRad += (this.swingLimitTargetRad - this.swingLimitRad) * limitAlpha;
+    }
+
     let dragAngle = 0;
     if (this.dragging || this.dragPoseGain > 0.001) {
       const forcing = this.dragging
@@ -3615,11 +4335,31 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
         forcing,
         nowMs: now,
       });
-      dragAngle =
+      const rawAngle =
         (this.dragPendulum.angle + struggleOffset(this.dragBand, now, this.dragPoseGain)) *
         this.dragPoseGain;
+      /**
+       * ADR 0058 D3：**角度饱和**而不是画面破掉。
+       *
+       * 单摆本身照常积分（松手后的角速度、惯性都不受影响），只是**提交给根节点**的
+       * 角度被视口容得下的最大值夹住 —— 顶到边界时她"贴着画框晃"，而不是头发被裁掉。
+       */
+      const limit = this.swingLimitRad;
+      dragAngle =
+        limit > 0 ? Math.max(-limit, Math.min(limit, rawAngle)) : rawAngle;
     }
     this.dragAngle = dragAngle;
+
+    /**
+     * ADR 0058 D5：悬空片段的下沉补偿。
+     *
+     * 标定时刻见 `DRAG_SWING_RECALIBRATE_MS`（与侧影采样同一次测量）；补偿按 100ms 指数跟上，
+     * 松手时随 `dragPoseGain` 一起收回（她落回地面）。
+     */
+    const liftAlpha = 1 - Math.exp(-dt / 0.1);
+    this.dragLiftPx += (this.dragLiftTargetPx - this.dragLiftPx) * liftAlpha;
+    this.dragLiftPx = Math.max(0, this.dragLiftPx);
+    const dragLift = this.dragLiftPx * this.dragPoseGain;
 
     // ADR 0035 D2：绕抓取点旋转，保持支点不动（补偿二维旋转带来的位移）
     const pivotShift = pivotCompensation(this.dragPivot, dragAngle);
@@ -3646,6 +4386,8 @@ class StageRender implements RenderModule {  private readonly renderer: THREE.We
       breathFloatPx +
       sitShift.y +
       pivotShift.y +
+      // ADR 0058 D5：悬空片段的下沉补偿（她比站立低 ≈21px，不补就被底边切脚）
+      dragLift +
       startleY;
     this.animationRoot.rotation.z =
       tilt +

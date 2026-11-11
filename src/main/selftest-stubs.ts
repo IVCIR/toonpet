@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 自检专用本地桩（只被 `selftest.ts` 引用，不进入产品路径）。
  *
  * 为什么需要桩：真实验收时本机可能既没有 Ollama 对话模型、也没有 TTS 参考音频，
@@ -19,6 +19,18 @@ export const SELFTEST_TTS_PORT = 9881;
 export const SELFTEST_OCR_PORT = 8003;
 export const SELFTEST_LLM_MODEL = 'selftest-stub:1b';
 export const SELFTEST_OCR_MODEL = 'win-ocr-stub';
+
+/**
+ * 桩端口的**实际来源**（ADR 0058 D8）。
+ *
+ * 默认值只是兜底：`scripts/start.mjs` 在拉起 Electron 之前会逐个候选端口试绑，
+ * 把真正能监听的那个写进环境变量（Windows 的端口排除范围是动态的，实测重启后
+ * `11367–11466` 整段被 Hyper-V 占掉，写死 11435 会 EACCES → 整套自检 exit 1）。
+ */
+function stubPort(envKey: string, fallback: number): number {
+  const raw = Number(process.env[envKey]);
+  return Number.isInteger(raw) && raw > 0 && raw < 65536 ? raw : fallback;
+}
 
 export interface SelftestStubStats {
   llmChats: number;
@@ -309,20 +321,24 @@ export async function startSelftestStubs(): Promise<SelftestStubs> {
     });
   });
 
-  await listen(llm, SELFTEST_LLM_PORT, 'LLM');
+  const llmPort = stubPort('PET_SELFTEST_LLM_PORT', SELFTEST_LLM_PORT);
+  const ttsPort = stubPort('PET_SELFTEST_TTS_PORT', SELFTEST_TTS_PORT);
+  const ocrPort = stubPort('PET_SELFTEST_OCR_PORT', SELFTEST_OCR_PORT);
+  await listen(llm, llmPort, 'LLM');
   try {
-    await listen(tts, SELFTEST_TTS_PORT, 'TTS');
+    await listen(tts, ttsPort, 'TTS');
   } catch (error) {
     await new Promise<void>((resolve) => llm.close(() => resolve()));
     throw error;
   }
   try {
-    await listen(ocr, SELFTEST_OCR_PORT, 'OCR');
+    await listen(ocr, ocrPort, 'OCR');
   } catch (error) {
     await new Promise<void>((resolve) => llm.close(() => resolve()));
     await new Promise<void>((resolve) => tts.close(() => resolve()));
     throw error;
   }
+  console.log(`[selftest] 本地桩已监听 127.0.0.1:${llmPort}/${ttsPort}/${ocrPort}（ADR 0058 D8）`);
 
   return {
     stats,

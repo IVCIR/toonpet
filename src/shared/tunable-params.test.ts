@@ -20,6 +20,9 @@ import {
   TUNABLE_ORDER,
 } from './tunable-params';
 import {
+  CHARACTER_SCALE_DEFAULT,
+  CHARACTER_SCALE_MAX,
+  CHARACTER_SCALE_MIN,
   GAZE_EYE_STIFFNESS,
   GAZE_HEAD_STIFFNESS,
   GAZE_SPINE_STIFFNESS,
@@ -98,4 +101,33 @@ test('参数契约：展示格式带单位与固定小数位', () => {
   assert.equal(formatTunableValue('sit.phaseAHeadTuneRad', -0.12), '-0.120 rad');
   assert.equal(formatTunableValue('sit.spineOverlayWeight', 0.85), '0.85');
   assert.equal(formatTunableValue('gaze.eyeStiffness', 12), '12.0 /s');
+});
+
+/**
+ * ADR 0057 D2：整体缩放也是一个可热更新参数。
+ *
+ * 它和另外五个参数的区别只在**消费方**（主进程改窗口），范围/默认值/夹取仍然只有
+ * 这一份实现 —— 面板滑块、`config.json`、渲染侧收到的值必须完全一致。
+ */
+test('参数契约：角色缩放 0.5x–2.0x、默认 1.0x、两位小数', () => {
+  const meta = TUNABLE_META['view.scale'];
+  assert.equal(meta.group, 'physics', '与其它手感参数同一个 Tab');
+  assert.equal(meta.min, CHARACTER_SCALE_MIN);
+  assert.equal(meta.max, CHARACTER_SCALE_MAX);
+  assert.equal(meta.default, CHARACTER_SCALE_DEFAULT);
+  assert.equal(meta.decimals, 2);
+  assert.equal(TUNABLE_DEFAULTS['view.scale'], 1);
+
+  assert.equal(clampTunableValue('view.scale', 2), 2);
+  assert.equal(clampTunableValue('view.scale', 0.5), 0.5);
+  assert.equal(clampTunableValue('view.scale', 9), 2);
+  assert.equal(clampTunableValue('view.scale', 0), 0.5);
+  assert.equal(clampTunableValue('view.scale', 1.234), 1.23, '对齐 0.01 步长');
+  assert.equal(clampTunableValue('view.scale', 'x'), CHARACTER_SCALE_DEFAULT);
+  assert.equal(formatTunableValue('view.scale', 1.4), '1.40 x');
+  // 与默认值相同 → 不写进 config.json
+  assert.deepEqual(diffTunableValues({ ...TUNABLE_DEFAULTS, 'view.scale': 1 }), {});
+  assert.deepEqual(diffTunableValues({ ...TUNABLE_DEFAULTS, 'view.scale': 1.4 }), {
+    'view.scale': 1.4,
+  });
 });

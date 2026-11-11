@@ -13,20 +13,26 @@ import { app, globalShortcut, ipcMain, screen } from 'electron';
 import type { BrowserWindow, IpcMainEvent, IpcMainInvokeEvent } from 'electron';
 import path from 'node:path';
 import {
+  CHARACTER_SCALE_DEFAULT,
+  MODEL_VIEW_PADDING_PX,
   SNAP_RELEASE_FALL_MIN_PX,
   SNAP_RELEASE_FALL_VY_PX_PER_SEC,
   TRAY_STATS_REFRESH_MS,
   VISION_HOTKEY_DEFAULT,
   VISION_HOTKEY_FALLBACK,
   WINDOW_HEIGHT_PX,
-  WINDOW_WIDTH_PX,
 } from '../../shared/constants';
 import { isEventName } from '../../shared/events';
 import type { BroadcastEvent, EventName, EventPayloads, ModelReadyPayload } from '../../shared/events';
-import { computeWindowSize } from '../../shared/model-frame';
+import { computeWindowSize, fallbackWindowSize } from '../../shared/model-frame';
 import { groundYFor } from '../../shared/motion';
 import { intersectionArea } from '../../shared/geometry';
 import type { Rect } from '../../shared/geometry';
+import {
+  clampCharacterScale,
+  resolveScaledWindowBounds,
+  type ScaleClamp,
+} from '../../shared/window-scale';
 import { IPC_CHANNELS } from '../../shared/ipc';
 import type { PointerFact, ProbeResponse, WalkCommand } from '../../shared/ipc';
 import type {
@@ -48,6 +54,7 @@ import { createForegroundWindowReader } from './foreground-window';
 import type { ForegroundWindowReader, PhysicalRect } from './foreground-window';
 import { createMainWindow, loadMainRenderer } from './main-window';
 import type { WindowSize } from './main-window';
+import { readPanelConfigFile, resolvePanelConfigPath } from '../panel-config';
 import { createMotionController } from './motion';
 import type { MotionController, MotionDiagnostics } from './motion';
 import { createPointerPoller } from './pointer-poller';
@@ -175,6 +182,35 @@ export interface ShellModule {
   queryVision(source?: VisionSource): Promise<VisionResult | null>;
   /** 内部诊断（非契约）：视觉热键注册结果。 */
   visionHotkeySnapshot(): HotkeyRegistration | null;
+  /**
+   * 内部（非契约，ADR 0057 D2）：把整体缩放设到某个比例，与面板滑块走**同一条**路径
+   * （`applyViewScale`）。自检/取证不能依赖真实拖动滑块。
+   */
+  setViewScale(scale: number, reason?: string): ViewScaleDiagnostics;
+  /** 内部诊断（非契约，ADR 0057 D2）：请求值 / 实际值 / 是否被工作区夹过 / 当前矩形。 */
+  viewScaleSnapshot(): ViewScaleDiagnostics;
+}
+
+/**
+ * ADR 0057 D2：整体缩放的只读诊断（内部，不跨进程暴露）。
+ *
+ * `requested` 是面板给的、`effective` 是**真正生效**的（受屏幕工作区限制），
+ * 两者不等时 `clamped='workarea'`——面板状态页据此显示"受屏幕限制"。
+ */
+export interface ViewScaleDiagnostics {
+  requested: number;
+  effective: number;
+  clamped: ScaleClamp;
+  /** 基准内容区尺寸（未缩放） */
+  base: { width: number; height: number } | null;
+  /** 当前窗口内容区矩形 */
+  bounds: ShellBounds | null;
+  /** 缩放时用的底边中心锚点（窗口底边中点） */
+  anchor: { x: number; y: number } | null;
+  workArea: Rect | null;
+  /** 缩放操作次数（自检确认"滑块真的改了窗口"） */
+  applies: number;
+  lastReason: string | null;
 }
 
 let mainWindow: BrowserWindow | null = null;
@@ -202,6 +238,26 @@ let lastTrayStatsRefreshAt = Number.NEGATIVE_INFINITY;
 let lastTrayStats: TrayStatsView | null = null;
 /** 拖拽进行中（shell 侧镜像；`sitting` 时点/拖都要先解除吸附，ADR 0028 D9） */
 let dragging = false;
+/**
+ * ADR 0057 D2：**基准内容区尺寸**（未乘缩放）。
+ *
+ * 由 `resolveWindowSize()` 在创建窗口前解析一次（模型包围盒 → 宽高），之后所有缩放
+ * 都以它为基准：`宽高 = base × scale`。不允许在运行期重新解析 GLB —— 缩放是"改窗口"，
+ * 不是"换模型"。
+ */
+let baseContentSize: WindowSize | null = null;
+/** ADR 0057 D2：最近一次缩放的只读状态（诊断/取证） */
+let viewScaleState: ViewScaleDiagnostics = {
+  requested: CHARACTER_SCALE_DEFAULT,
+  effective: CHARACTER_SCALE_DEFAULT,
+  clamped: 'none',
+  base: null,
+  bounds: null,
+  anchor: null,
+  workArea: null,
+  applies: 0,
+  lastReason: null,
+};
 let onProbeResponse: ((event: unknown, response: ProbeResponse) => void) | null = null;
 let onPointerFact: ((event: IpcMainEvent, fact: PointerFact) => void) | null = null;
 let onRendererEvent: ((event: IpcMainEvent, envelope: BroadcastEvent) => void) | null = null;
@@ -532,6 +588,15 @@ function ensurePanelController(): PanelController | null {
       },
       // §3.5 的单向命令：`cmd:tuning` 送到**主窗口渲染页**（不是面板）
       sendTuning: (values, reason) => {
+        /**
+         * ADR 0057 D2.2：**缩放由主进程自己执行**（窗口几何归 shell，不让渲染侧改窗口）。
+         *
+         * 顺序：先改窗口（`setBounds` → 浏览器发 `resize` → 渲染侧 `resize()` 重算视锥
+         * 与 `pixelsPerUnit`、重建掩膜），再把整组参数按原路径 `cmd:tuning` 推过去。
+         * 两个动作互不依赖，先后都行；先改窗口的好处是"下一帧看到的就是新尺寸"。
+         */
+        const scale = values['view.scale'];
+        if (typeof scale === 'number' && Number.isFinite(scale)) applyViewScale(scale, reason);
         const delivered = appBus.sendCommand(IPC_CHANNELS.tuning, values);
         logInfo('panel', '热更新参数下发', { reason, delivered, values });
         return delivered;
@@ -810,7 +875,7 @@ function resolveWindowSize(): {
   const config = resolveAssetConfig(appRoot);
   registerAssetProtocol(config);
 
-  const fallback: WindowSize = { width: WINDOW_WIDTH_PX, height: WINDOW_HEIGHT_PX };
+  const fallback: WindowSize = fallbackWindowSize();
   const modelId = path.basename(config.modelPath);
 
   logInfo('shell', '资产配置', {
@@ -881,12 +946,13 @@ function resolveWindowSize(): {
     parseMs: Number(parseMs.toFixed(1)),
   });
 
-  logInfo('shell', '窗口尺寸已按包围盒校正（ADR 0009 D4）', {
+  logInfo('shell', '窗口尺寸已按包围盒校正（ADR 0009 D4 / ADR 0058 D1）', {
     width: usable.width,
     height: usable.height,
     pixelsPerUnit: Math.round(size.pixelsPerUnit),
     clampedWidth: size.clampedWidth,
     padding: 1.15,
+    viewPaddingPx: MODEL_VIEW_PADDING_PX,
   });
 
   if (size.clampedWidth) {
@@ -1246,13 +1312,170 @@ function revealWhenRendererReady(window: BrowserWindow): void {
   });
 }
 
+/**
+ * ADR 0057 D2：从 `config.json` 读一次已保存的缩放比例（首帧就按它建窗口）。
+ *
+ * 为什么在**建窗口之前**读：与 ADR 0009 D2"先解析包围盒再建窗口"同一条理由 ——
+ * 否则用户会看到"先 1.0x 闪一下、再跳到 1.4x"。读失败/缺项按默认 1.0（§11 降级）。
+ */
+function readConfiguredScale(): number {
+  try {
+    const path_ = resolvePanelConfigPath(app.getAppPath());
+    const state = readPanelConfigFile(path_);
+    const raw = (state.tuning as Record<string, unknown>)['view.scale'];
+    return clampCharacterScale(raw === undefined ? CHARACTER_SCALE_DEFAULT : raw);
+  } catch (error) {
+    logWarn('shell', '读取 config.json 的缩放比例失败，按 1.0x 启动', { error: String(error) });
+    return CHARACTER_SCALE_DEFAULT;
+  }
+}
+
+/** 主显示器工作区的"底边中心"锚点（§1.2：窗口默认贴合工作区底边、水平居中）。 */
+function initialAnchor(base: WindowSize): { x: number; y: number; workArea: Rect } {
+  const { workArea } = screen.getPrimaryDisplay();
+  return {
+    // 先按 1.0x 算出"工作区底边中心"，作为缩放锚点；缩放时这个点不动
+    x: workArea.x + workArea.width / 2,
+    y: workArea.y + workArea.height,
+    workArea,
+  };
+}
+
+/**
+ * ADR 0058 D6：缩放的**逻辑锚点**（底边中心，屏幕 DIP）。
+ *
+ * 为什么不能每次都从 `getContentBounds()` 现算：宽高取整之后 `x = round(anchor − w/2)`
+ * 会让锚点带上 ±0.5px 的误差；下一次缩放再拿这个"半个像素"当基准，**误差会累积**
+ * （实测连续缩放一轮后窗口漂了 2px）。这里记住上一次提交的锚点，只在窗口被**别的东西**
+ * 搬动过（拖拽/行走/吸附/D-7 兜底）时才从当前位置重新取。
+ */
+let viewAnchor: { x: number; y: number } | null = null;
+
+/** 取锚点：窗口位置与"上次锚点推出的位置"一致 → 沿用上次的锚点（不累积取整误差）。 */
+function resolveViewAnchor(window: BrowserWindow): { x: number; y: number } {
+  const current = window.getContentBounds();
+  if (viewAnchor) {
+    const expectedX = viewAnchor.x - current.width / 2;
+    const expectedY = viewAnchor.y - current.height;
+    if (Math.abs(current.x - expectedX) <= 2 && Math.abs(current.y - expectedY) <= 2) {
+      return viewAnchor;
+    }
+  }
+  return { x: current.x + current.width / 2, y: current.y + current.height };
+}
+
+/**
+ * ADR 0057 D2：把整体缩放应用到主窗口（面板滑块 → 这里 → `setBounds`）。
+ *
+ * 三条硬约束：
+ * 1. **底边中心锚点不动**（脚底贴底边）：新矩形由 `resolveScaledWindowBounds()` 算；
+ * 2. **等比**：宽高同时乘同一个比例，模型靠 `pixelsPerUnit = 内容高 / 取景高` 自动同比放大；
+ * 3. **不许长到工作区外面**：超出时夹到工作区能装下的比例（`effectiveScale`），
+ *    差额写进诊断与日志（面板状态页显示"受屏幕限制"）。
+ *
+ * 返回是否真的改了窗口（尺寸与位置都没变时返回 false，不重复 `setBounds`）。
+ */
+function applyViewScale(scale: number, reason: string): boolean {
+  const window = mainWindow;
+  const base = baseContentSize;
+  if (!window || window.isDestroyed() || !base) return false;
+  const current = window.getContentBounds();
+  const anchor = resolveViewAnchor(window);
+  const display = screen.getDisplayMatching(current);
+  const target = resolveScaledWindowBounds({
+    base,
+    scale,
+    anchor,
+    workArea: display.workArea,
+  });
+  const unchanged =
+    target.width === current.width &&
+    target.height === current.height &&
+    target.x === current.x &&
+    target.y === current.y;
+  viewScaleState = {
+    requested: target.requestedScale,
+    effective: target.effectiveScale,
+    clamped: target.clamped,
+    base: { ...base },
+    bounds: { ...current },
+    anchor: { ...anchor },
+    workArea: { ...display.workArea },
+    applies: viewScaleState.applies + (unchanged ? 0 : 1),
+    lastReason: reason,
+  };
+  if (unchanged) {
+    viewAnchor = anchor;
+    return false;
+  }
+  // 无边框透明窗口：`bounds === contentBounds`；显式 animate=false，拖动滑块时要"跟手"
+  window.setBounds(
+    { x: target.x, y: target.y, width: target.width, height: target.height },
+    false,
+  );
+  viewAnchor = anchor;
+  const after = window.getContentBounds();
+  viewScaleState.bounds = { ...after };
+  logInfo('shell', '整体缩放已应用（ADR 0057 D2）', {
+    reason,
+    requested: target.requestedScale,
+    effective: target.effectiveScale,
+    clamped: target.clamped,
+    anchor,
+    from: current,
+    to: after,
+    base,
+    workArea: display.workArea,
+  });
+  if (target.clamped === 'workarea') {
+    logWarn('shell', '缩放受屏幕工作区限制：窗口已夹到能装下的最大比例', {
+      requested: target.requestedScale,
+      effective: target.effectiveScale,
+      workArea: display.workArea,
+    });
+  }
+  return true;
+}
+
 export const shell: ShellModule = {
   async start(opts: ShellStartOptions = {}): Promise<void> {
     if (mainWindow) return;
 
     const { size, frameExclude, hideAttachments, modelId } = resolveWindowSize();
+    /**
+     * ADR 0057 D2.1：**首帧就按 `config.json` 里保存的比例建窗口**。
+     *
+     * 基准尺寸（`size`）与缩放是两件事：`size` 由模型包围盒决定（ADR 0009 D4），
+     * 缩放只是把它等比乘一个系数。这里一次性算出初始矩形，避免"先 1.0x 闪一下再跳"。
+     */
+    baseContentSize = { ...size };
+    const configuredScale = readConfiguredScale();
+    const anchor = initialAnchor(size);
+    viewAnchor = { x: anchor.x, y: anchor.y };
+    const initial = resolveScaledWindowBounds({
+      base: size,
+      scale: configuredScale,
+      anchor: { x: anchor.x, y: anchor.y },
+      workArea: anchor.workArea,
+    });
+    viewScaleState = {
+      requested: initial.requestedScale,
+      effective: initial.effectiveScale,
+      clamped: initial.clamped,
+      base: { ...size },
+      bounds: { x: initial.x, y: initial.y, width: initial.width, height: initial.height },
+      anchor: { x: anchor.x, y: anchor.y },
+      workArea: { ...anchor.workArea },
+      applies: 0,
+      lastReason: 'startup',
+    };
 
-    const window = createMainWindow(size);
+    const window = createMainWindow({
+      x: initial.x,
+      y: initial.y,
+      width: initial.width,
+      height: initial.height,
+    });
     mainWindow = window;
     installRendererSink(window);
     revealWhenRendererReady(window);
@@ -1311,6 +1534,8 @@ export const shell: ShellModule = {
 
     logInfo('shell', `start 完成 hotkey=${hotkeyRegistration?.accelerator ?? '(未注册)'}`, {
       contentSize: { width: size.width, height: size.height },
+      // ADR 0057 D2：首个窗口的实际几何与缩放（诊断/取证的第一条基线）
+      viewScale: viewScaleState,
       hotkeyFallbackUsed: hotkeyRegistration?.fallbackUsed ?? null,
       snapHotkey: snapHotkeyRegistration?.accelerator ?? null,
       panelHotkey: panelHotkeyRegistration?.accelerator ?? null,
@@ -1457,6 +1682,25 @@ export const shell: ShellModule = {
 
   visionHotkeySnapshot(): HotkeyRegistration | null {
     return visionHotkeyRegistration;
+  },
+
+  setViewScale(scale: number, reason = 'internal'): ViewScaleDiagnostics {
+    applyViewScale(scale, reason);
+    return { ...viewScaleState };
+  },
+
+  viewScaleSnapshot(): ViewScaleDiagnostics {
+    const window = mainWindow;
+    if (window && !window.isDestroyed()) {
+      const bounds = window.getContentBounds();
+      viewScaleState.bounds = {
+        x: bounds.x,
+        y: bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+      };
+    }
+    return { ...viewScaleState };
   },
 
   snapToForeground(): SnapOutcome | null {

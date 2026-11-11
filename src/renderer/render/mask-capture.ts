@@ -1,19 +1,19 @@
 /**
- * 掩膜采集器：把场景渲染进 128×72 离屏 RenderTarget 并读回 alpha。
+ * 掩膜采集器：把场景渲染进离屏 RenderTarget 并读回 alpha。
  *
- * 契约 §3.3 R-2/R-5/R-9；ADR 0002；ADR 0004 D5。
+ * 契约 §3.3 R-2/R-5/R-9；ADR 0002；ADR 0004 D5；ADR 0057 D2.5（分辨率随缩放自适应）。
  * - 只对离屏 RT 调 `readRenderTargetPixels`，绝不碰 drawing buffer，绝不开启 preserveDrawingBuffer。
  * - 20Hz 固定刷新（与 rAF 解耦）；光标离开（主进程停止探针）后暂停采集。
  * - 三态与降级计数在 MaskSampler 里；这里只负责"把 alpha 交进去"和"探针到达时按需重采"。
+ * - **掩膜分辨率不是常量**：尺寸由 `maskSizeFor(内容宽, 内容高)` 按当前缩放算出来，
+ *   缩放时重建 RT。单元覆盖的 CSS 面积保持恒定，命中精度与拖动滑块前一致。
  */
 import * as THREE from 'three';
 import {
-  MASK_HEIGHT,
   MASK_PROBE_ACTIVE_WINDOW_MS,
   MASK_REFRESH_INTERVAL_MS,
-  MASK_WIDTH,
 } from '../../shared/constants';
-import { rgbaToAlpha } from '../../shared/mask';
+import { maskSizeFor, rgbaToAlpha } from '../../shared/mask';
 import { MaskSampler } from './mask-sampler';
 import type { MaskSample, MaskSnapshot } from './mask-sampler';
 
@@ -34,6 +34,13 @@ export interface MaskCapture {
    * 用途只有一个：不新增定时器也能在暂停期间继续推进状态。
    */
   setTickListener(listener: ((now: number) => void) | null): void;
+  /**
+   * ADR 0057 D2.5：内容区尺寸变化（整体缩放 / 显示器 DPI 变化）后重算掩膜分辨率。
+   * 返回是否真的重建了 RT（自检据此断言"缩放真的换了分辨率"）。
+   */
+  resize(cssWidth: number, cssHeight: number): boolean;
+  /** 当前掩膜分辨率 */
+  size(): { width: number; height: number };
   snapshot(): MaskSnapshot;
   /** 自检用：模拟 WebGL 上下文丢失 */
   markContextLost(): void;
@@ -41,11 +48,10 @@ export interface MaskCapture {
 
 export function createMaskCapture(host: MaskRendererHost): MaskCapture {
   const sampler = new MaskSampler();
-  const target = new THREE.WebGLRenderTarget(MASK_WIDTH, MASK_HEIGHT, {
-    depthBuffer: true,
-    stencilBuffer: false,
-  });
-  const pixels = new Uint8Array(MASK_WIDTH * MASK_HEIGHT * 4);
+
+  let size = maskSizeFor(0, 0);
+  let target = createTarget(size.width, size.height);
+  let pixels = new Uint8Array(size.width * size.height * 4);
 
   let timer: number | null = null;
   let paused = false;
@@ -53,15 +59,27 @@ export function createMaskCapture(host: MaskRendererHost): MaskCapture {
   let consecutiveFailures = 0;
   let tickListener: ((now: number) => void) | null = null;
 
+  function createTarget(width: number, height: number): THREE.WebGLRenderTarget {
+    return new THREE.WebGLRenderTarget(width, height, {
+      depthBuffer: true,
+      stencilBuffer: false,
+    });
+  }
+
   function capture(now: number): boolean {
     try {
       host.renderer.setRenderTarget(target);
       host.renderer.clear();
       host.renderer.render(host.scene, host.camera);
-      host.renderer.readRenderTargetPixels(target, 0, 0, MASK_WIDTH, MASK_HEIGHT, pixels);
+      host.renderer.readRenderTargetPixels(target, 0, 0, size.width, size.height, pixels);
       host.renderer.setRenderTarget(null);
       // WebGL 帧缓冲原点在左下，掩膜/CSS 原点在左上 → 读回时垂直翻转
-      sampler.recordSuccess(now, rgbaToAlpha(pixels, MASK_WIDTH, MASK_HEIGHT, true));
+      sampler.recordSuccess(
+        now,
+        rgbaToAlpha(pixels, size.width, size.height, true),
+        size.width,
+        size.height,
+      );
       consecutiveFailures = 0;
       return true;
     } catch (error) {
@@ -124,6 +142,26 @@ export function createMaskCapture(host: MaskRendererHost): MaskCapture {
 
     setTickListener(listener: ((now: number) => void) | null): void {
       tickListener = listener;
+    },
+
+    resize(cssWidth: number, cssHeight: number): boolean {
+      const next = maskSizeFor(cssWidth, cssHeight);
+      if (next.width === size.width && next.height === size.height) return false;
+      target.dispose();
+      size = next;
+      target = createTarget(size.width, size.height);
+      pixels = new Uint8Array(size.width * size.height * 4);
+      // 旧 alpha 缓冲尺寸对不上，必须作废：下一次 probe 会立刻重采一次（`stateAt !== 'ready'`）
+      sampler.recordFailure();
+      console.log(
+        `[render] 掩膜分辨率随缩放调整：${next.width}×${next.height}` +
+          `（内容区 ${Math.round(cssWidth)}×${Math.round(cssHeight)}，ADR 0057 D2.5）`,
+      );
+      return true;
+    },
+
+    size(): { width: number; height: number } {
+      return { width: size.width, height: size.height };
     },
 
     snapshot(): MaskSnapshot {

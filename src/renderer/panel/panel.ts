@@ -370,7 +370,10 @@ function buildParamUi(): void {
       heading.textContent = meta.section;
       const hint = document.createElement('span');
       hint.className = 'card-hint';
-      hint.textContent = meta.section === '坐姿' ? '仅坐姿（吸附到窗口边缘）时可见' : '光标在她身上移动时可见';
+      // ADR 0057 D2：分组提示词由参数元数据给出（新增"整体缩放"卡片时不必再改这里）
+      hint.textContent =
+        meta.sectionHint ??
+        (meta.section === '坐姿' ? '仅坐姿（吸附到窗口边缘）时可见' : '光标在她身上移动时可见');
       head.append(heading, hint);
       element.append(head);
       card = element;
@@ -1295,6 +1298,26 @@ function renderStatus(status: PanelStatus): void {
     'gaze.headStiffness',
     tuning['gaze.headStiffness'],
   )} / ${formatTunableValue('gaze.spineStiffness', tuning['gaze.spineStiffness'])}`;
+
+  /**
+   * ADR 0057 D2.6：缩放要看**两个数**。
+   *
+   * 左边是滑块给的请求值（面板自己的状态），右边是渲染进程报回来的实际尺寸反算出的比例。
+   * 两者不等只有一个原因：窗口被**屏幕工作区**夹过（1080p 桌面上放不到 2.0x）——
+   * 这正是要显示出来的事实，否则用户会以为滑块坏了。
+   */
+  {
+    const requested = tuning['view.scale'];
+    const actual = render?.view && render.view.scale > 0 ? render.view.scale : null;
+    must<HTMLElement>('#stat-scale').textContent =
+      actual === null
+        ? `${requested.toFixed(2)}x`
+        : `${requested.toFixed(2)}x → ${actual.toFixed(2)}x`;
+    must<HTMLElement>('#stat-scale-detail').textContent =
+      render?.view && render.view.height > 0
+        ? `内容区 ${Math.round(render.view.width)}×${Math.round(render.view.height)}`
+        : '窗口与角色同比缩放';
+  }
 
   must<HTMLElement>('#kv-state').textContent = render
     ? `${render.state.base} / ${render.state.overlay ?? '—'} / ${render.state.physics ?? '—'}`

@@ -1,15 +1,18 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { BASE_CONTENT_HEIGHT_PX, MODEL_VIEW_PADDING_PX, MODEL_VIEW_PADDING_X_PX } from './constants';
 import {
   DEFAULT_FRAME_EXCLUDE,
   MAX_MODEL_WINDOW_WIDTH_PX,
   MIN_MODEL_WINDOW_WIDTH_PX,
   computeWindowSize,
+  fallbackWindowSize,
   frameHeight,
   frameWidth,
   matchesFrameExclude,
   mergeBounds,
   pixelsPerUnitFor,
+  viewPaddingShare,
   type Bounds3,
 } from './model-frame';
 
@@ -73,13 +76,44 @@ test('取景尺寸与像素定标', () => {
   assert.ok(ppm > 50_000);
 });
 
-test('窗口尺寸：高度沿用 720，宽度按包围盒比例（CH0335 应为 422×720）', () => {
+test('窗口尺寸：高度 = 720 + 头顶边距，宽度按包围盒比例 + 左右边距（CH0335 应为 550×756）', () => {
   const size = computeWindowSize(BODY_HALO, 720);
-  assert.equal(size.height, 720);
-  assert.equal(size.width, 422);
+  assert.equal(size.height, BASE_CONTENT_HEIGHT_PX);
+  assert.equal(size.height, 756);
+  assert.equal(size.width, 550);
   assert.equal(size.clampedWidth, false);
-  // 与"bbox × 1.15"等价：宽高比一致
-  assert.ok(Math.abs(size.width / size.height - 0.00638 / 0.01088) < 0.005);
+});
+
+test('视口边距是加法：1.0x 的像素定标与加边距之前完全一样（ADR 0058 D1）', () => {
+  const size = computeWindowSize(BODY_HALO, 720);
+  // 旧口径（无安全边距）：720 / (高 × 1.15)
+  const legacy = pixelsPerUnitFor(frameHeight(BODY_HALO), 720);
+  assert.ok(Math.abs(size.pixelsPerUnit - legacy) < 1e-6, `${size.pixelsPerUnit} vs ${legacy}`);
+  // 她的像素高度（包围盒 × ppu）与旧窗口一样是 626px，多出来的 36px 是空白
+  const modelHeightPx = frameHeight(BODY_HALO) * size.pixelsPerUnit;
+  assert.ok(Math.abs(modelHeightPx - 720 / 1.15) < 0.05);
+  // 左右各 MODEL_VIEW_PADDING_X_PX、头顶 MODEL_VIEW_PADDING_PX（叠在原有 15% 留白之上）；
+  // 底边 0（脚底贴窗口底边，锚点不变）
+  const modelWidthPx = frameWidth(BODY_HALO) * size.pixelsPerUnit;
+  const legacyWidth = Math.round(modelWidthPx * 1.15);
+  assert.equal(size.width - legacyWidth, 2 * MODEL_VIEW_PADDING_X_PX);
+  const legacyTopMargin = 720 - 720 / 1.15;
+  assert.ok(Math.abs(size.height - modelHeightPx - legacyTopMargin - MODEL_VIEW_PADDING_PX) < 0.5);
+});
+
+test('边距份额：与内容区高度同比，2.0x 时像素定标严格翻倍', () => {
+  const share = viewPaddingShare(720);
+  assert.ok(Math.abs(share - 36 / 756) < 1e-9);
+  const one = pixelsPerUnitFor(frameHeight(BODY_HALO), 756, 1.15, share);
+  const two = pixelsPerUnitFor(frameHeight(BODY_HALO), 1512, 1.15, share);
+  assert.ok(Math.abs(two / one - 2) < 1e-9);
+});
+
+test('模型缺失时的兜底窗口同样带边距（480×720 → 608×756）', () => {
+  const size = fallbackWindowSize();
+  assert.equal(size.width, 608);
+  assert.equal(size.height, 756);
+  assert.equal(size.pixelsPerUnit, 0);
 });
 
 test('窗口宽度护栏：过宽/过窄都被夹住并标记', () => {
@@ -88,7 +122,8 @@ test('窗口宽度护栏：过宽/过窄都被夹住并标记', () => {
   assert.equal(wideSize.width, MAX_MODEL_WINDOW_WIDTH_PX);
   assert.equal(wideSize.clampedWidth, true);
 
-  const narrow: Bounds3 = { ...BODY_HALO, minX: -0.001, maxX: 0.001 };
+  // 极窄模型：包围盒只有 0.001 单位宽（≈58px）+ 左右边距 128 → 仍低于 240 的下限
+  const narrow: Bounds3 = { ...BODY_HALO, minX: -0.0005, maxX: 0.0005 };
   const narrowSize = computeWindowSize(narrow, 720);
   assert.equal(narrowSize.width, MIN_MODEL_WINDOW_WIDTH_PX);
   assert.equal(narrowSize.clampedWidth, true);

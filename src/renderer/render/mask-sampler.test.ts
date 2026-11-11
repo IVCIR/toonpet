@@ -109,3 +109,48 @@ test('矩形退路在内容区外判不命中', () => {
   assert.equal(outside.hit, false);
   assert.equal(outside.degraded, true);
 });
+
+/**
+ * ADR 0057 D2.5：掩膜分辨率随整体缩放变化。
+ *
+ * 采样器必须用"这一帧真正采集到的尺寸"做 CSS → 掩膜映射，而不是 128×72 的常量，
+ * 否则放大窗口之后命中点会整体偏移（右下角越偏越多）。
+ */
+test('分辨率自适应：按实际采集尺寸映射，命中与头部带一起跟着变', () => {
+  const sampler = new MaskSampler();
+  // 2x：256×144 的掩膜，涂满下半部（rows 72..143）
+  const width = 256;
+  const height = 144;
+  const mask = new Uint8Array(width * height);
+  for (let y = 72; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) mask[y * width + x] = 255;
+  }
+  sampler.recordSuccess(1000, mask, width, height);
+  assert.deepEqual(sampler.size(), { width, height });
+  assert.deepEqual(sampler.snapshot(1000).size, { width, height });
+
+  // 内容区也是 2x（960×1440）：下半部命中、上半部不命中
+  const lower = sampler.sample(480, 1200, 960, 1440, 1010);
+  assert.equal(lower.state, 'ready');
+  assert.equal(lower.hit, true);
+  const upper = sampler.sample(480, 200, 960, 1440, 1010);
+  assert.equal(upper.hit, false);
+  // bbox 的行区间是 72..143（新网格），头部带底部 = 72 + 72*0.22 ≈ 87.84
+  assert.deepEqual(sampler.snapshot(1010).bbox, {
+    minX: 0,
+    minY: 72,
+    maxX: width - 1,
+    maxY: height - 1,
+  });
+});
+
+test('分辨率自适应：尺寸变化会作废旧包围盒（不能拿旧网格算头部带）', () => {
+  const sampler = new MaskSampler();
+  sampler.recordSuccess(1000, bodyMask());
+  assert.ok(sampler.snapshot(1000).bbox);
+  // 换成 64×36（0.5x）：新缓冲全透明 → 包围盒必须为空，而不是沿用旧值
+  const small = new Uint8Array(64 * 36);
+  sampler.recordSuccess(1010, small, 64, 36);
+  assert.equal(sampler.snapshot(1010).bbox, null);
+  assert.deepEqual(sampler.size(), { width: 64, height: 36 });
+});

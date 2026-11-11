@@ -6,6 +6,7 @@
 //
 // stdio 用 inherit：不要用管道捕获 Electron 的输出，否则在没有命名管道权限的环境里会 EPERM。
 import { spawn } from 'node:child_process';
+import { createServer } from 'node:http';
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -61,7 +62,9 @@ const extraArgs = process.argv
       arg !== '--selftest-input' &&
       arg !== '--selftest-vision' &&
       arg !== '--panel-shot' &&
-      arg !== '--panel-opencode-shot',
+      arg !== '--panel-opencode-shot' &&
+      arg !== '--scale-shot' &&
+      arg !== '--swing-shot',
   );
 const selftest = process.argv.includes('--selftest');
 const selftestFallback = process.argv.includes('--selftest-fallback');
@@ -73,11 +76,21 @@ const selftestVision = process.argv.includes('--selftest-vision');
 // 截一张"OpenCode Go 模型下拉"的图；默认的 `--panel-shot` 仍然只用 127.0.0.1 桩，不访问外网。
 const panelOpenCodeShot = process.argv.includes('--panel-opencode-shot');
 const panelShot = process.argv.includes('--panel-shot') || panelOpenCodeShot;
+// ADR 0057 D2：整体缩放的逐档截图（拼成 GIF 当"录屏"看）
+const scaleShot = process.argv.includes('--scale-shot');
+// ADR 0058 D4：拖拽摇晃的逐帧取证。它必须开 `PET_SELFTEST=1`：
+// 主进程只有在这个模式下才读**脚本光标**，而摇晃正是靠"推光标 → 窗口跟随 → 单摆"驱动的。
+const swingShot = process.argv.includes('--swing-shot');
 
 const env = { ...process.env };
 delete env['ELECTRON_RUN_AS_NODE'];
 delete env['ELECTRON_NO_ATTACH_CONSOLE'];
 if (selftest || selftestFallback || selftestSpeech || selftestInput || selftestVision) env['PET_SELFTEST'] = '1';
+if (swingShot) {
+  env['PET_SELFTEST'] = '1';
+  env['PET_SWING_SHOT'] = '1';
+}
+if (scaleShot) env['PET_SCALE_SHOT'] = '1';
 if (panelShot) {
   // 面板取证**不**开 PET_SELFTEST：它需要真实运行时（真实输入/真实配置路径），
   // 只是把配置指向 logs/selftest/panel-config.json，跑完由脚本自己还原/删除。
@@ -117,18 +130,16 @@ if (selftestSpeech) {
 }
 
 if (selftestVision) {
-  // ADR 0054：视觉自检。OCR 端点用脚本内的本地桩（8003，真调 Windows OCR），
+  // ADR 0054：视觉自检。OCR 端点用脚本内的本地桩（真调 Windows OCR），
   // LLM/TTS 与语音自检同一套桩（chat 桩会检查 system 段里有没有 OCR 文字）。
+  // 端口在下面统一探测（ADR 0058 D8），这里只定模型/超时/来源。
   env['PET_SELFTEST_VISION'] = '1';
-  setDefault('PET_OCR_URL', 'http://127.0.0.1:8003/v1');
   setDefault('PET_OCR_MODEL', 'win-ocr-stub');
   setDefault('PET_OCR_TIMEOUT_MS', '20000');
   setDefault('PET_VISION_SOURCE', 'screen');
   // 自检屏幕是 3200×2000（200% 缩放）：缩到 1600 后 96px 字只剩 48px，
   // Windows OCR 会把 "VISION" 拆错。放宽到契约上限 2560，保留更多笔画。
   setDefault('PET_VISION_MAX_WIDTH', '2560');
-  setDefault('PET_TTS_URL', 'http://127.0.0.1:9881');
-  setDefault('PET_LLM_URL', 'http://127.0.0.1:11435');
   setDefault('PET_LLM_MODEL', 'selftest-stub:1b');
   setDefault('PET_TTS_PROMPT_TEXT', '参考音频：测试语音。');
   if (env['PET_TTS_REF_AUDIO'] === undefined || env['PET_TTS_REF_AUDIO'] === '') {
@@ -185,9 +196,7 @@ if (selftestInput) {
 }
 
 if (selftestSpeech) {
-  // 语音自检用本地桩（脚本内起在固定回环端口）；桩由 selftest.ts 启动
-  setDefault('PET_TTS_URL', 'http://127.0.0.1:9881');
-  setDefault('PET_LLM_URL', 'http://127.0.0.1:11435');
+  // 语音自检用本地桩（脚本内起在回环端口）；桩由 selftest.ts 启动
   setDefault('PET_LLM_MODEL', 'selftest-stub:1b');
   setDefault('PET_TTS_PROMPT_TEXT', '参考音频：测试语音。');
   if (env['PET_TTS_REF_AUDIO'] === undefined || env['PET_TTS_REF_AUDIO'] === '') {
@@ -198,9 +207,60 @@ if (selftestSpeech) {
   }
 }
 
+/**
+ * 自检桩的**端口选择**（ADR 0058 D8）。
+ *
+ * 原来三个桩写死 11435 / 9881 / 8003。Windows 的"端口排除范围"是**动态**的
+ * （Hyper-V / WinNAT 重启后会重新占段）：真机实测某次重启后 `11367–11466` 被整段排除，
+ * 于是 LLM 桩 `listen()` 直接 EACCES → 语音/视觉两套自检 exit 1（而断言本身还是全过的，
+ * 极难一眼看出是环境问题）。这里在**拉起 Electron 之前**逐个候选端口试绑，
+ * 选第一个真的能监听的，再通过环境变量同时告诉主进程和桩。
+ */
+const STUB_PORT_CANDIDATES = {
+  llm: [11435, 12435, 13435, 14435, 15435, 16435, 17435],
+  tts: [9881, 10881, 11881, 12881, 13881],
+  ocr: [8003, 9003, 10003, 11003],
+};
+
+function canListen(port) {
+  return new Promise((resolve) => {
+    const server = createServer();
+    const done = (ok) => {
+      server.removeAllListeners();
+      server.close(() => resolve(ok));
+    };
+    server.once('error', () => done(false));
+    server.once('listening', () => done(true));
+    server.listen(port, '127.0.0.1');
+  });
+}
+
+async function pickStubPort(kind) {
+  for (const port of STUB_PORT_CANDIDATES[kind]) {
+    if (await canListen(port)) return port;
+  }
+  // 全都被占/被排除：退回首选端口，让桩按原有方式报错（错误信息里带端口号）
+  return STUB_PORT_CANDIDATES[kind][0];
+}
+
+if (selftestSpeech || selftestVision) {
+  const llmPort = await pickStubPort('llm');
+  env['PET_LLM_URL'] = `http://127.0.0.1:${llmPort}`;
+  env['PET_SELFTEST_LLM_PORT'] = String(llmPort);
+  const ttsPort = await pickStubPort('tts');
+  env['PET_TTS_URL'] = `http://127.0.0.1:${ttsPort}`;
+  env['PET_SELFTEST_TTS_PORT'] = String(ttsPort);
+  if (selftestVision) {
+    const ocrPort = await pickStubPort('ocr');
+    env['PET_OCR_URL'] = `http://127.0.0.1:${ocrPort}/v1`;
+    env['PET_SELFTEST_OCR_PORT'] = String(ocrPort);
+  }
+  log('stub-ports', { llm: llmPort, tts: ttsPort });
+}
+
 // 自检不得污染真实记忆库（data/memory.db，ADR 0020）：改用 logs/selftest/memory.db，
 // 每次自检前清空，保证"行数 / 检索命中"类断言可复现。
-if (selftest || selftestFallback || selftestSpeech || selftestInput || selftestVision) {
+if (selftest || selftestFallback || selftestSpeech || selftestInput || selftestVision || swingShot) {
   const memoryDir = path.join(process.cwd(), 'logs', 'selftest');
   try {
     rmSync(memoryDir, { recursive: true, force: true });
@@ -209,6 +269,16 @@ if (selftest || selftestFallback || selftestSpeech || selftestInput || selftestV
     // 清理失败不挡自检：记忆库打不开时应用会降级为 :memory:（§11）
   }
   setDefault('PET_MEMORY_DB', path.join(memoryDir, 'memory.db'));
+  /**
+   * ADR 0057 D4：自检同样**不得读用户的 `config.json`**。
+   *
+   * 原来只有 `--panel-shot` 会隔离这个文件，主链路/输入条/语音/视觉四套自检都直接读
+   * `<appRoot>/config.json`。一旦用户在面板里配了一个**真实**的远程提供商（例如 OpenCode Go），
+   * 自检的"LLM 不可用 → llm_failed / route=fallback / 熔断"三条断言就会真的走网络并成功，
+   * 于是由绿变红 —— 更要紧的是**自检会拿用户的 Key 发真实请求**（§10.2 成本红线）。
+   * 隔离之后自检只看默认值（本地 Ollama + 环境变量里那个确定没人监听的端口）。
+   */
+  setDefault('PET_PANEL_CONFIG', path.join(memoryDir, 'panel-config.json'));
 }
 
 /** 300ms 静音 WAV：自检只需要"参考音频文件存在"这个前置条件。 */

@@ -13,6 +13,9 @@
  * 3. **不跨进程传函数/DOM**：这里只有数字与字符串，符合契约 §6.2 N-7 的纯数据要求。
  */
 import {
+  CHARACTER_SCALE_DEFAULT,
+  CHARACTER_SCALE_MAX,
+  CHARACTER_SCALE_MIN,
   GAZE_EYE_STIFFNESS,
   GAZE_HEAD_STIFFNESS,
   GAZE_SPINE_STIFFNESS,
@@ -30,6 +33,8 @@ export type TunableGroup = 'physics';
  * **不得**在消费方再写一份范围或默认值。
  */
 export const TUNABLE_IDS = [
+  // ADR 0057 D2：整体缩放（窗口几何由主进程执行，渲染侧只跟着 resize）
+  'view.scale',
   'sit.phaseAHeadTuneRad',
   'sit.spineOverlayWeight',
   'gaze.eyeStiffness',
@@ -55,6 +60,11 @@ export interface TunableMeta {
   hint: string;
   /** 单位后缀（`rad` / 空字符串） */
   unit: string;
+  /**
+   * 分组卡片的副标题（同一 section 的每一项都写一样的值）。
+   * 缺省由面板按分组名兜底（旧行为），新增分组时用它给出准确提示。
+   */
+  sectionHint?: string;
   min: number;
   max: number;
   step: number;
@@ -65,6 +75,21 @@ export interface TunableMeta {
 }
 
 export const TUNABLE_META: Record<TunableId, TunableMeta> = {
+  'view.scale': {
+    id: 'view.scale',
+    group: 'physics',
+    section: '整体缩放',
+    label: '角色缩放比例',
+    constant: 'CHARACTER_SCALE_MIN / MAX / DEFAULT',
+    hint: '窗口与角色同比变大变小，底边中心不动；上限还受屏幕工作区限制。',
+    sectionHint: '窗口与角色一起缩放 · 拖动即时生效',
+    unit: 'x',
+    min: CHARACTER_SCALE_MIN,
+    max: CHARACTER_SCALE_MAX,
+    step: 0.01,
+    decimals: 2,
+    default: CHARACTER_SCALE_DEFAULT,
+  },
   'sit.phaseAHeadTuneRad': {
     id: 'sit.phaseAHeadTuneRad',
     group: 'physics',

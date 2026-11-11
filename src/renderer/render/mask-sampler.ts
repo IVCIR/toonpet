@@ -35,6 +35,8 @@ export interface MaskSnapshot {
   lastSuccessAt: number | null;
   counters: MaskCounters;
   bbox: MaskBoundingBox | null;
+  /** 当前掩膜的**实际分辨率**（ADR 0057 D2.5：会随整体缩放变化） */
+  size: { width: number; height: number };
 }
 
 export interface MaskSample extends ProbeResponse {
@@ -54,9 +56,22 @@ export class MaskSampler {
   private contextLost = false;
   private readonly staleMs: number;
   private readonly counters: MaskCounters = { cold: 0, stale: 0 };
+  /**
+   * 当前掩膜的**实际分辨率**（ADR 0057 D2.5）。
+   *
+   * 不再直接读 `MASK_WIDTH/MASK_HEIGHT` 常量：整体缩放后掩膜分辨率会跟着变，
+   * 采样器必须用"这一帧真正采集到的尺寸"做 CSS → 掩膜映射，否则命中点会整体偏移。
+   */
+  private maskWidth = MASK_WIDTH;
+  private maskHeight = MASK_HEIGHT;
 
   constructor(options: MaskSamplerOptions = {}) {
     this.staleMs = options.staleMs ?? MASK_STALE_MS;
+  }
+
+  /** 当前掩膜分辨率（诊断/自检用） */
+  size(): { width: number; height: number } {
+    return { width: this.maskWidth, height: this.maskHeight };
   }
 
   stateAt(now: number): MaskState {
@@ -65,9 +80,17 @@ export class MaskSampler {
     return 'ready';
   }
 
-  recordSuccess(at: number, alpha: Uint8Array): void {
+  recordSuccess(at: number, alpha: Uint8Array, width?: number, height?: number): void {
+    const w = typeof width === 'number' && width > 0 ? Math.round(width) : this.maskWidth;
+    const h = typeof height === 'number' && height > 0 ? Math.round(height) : this.maskHeight;
+    // 尺寸变了就当作"新掩膜"：旧 bbox / 旧 alpha 都不能再用（否则头部带会按旧网格算）
+    if (w !== this.maskWidth || h !== this.maskHeight) {
+      this.bbox = null;
+      this.maskWidth = w;
+      this.maskHeight = h;
+    }
     this.alpha = alpha;
-    this.bbox = alphaBoundingBox(alpha, MASK_WIDTH, MASK_HEIGHT);
+    this.bbox = alphaBoundingBox(alpha, this.maskWidth, this.maskHeight);
     this.lastSuccessAt = at;
     this.contextLost = false;
   }
@@ -83,6 +106,7 @@ export class MaskSampler {
       lastSuccessAt: this.lastSuccessAt,
       counters: { ...this.counters },
       bbox: this.bbox,
+      size: { width: this.maskWidth, height: this.maskHeight },
     };
   }
 
@@ -93,8 +117,8 @@ export class MaskSampler {
     if (state === 'ready' && this.alpha) {
       const hit = hitTest(
         this.alpha,
-        MASK_WIDTH,
-        MASK_HEIGHT,
+        this.maskWidth,
+        this.maskHeight,
         cssX,
         cssY,
         cssW,

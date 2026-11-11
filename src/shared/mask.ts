@@ -7,11 +7,22 @@
  * 禁止各自再写一份（ADR 0004 D1.3）。
  *
  * 坐标系约定：
- * - 掩膜是 128 × 72 的单元网格，单元 (i, j) 的中心位于 ((i + 0.5) / 128, (j + 0.5) / 72)；
+ * - 掩膜是 `maskWidth × maskHeight` 的单元网格（契约基准 **128 × 72**；ADR 0057 起
+ *   整体缩放时按同一比例放大/缩小，见 `maskSizeFor`），单元 (i, j) 的中心位于
+ *   ((i + 0.5) / maskWidth, (j + 0.5) / maskHeight)；
  * - 因此连续掩膜坐标在单元中心处取整数，`cssToMask` 的 −0.5 偏移就是这个约定；
  * - 掩膜覆盖整个窗口内容区，CSS 坐标按内容区宽高等比映射（R-3）。
  */
-import { HEAD_BAND_RATIO, HIT_ALPHA_THRESHOLD, MASK_HEIGHT, MASK_WIDTH, GRAB_FOOT_BAND_RATIO } from './constants';
+import {
+  BASE_CONTENT_HEIGHT_PX,
+  HEAD_BAND_RATIO,
+  HIT_ALPHA_THRESHOLD,
+  MASK_HEIGHT,
+  MASK_SCALE_MAX,
+  MASK_SCALE_MIN,
+  MASK_WIDTH,
+  GRAB_FOOT_BAND_RATIO,
+} from './constants';
 
 export interface MaskPoint {
   mx: number;
@@ -36,11 +47,49 @@ export interface HitSample {
 /**
  * 窗口内容区 CSS 坐标 → 连续掩膜坐标（单元中心为整数）。
  * 调用方必须先保证 `cssW > 0 && cssH > 0`；`hitTest` 已内置该检查。
+ *
+ * `maskWidth` / `maskHeight` 缺省是契约的 128 × 72；ADR 0057 D2.5 允许掩膜分辨率
+ * 随整体缩放变化（窗口放大后仍保持"每个 CSS px 一个采样密度"），此时显式传入实际尺寸。
  */
-export function cssToMask(cssX: number, cssY: number, cssW: number, cssH: number): MaskPoint {
+export function cssToMask(
+  cssX: number,
+  cssY: number,
+  cssW: number,
+  cssH: number,
+  maskWidth: number = MASK_WIDTH,
+  maskHeight: number = MASK_HEIGHT,
+): MaskPoint {
+  const width = maskWidth > 0 ? maskWidth : MASK_WIDTH;
+  const height = maskHeight > 0 ? maskHeight : MASK_HEIGHT;
   return {
-    mx: (cssX / cssW) * MASK_WIDTH - 0.5,
-    my: (cssY / cssH) * MASK_HEIGHT - 0.5,
+    mx: (cssX / cssW) * width - 0.5,
+    my: (cssY / cssH) * height - 0.5,
+  };
+}
+
+/**
+ * 掩膜分辨率随窗口缩放自适应（ADR 0057 D2.5；基准改到"带边距的内容区"见 ADR 0058 D1）。
+ *
+ * 基准是"494 × 756 的内容区（1.0x）用 128 × 72 的掩膜"：缩放后按同一比例放大/缩小，
+ * 于是每个掩膜单元覆盖的 CSS 面积不变 —— 命中精度不会因为放大窗口而变糊，
+ * 也不会因为缩小窗口而浪费 `readRenderTargetPixels` 的带宽。
+ * 夹在 `[0.5x, 2x]`：再大只是给 readPixels 加负担，再小会丢掉手指/刘海级别的细节。
+ *
+ * 注意：掩膜映射是**相对**的（`cssToMask` 按内容区宽高等比），所以视口加了边距
+ * 之后命中坐标不需要任何换算——掩膜铺满整个内容区，空白区 alpha=0 自然不命中。
+ */
+export function maskSizeFor(
+  cssWidth: number,
+  cssHeight: number,
+): { width: number; height: number } {
+  const height = cssHeight > 0 ? cssHeight : BASE_CONTENT_HEIGHT_PX;
+  const raw = height / BASE_CONTENT_HEIGHT_PX;
+  const factor = Number.isFinite(raw)
+    ? Math.min(MASK_SCALE_MAX, Math.max(MASK_SCALE_MIN, raw))
+    : 1;
+  return {
+    width: Math.max(8, Math.round(MASK_WIDTH * factor)),
+    height: Math.max(8, Math.round(MASK_HEIGHT * factor)),
   };
 }
 
@@ -207,7 +256,9 @@ export function hitTest(
   if (!isInsideContent(cssX, cssY, cssW, cssH)) {
     return { inside: false, mx: Number.NaN, my: Number.NaN, alpha: 0, hit: false };
   }
-  const { mx, my } = cssToMask(cssX, cssY, cssW, cssH);
+  // 掩膜尺寸由 alpha 缓冲本身给出：`width/height` 就是这一帧掩膜的真实分辨率，
+  // CSS → 掩膜 的映射必须用它（ADR 0057 D2.5：分辨率会随缩放变化）。
+  const { mx, my } = cssToMask(cssX, cssY, cssW, cssH, width, height);
   const alphaValue = alphaAt(alpha, width, height, mx, my);
   return { inside: true, mx, my, alpha: alphaValue, hit: alphaValue >= threshold };
 }

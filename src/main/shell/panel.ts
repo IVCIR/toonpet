@@ -1045,6 +1045,16 @@ export function createPanelController(options: PanelControllerOptions): PanelCon
         }
       : null;
 
+    // ADR 0057 D2.6：渲染侧的内容区尺寸与实际生效的缩放比例（面板只显示）
+    const viewRaw = payload['view'];
+    const view = isRecord(viewRaw)
+      ? {
+          width: Math.max(0, Number(viewRaw['width']) || 0),
+          height: Math.max(0, Number(viewRaw['height']) || 0),
+          scale: Math.max(0, Number(viewRaw['scale']) || 0),
+        }
+      : { width: 0, height: 0, scale: 0 };
+
     renderFacts = {
       // 渲染侧发来的就是 `getState()` 的原样对象；字段级别的严格校验在主进程意义不大，
       // 面板只用它显示。这里只保证"不是 undefined"。
@@ -1057,6 +1067,7 @@ export function createPanelController(options: PanelControllerOptions): PanelCon
       },
       sit,
       tuning: sanitizeTunableValues(payload['tuning']),
+      view,
       collectedAt: Number(payload['collectedAt']) || 0,
     };
     renderFactsAt = performance.now();

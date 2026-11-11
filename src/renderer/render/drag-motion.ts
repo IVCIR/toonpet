@@ -20,6 +20,9 @@ import {
   DRAG_GRAVITY_PX_PER_SEC2,
   DRAG_PENDULUM,
   DRAG_PENDULUM_SUBSTEP_SECONDS,
+  DRAG_SWING_LIMIT_STEPS,
+  DRAG_SWING_MIN_ANGLE_RAD,
+  DRAG_SWING_SAFETY_PX,
 } from '../../shared/constants';
 
 export type DragBand = 'head' | 'body' | 'foot';
@@ -162,3 +165,122 @@ export function pivotCompensation(
     y: py - (px * sin + py * cos),
   };
 }
+
+// ---------------------------------------------------------------------------
+// 摆角的视口约束（ADR 0058 D3）
+// ---------------------------------------------------------------------------
+
+/** 侧影采样点（animationRoot 局部 px：脚底中心为原点，x 右、y 上）。 */
+export interface SwingPoint {
+  x: number;
+  y: number;
+}
+
+/** 视口（= 窗口内容区，世界单位 = CSS px，正交相机铺满整个内容区）。 */
+export interface SwingViewport {
+  /** 半宽：`|x|` 必须小于它 */
+  halfWidthPx: number;
+  /** 内容区高度：`y` 必须落在 [0, heightPx] */
+  heightPx: number;
+}
+
+export interface SwingLimitInput {
+  /** 侧影采样点（`measureSilhouette()` 的每一带的左右边缘） */
+  points: readonly SwingPoint[];
+  /** 抓取点（同一局部坐标） */
+  pivot: SwingPoint;
+  viewport: SwingViewport;
+  /** 物理上限（`DRAG_PENDULUM[band].angleLimitRad`） */
+  limitRad: number;
+  /** 兜底下限：算不出可行角时用它，绝不返回 0 */
+  minAngleRad?: number;
+  /** 求解分辨率 */
+  steps?: number;
+  /** 安全余量（px）：按"可用半宽 − 它"来解 */
+  safetyPx?: number;
+}
+
+/**
+ * 绕 `pivot` 转 `angle` 之后，侧影是否还整个落在视口里。
+ *
+ * 变换与渲染完全一致：先绕支点旋转（`animationRoot.rotation.z`），
+ * 再平移 `pivotCompensation()`（保持抓取点不动）—— 所以等价于"绕支点转"。
+ */
+export function swingFits(
+  points: readonly SwingPoint[],
+  pivot: SwingPoint,
+  angle: number,
+  viewport: SwingViewport,
+  safetyPx = 0,
+): boolean {
+  const px = finiteOrZero(pivot.x);
+  const py = finiteOrZero(pivot.y);
+  const theta = finiteOrZero(angle);
+  const cos = Math.cos(theta);
+  const sin = Math.sin(theta);
+  const limitX = viewport.halfWidthPx - Math.max(0, finiteOrZero(safetyPx));
+  const top = viewport.heightPx;
+  for (const point of points) {
+    const dx = finiteOrZero(point.x) - px;
+    const dy = finiteOrZero(point.y) - py;
+    const x = px + dx * cos - dy * sin;
+    const y = py + dx * sin + dy * cos;
+    if (Math.abs(x) > limitX) return false;
+    // 竖直：脚底贴内容区底边（y=0），头顶不能超过内容区高度。
+    // 容差 1px 是给取整用的：静止时脚底正好在 0，不能让浮点误差把它判成越界。
+    if (y < -1 || y > top + 1) return false;
+  }
+  return true;
+}
+
+/**
+ * **摆角的视口约束**：在物理上限 `limitRad` 之内，求出"侧影仍完整可见"的最大摆角。
+ *
+ * 为什么要它：`DRAG_PENDULUM` 的 `angleLimitRad`（抓头 0.35rad ≈ 20°）是**手感**上限，
+ * 与窗口多大无关；而窗口只比模型宽一点点，甩到 20° 时整身绕抓取点转，头发/身体必然
+ * 顶出内容区被裁掉（真机"边缘被切"）。视口边距（`MODEL_VIEW_PADDING_PX`）把可摆范围
+ * 撑大之后，这条约束负责**收口**：越接近边缘角度越饱和，而不是让画面破掉。
+ *
+ * 纯函数、无分配；只在拖拽开始 / 窗口缩放时算一次（不是每帧）。
+ */
+export function maxSwingAngle(input: SwingLimitInput): number {
+  const limit = Math.abs(finiteOrZero(input.limitRad));
+  if (!(limit > 0)) return 0;
+  const minAngle = clamp(
+    Math.abs(finiteOrZero(input.minAngleRad ?? DRAG_SWING_MIN_ANGLE_RAD)),
+    0,
+    limit,
+  );
+  const points = input.points ?? [];
+  if (points.length === 0) return minAngle;
+  const viewport = input.viewport;
+  if (!(viewport?.halfWidthPx > 0) || !(viewport?.heightPx > 0)) return minAngle;
+  const steps = Math.max(2, Math.min(256, Math.round(input.steps ?? DRAG_SWING_LIMIT_STEPS)));
+  const safety = Math.max(0, finiteOrZero(input.safetyPx ?? DRAG_SWING_SAFETY_PX));
+
+  if (swingFits(points, input.pivot, limit, viewport, safety)) return limit;
+
+  // 线性扫描找"第一个不行的步"，再在 [上一个可行, 这个不可行] 之间插值。
+  // 不假设单调性（模型的侧影不是凸的），但每一步都重新判一次，所以不会跳过一个可行的尖峰。
+  let lastGood = 0;
+  for (let step = 1; step <= steps; step += 1) {
+    const angle = (limit * step) / steps;
+    if (swingFits(points, input.pivot, angle, viewport, safety)) {
+      lastGood = angle;
+      continue;
+    }
+    const stepSize = limit / steps;
+    const previous = angle - stepSize;
+    // 二分 3 次即可到 1/8 步（≤0.0014rad ≈0.08°），比线性插值更贴边界
+    let low = previous;
+    let high = angle;
+    for (let i = 0; i < 3; i += 1) {
+      const mid = (low + high) / 2;
+      if (swingFits(points, input.pivot, mid, viewport, safety)) low = mid;
+      else high = mid;
+    }
+    return Math.max(minAngle, low);
+  }
+  return limit;
+}
+

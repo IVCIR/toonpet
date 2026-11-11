@@ -68,6 +68,15 @@ export interface MicroPool<K extends string> {
   /** 重置（重新进入状态时调用：回到第一个条目、权重归零、重新排期） */
   reset(nowMs: number): void;
   /**
+   * **立刻**把所有权重清零并回到默认条目（ADR 0057 D1：退出坐姿的 0.3s 交接收尾）。
+   *
+   * 与 `reset()` 的区别：不清 `switches` / `releases` / `forced` 这些诊断计数，
+   * 也不清"下一次抽签"以外的状态 —— 它只回答"这一帧开始，没有任何微动作在生效"。
+   * 生产路径上只有坐姿退出收尾会用它（要求"微动作池权重 0.3s 内归零"）；
+   * 上下文切换（idle → dragged 等）仍然走指数衰减，那样才不跳。
+   */
+  flush(nowMs: number): void;
+  /**
    * 覆盖切换间隔（自检压缩时序用；**不是**生产参数）。
    * 下一拍生效并重新排期——否则当前那 15–30s 的截止时间会挡在中间。
    */
@@ -285,6 +294,19 @@ export function createMicroPool<K extends string>(
       forced = null;
       intervalDirty = false;
       last = null;
+    },
+
+    flush(nowMs: number): void {
+      const now = Number.isFinite(nowMs) ? nowMs : 0;
+      for (const kind of kinds) weights[kind] = 0;
+      active = defaultKind;
+      activeSince = now;
+      // 下一次"激活"时重新排期 15–30s（不在回来的那一拍就抽签）
+      nextSwitchAt = Number.NaN;
+      releaseAt = Number.NaN;
+      forced = null;
+      intervalDirty = false;
+      last = snapshot(now);
     },
 
     setInterval(min: number, max: number): void {

@@ -12,6 +12,7 @@ import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Rect } from '../shared/geometry';
 import { SIT_HEAD_TUNE_RAD } from '../shared/constants';
+import { maskSizeFor } from '../shared/mask';
 import type { VisionResult } from '../shared/vision';
 import { logInfo, logWarn } from './log';
 import { getRuntime } from './runtime';
@@ -83,6 +84,9 @@ interface SitSequenceDiagnostics {
   spineOverlayApplied: number;
   headQuat: [number, number, number, number] | null;
   headWorld: { x: number; y: number } | null;
+  /** ADR 0058 D7：实际施加的平移补偿与原值（同一时刻读，用来验证 offset = raw × gain） */
+  offsetPx: { x: number; y: number };
+  rawOffsetPx: { x: number; y: number };
 }
 
 interface ModelDiagnostics {
@@ -213,6 +217,29 @@ interface ModelDiagnostics {
     headOrientation?: { pitch: number; yaw: number } | null;
     /** ADR 0046 D1：眼球当前相对头骨的朝向 */
     eyeOrientation?: { pitch: number; yaw: number } | null;
+    /** ADR 0057 D1：退出坐姿的 0.3s 交接（null = 不在交接中） */
+    handover?: { active: boolean; remainingMs: number; from: number } | null;
+    /** ADR 0057 D3：眼皮"睁眼"覆写（weight + 片段值/基线/实际值） */
+    eyelid?: {
+      captured: boolean;
+      applied: number;
+      x: { clip: number | null; idle: number | null; applied: number | null };
+      positionOverridden: boolean;
+    };
+    /** ADR 0057 D1：此刻仍被坐姿覆写的骨骼名（退出后两个数组都必须为空） */
+    overrides?: { rotation: string[]; position: string[] };
+  };
+  /** ADR 0057 D2：整体缩放的渲染侧事实（内容区尺寸 / 生效比例 / 掩膜分辨率） */
+  view?: {
+    width: number;
+    height: number;
+    scale: number;
+    pixelsPerUnit: number | null;
+    mask: { width: number; height: number };
+    faceZoom: number;
+    /** ADR 0058 D3：侧影剖面带数与当前摆角上限（未拖拽时 swingLimit=null） */
+    silhouetteBands?: number;
+    swingLimit?: number | null;
   };
   /** ADR 0035：拖拽抓取点/受迫摆/落地分级 */
   drag?: {
@@ -220,6 +247,8 @@ interface ModelDiagnostics {
     band: 'head' | 'body' | 'foot' | null;
     pivot: { x: number; y: number };
     angle: number;
+    /** ADR 0058 D3：视角容得下的最大摆角（= 物理上限表示没被夹过） */
+    angleLimit?: number;
     omega: number;
     gain: number;
     supportAcceleration: { x: number; y: number };
@@ -681,6 +710,38 @@ function clampRect(rect: Rect, width: number, height: number): Rect {
   };
 }
 
+/**
+ * 截图里**不透明像素**的包围盒（ADR 0058 D4 的像素级判据）。
+ *
+ * 为什么不用 `silhouetteCss()` 就够：那是顶点采样，光环是空心的圆环，它的包围盒四角
+ * 是空白；而要证明"没有被窗口切掉"，最硬的一条就是**渲染出来的像素**没有贴边。
+ * 透明窗口的 `capturePage()` 带 alpha，所以直接读 BGRA 的第 4 个字节。
+ */
+function alphaBounds(image: NativeImage, threshold = 24): {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+} | null {
+  const size = image.getSize();
+  const bitmap = image.toBitmap();
+  let minX = size.width;
+  let minY = size.height;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < size.height; y += 1) {
+    for (let x = 0; x < size.width; x += 1) {
+      const alpha = bitmap[(y * size.width + x) * 4 + 3] ?? 0;
+      if (alpha < threshold) continue;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  return maxX < 0 ? null : { minX, minY, maxX, maxY };
+}
+
 /** 两张截图的局部像素差（BGRA；忽略 alpha，单通道差 > 16 计为变化）。 */
 function diffRegion(
   before: NativeImage,
@@ -927,8 +988,8 @@ async function runFallbackSuite(window: BrowserWindow, checks: AcceptanceCheck[]
 
   const bounds = window.getContentBounds();
   check(
-    '缺失模型：窗口退回默认 480×720',
-    bounds.width === 480 && bounds.height === 720,
+    '缺失模型：窗口退回默认 608×756（含视口安全边距）',
+    bounds.width === 608 && bounds.height === 756,
     bounds,
   );
 
@@ -2951,6 +3012,11 @@ async function runHaloDiagnostics(window: BrowserWindow): Promise<void> {
 
 export async function runSelfTestIfRequested(): Promise<void> {
   if (process.env.PET_SELFTEST !== '1') return;
+  /**
+   * ADR 0058 D4：`swing:shot` 复用 `PET_SELFTEST=1`（它要脚本光标），但**不是**自检。
+   * 没有这一行，`npm run swing:shot` 会先跑完整套自检（约 4 分钟）再取证。
+   */
+  if (process.env.PET_SWING_SHOT === '1') return;
 
   const fallbackMode = process.env.PET_SELFTEST_FALLBACK === '1';
   const speechMode = process.env.PET_SELFTEST_SPEECH === '1';
@@ -3078,8 +3144,11 @@ export async function runSelfTestIfRequested(): Promise<void> {
 
   const contentSize = window.getContentBounds();
   check(
-    '窗口尺寸：高度沿用 720、宽度按包围盒校正（240–960）',
-    contentSize.height === 720 && contentSize.width >= 240 && contentSize.width <= 960,
+    '窗口尺寸：高度 = 720 + 36、宽度按包围盒校正 + 左右各 64（ADR 0058 D1）',
+    contentSize.height === 756 &&
+      contentSize.width >= 240 &&
+      contentSize.width <= 960 &&
+      contentSize.width === 550,
     contentSize,
   );
   check(
@@ -4569,6 +4638,28 @@ export async function runSelfTestIfRequested(): Promise<void> {
 
   // ADR 0034：必须等"到达并落座"之后再量几何；physics=sitting 在接近阶段就为真，
   // 不能再拿它当"已经坐下"的判据。
+  /**
+   * ADR 0058 D7（自检稳定性）：**落座弹簧只有 ~0.3s**，而 `getDiagnostics()` 单次约 300ms。
+   *
+   * 旧实现是"等到 arrived 再读一次重快照"——那一帧可能已经落在弹簧之后（`sitDrop=1`、
+   * `sitPoseGain=0`），于是"落座有半蹲过渡"或"offset = raw × gain"偶发失败（真机踩到过，
+   * 同一天两次运行一次绿一次红）。这里从**接近阶段就开始**用 16ms 的轻快照
+   * （`sitSequence()`，微秒级）采整段，断言的是"整段里的不变量"，与轮询相位无关。
+   */
+  const landingSeriesPromise = window.webContents.executeJavaScript(
+    `new Promise((resolve) => {
+      const rows = [];
+      const startedAt = performance.now();
+      const tick = () => {
+        const snap = window.diagnostics.sitSequence();
+        rows.push({ t: Math.round(performance.now() - startedAt), ...snap });
+        if (performance.now() - startedAt < 3200) setTimeout(tick, 16);
+        else resolve(JSON.stringify(rows));
+      };
+      tick();
+    })`,
+    true,
+  ) as Promise<string>;
   const arrived = await waitFor(
     window,
     4000,
@@ -4579,16 +4670,9 @@ export async function runSelfTestIfRequested(): Promise<void> {
     arrived?.sit?.arrived === true && arrived?.hfsm.physics === 'sitting',
     arrived?.sit ?? null,
   );
-  // ADR 0042 D1：落座不是瞬间切换——到达后 240ms 内有一个"半蹲"过渡
-  // （身体从座面上方 14px 落下、大腿前弯 0.22rad、躯干微前倾），之后全部归零。
-  check(
-    '坐姿：落座时有半蹲过渡（transition ∈ (0,1)、transitionLiftPx > 0，ADR 0042 D1）',
-    typeof arrived?.sit?.transition === 'number' &&
-      arrived.sit.transition > 0 &&
-      arrived.sit.transition < 1 &&
-      (arrived.sit.transitionLiftPx ?? 0) > 0,
-    arrived?.sit ?? null,
-  );
+  // ADR 0042 D1 / ADR 0051：落座过渡与补偿缩放的断言都基于上面这条 16ms 序列
+  // （ADR 0058 D7）。**但不能在这里 await** —— 它要跑 3.2s，而阶段 A→B 只有 1.8s，
+  // 阻塞会把阶段 A/B 的采样整段错过。序列在页内独立计时，等阶段 B 采样完再收。
 
   const notepadBounds = notepad.getBounds();
   const seatedBounds = shell.getBounds();
@@ -4719,15 +4803,29 @@ export async function runSelfTestIfRequested(): Promise<void> {
       { tune, applied: applied.map((value) => Number(value.toFixed(3))).slice(0, 8) },
     );
   }
+  /**
+   * ADR 0058 D7：不再用"阶段 B 出现在采样窗口的第几毫秒"当判据 —— 那其实在测
+   * "采样起点是否早于 16.0s"，与产品行为无关，会随前序步骤耗时漂移（实测 813ms 假失败）。
+   * 改成测**过渡本身的时长**：`stageBBlend` 从 ≤0.02 到 ≥0.98 用了多久，必须 ≈0.3s。
+   */
+  const stageBRamp = sitSequenceSeries.filter((row) => row.stage === 'b');
+  const firstBlendZero = stageBRamp.find((row) => row.stageBBlend <= 0.02) ?? null;
+  const firstBlendFull = stageBRamp.find((row) => row.stageBBlend >= 0.98) ?? null;
+  const rampMs =
+    firstBlendZero !== null && firstBlendFull !== null ? firstBlendFull.t - firstBlendZero.t : null;
   check(
     '坐姿两段式：阶段 B 在 0.3s 内把上半身覆盖从 0 收到 1（16.2s 停帧后不再跳）',
     firstStageB !== null &&
-      firstStageB.t >= 900 &&
-      firstStageB.t <= 2500 &&
+      firstStageB.t >= 0 &&
+      firstStageB.t <= 2200 &&
+      rampMs !== null &&
+      rampMs >= 150 &&
+      rampMs <= 700 &&
       (lastSequence?.stageBBlend ?? 0) >= 0.999 &&
       (lastSequence?.upperOverride ?? 0) >= 0.95,
     {
       stageBAtMs: firstStageB?.t ?? null,
+      rampMs,
       finalStageBBlend: lastSequence?.stageBBlend ?? null,
       finalUpperOverride: lastSequence?.upperOverride ?? null,
     },
@@ -4801,25 +4899,80 @@ export async function runSelfTestIfRequested(): Promise<void> {
   // 截图取证完就恢复随机张望，否则后面 11s 的"换向/头在转"断言只会看到一个 camera 目标。
   await window.webContents.executeJavaScript(`window.diagnostics.forceSitGaze('wander')`, true);
   await sleep(400);
+  /**
+   * ADR 0058 D7：落座弹簧 + 补偿缩放的**整段**判据。
+   *
+   * 这一刻 `landingSeriesPromise`（3.2s、16ms 一拍）早已跑完，取回序列即可；
+   * 断言全部是"整段里的不变量"，与 IPC 轮询相位、截图耗时都无关。
+   */
+  const landingSeries = JSON.parse(await landingSeriesPromise) as Array<
+    SitSequenceDiagnostics & { t: number }
+  >;
+  {
+    const midLanding = landingSeries.filter((row) => row.sitDrop > 0.05 && row.sitDrop < 0.95);
+    const liftedMid = midLanding.filter(
+      (row) => row.sitPoseGain > 0.2 && (1 - row.sitDrop) * row.sitPoseGain > 0.05,
+    );
+    let maxDropStep = 0;
+    for (let i = 1; i < landingSeries.length; i += 1) {
+      maxDropStep = Math.max(
+        maxDropStep,
+        Math.abs((landingSeries[i]?.sitDrop ?? 0) - (landingSeries[i - 1]?.sitDrop ?? 0)),
+      );
+    }
+    check(
+      '坐姿：落座时有半蹲过渡（sitDrop 在 (0,1) 之间被看到 ≥3 帧、过渡抬升 >0、16ms 步进 <0.35）',
+      arrived?.sit?.arrived === true && midLanding.length >= 3 && liftedMid.length >= 2 && maxDropStep < 0.35,
+      {
+        samples: landingSeries.length,
+        midLanding: midLanding.length,
+        liftedMid: liftedMid.length,
+        maxDropStep: Number(maxDropStep.toFixed(3)),
+        firstMid: midLanding[0] ?? null,
+      },
+    );
+  }
   // ADR 0043 D3：落座过程中补偿必须跟着片段权重走（不能一帧内硬切 ~390px）。
   // 断言的是**不变量**而不是某一帧的绝对值：`offset == raw × blend`（±1px 取整误差）。
-  // 这样与截图/IPC 的时序无关，又能证明"补偿被权重缩放"。
+  // ADR 0058 D7：改成对**整段 16ms 序列**成立 —— 旧实现只读 arrived 那一刻，
+  // 若那次重快照（≈300ms）已经落在弹簧之后（sitPoseGain=0），断言就会假失败。
   {
-    const sitNow = arrived?.sit ?? null;
-    const rawX = sitNow?.rawOffsetPx?.x ?? 0;
-    const rawY = sitNow?.rawOffsetPx?.y ?? 0;
-    const offX = sitNow?.offsetPx?.x ?? 0;
-    const offY = sitNow?.offsetPx?.y ?? 0;
-    // ADR 0051：补偿 = raw × sitGain × sitDrop（诊断字段 `sitPoseGain`）
-    const gain = sitNow?.sitPoseGain ?? 0;
+    const scaledRows = landingSeries.filter(
+      (row) => Math.abs(row.rawOffsetPx.x) > 50 && row.sitPoseGain > 0.02,
+    );
+    const scaledOk = scaledRows.every(
+      (row) =>
+        Math.abs(row.offsetPx.x - row.rawOffsetPx.x * row.sitPoseGain) < 1.5 &&
+        Math.abs(row.offsetPx.y - row.rawOffsetPx.y * row.sitPoseGain) < 1.5,
+    );
+    const midGain = scaledRows.filter(
+      (row) => row.sitPoseGain > 0.15 && row.sitPoseGain < 0.85,
+    );
+    const worst = scaledRows.reduce<{ row: SitSequenceDiagnostics | null; err: number }>(
+      (acc, row) => {
+        const err = Math.max(
+          Math.abs(row.offsetPx.x - row.rawOffsetPx.x * row.sitPoseGain),
+          Math.abs(row.offsetPx.y - row.rawOffsetPx.y * row.sitPoseGain),
+        );
+        return err > acc.err ? { row, err } : acc;
+      },
+      { row: null, err: 0 },
+    );
     check(
-      '坐姿：补偿按片段权重 × 弹簧增益缩放（offset ≈ raw × sitPoseGain，落座瞬间不会硬切，ADR 0043/0051）',
-      Math.abs(rawX) > 50 &&
-        gain > 0 &&
-        gain < 1 &&
-        Math.abs(offX - rawX * gain) < 1.5 &&
-        Math.abs(offY - rawY * gain) < 1.5,
-      { raw: sitNow?.rawOffsetPx ?? null, offset: sitNow?.offsetPx ?? null, sitPoseGain: sitNow?.sitPoseGain ?? null },
+      '坐姿：补偿按片段权重 × 弹簧增益缩放（整段 offset ≈ raw × sitPoseGain，且增益确实经过 (0,1)）',
+      scaledRows.length >= 5 && scaledOk && midGain.length >= 2,
+      {
+        rows: scaledRows.length,
+        midGain: midGain.length,
+        worstErrPx: Number(worst.err.toFixed(2)),
+        worstRow: worst.row
+          ? {
+              gain: worst.row.sitPoseGain,
+              offset: worst.row.offsetPx,
+              raw: worst.row.rawOffsetPx,
+            }
+          : null,
+      },
     );
   }
 
@@ -5438,6 +5591,204 @@ export async function runSelfTestIfRequested(): Promise<void> {
   resetScriptedCursor();
   await sleep(200);
 
+  // ------------------------------------------------------------------
+  // 3.8.4) ADR 0057：坐姿**退场残留**（真机"坐完站起来抽搐"）与**坐姿眯眼**
+  //
+  // 这两条都是"数据结构和画面不一致"类型的 bug，所以断言要看**数据结构**：
+  //
+  // ① `BoneArbiter.overrideBase()` 是**每帧持续写**的。旧实现只在"坐姿权重 > 0"时
+  //    提交覆写，权重归零之后**没有任何一处把它清成 `null`** → 下背/胸/颈/头/眼球
+  //    被永久冻在最后一次混合出的坐姿四元数上，站起来走路时上半身拧着、头随光标抽。
+  //    这里断言：坐姿里确实有 ≥4 根骨处于覆写中；退出 0.3s 交接之后**两个数组都空**，
+  //    并且头骨基底重新来自 mixer。
+  //
+  // ② 坐姿片段 16.2s 停帧会把眼皮骨（`bone_eye_D_L/R`）冻在"半闭"的位置（真机=眯眼）。
+  //    这里断言：阶段 B 之后眼皮 x 已经被拉回到站立待机采到的"睁眼"基线（|Δx| ≤ 2e-5），
+  //    并且覆写权重是 1（不是"刚好路过"）。
+  // ------------------------------------------------------------------
+  {
+    // 把她放到地面上、并让记事本当目标（前一段的桌面全屏测试要在这之后）
+    window.setPosition(
+      display.workArea.x + 120,
+      display.workArea.y + display.workArea.height - window.getContentBounds().height,
+      false,
+    );
+    await sleep(160);
+    const notepadForExit = notepad.getBounds();
+    pushScriptedForeground(dipRectToPhysical(notepadForExit));
+    await sleep(200);
+    const exitSnap = shell.snapToForeground();
+    check('坐姿退场（ADR 0057）：可以吸附落座（前置条件）', exitSnap?.ok === true, exitSnap ?? null);
+    await waitFor(window, 4000, (diagnostics) => diagnostics?.sit?.arrived === true);
+    // 阶段 B：16.2s 停帧 + 0.3s 覆盖淡入都走完，才谈得上"覆写"
+    const stageB = await waitFor(
+      window,
+      8000,
+      (diagnostics) =>
+        (diagnostics?.sit?.stageBBlend ?? 0) >= 0.98 && diagnostics?.sit?.done === true,
+    );
+    const inSit = await readDiagnostics(window);
+    const eyelidBefore = inSit?.sit?.eyelid ?? null;
+    check(
+      '坐姿（ADR 0057 D1）：阶段 B 之后上半身覆写真的挂在骨骼上（rotation ≥ 4 根）',
+      (inSit?.sit?.overrides?.rotation.length ?? 0) >= 4,
+      { stageB: stageB?.sit?.stage ?? null, overrides: inSit?.sit?.overrides ?? null },
+    );
+    check(
+      '坐姿（ADR 0057 D3）：眼皮已从片段值拉回"睁眼"基线（weight≥0.95、|Δx| ≤ 2e-5）',
+      eyelidBefore !== null &&
+        eyelidBefore.captured &&
+        eyelidBefore.applied >= 0.95 &&
+        eyelidBefore.x.idle !== null &&
+        eyelidBefore.x.applied !== null &&
+        Math.abs(eyelidBefore.x.applied - eyelidBefore.x.idle) <= 2e-5 &&
+        eyelidBefore.positionOverridden,
+      eyelidBefore,
+    );
+    const sitEyelidShot = await captureScreenshot(window, 'sit-eyelid-open.png', 'sit-eyelid-open');
+
+    /**
+     * 交接的中间态：用**渲染页内的 16ms 采样**（`sitSequence()` 很轻，~微秒级）。
+     *
+     * 为什么不用主进程的 `waitFor(readDiagnostics)`：那一次约 300ms，而交接窗口正好 300ms，
+     * 一半以上的概率整段被跳过（历史上就这么丢过"惊跳只有 120ms"的断言）。
+     */
+    const exitTracePromise = window.webContents.executeJavaScript(
+      `new Promise((resolve) => {
+        const rows = [];
+        const startedAt = performance.now();
+        const tick = () => {
+          const seq = window.diagnostics.sitSequence();
+          const pool = window.diagnostics.microPool();
+          rows.push({
+            t: Math.round(performance.now() - startedAt),
+            upper: seq.upperOverride,
+            handover: seq.handoverRemainingMs,
+            eyelid: seq.eyelidApplied,
+            rot: seq.overrideCount.rotation,
+            pos: seq.overrideCount.position,
+            pool: pool && pool.sit ? pool.sit.weights : null,
+          });
+          if (performance.now() - startedAt < 1000) setTimeout(tick, 16);
+          else resolve(JSON.stringify(rows));
+        };
+        tick();
+      })`,
+      true,
+    ) as Promise<string>;
+    await sleep(80);
+    shell.releaseSnap();
+    const exitTrace = JSON.parse(await exitTracePromise) as Array<{
+      t: number;
+      upper: number;
+      handover: number | null;
+      eyelid: number;
+      rot: number;
+      pos: number;
+      pool: Record<string, number> | null;
+    }>;
+    const handoverRows = exitTrace.filter((row) => row.handover !== null);
+    const lastRow = exitTrace[exitTrace.length - 1] ?? null;
+    let upperWentUp = false;
+    for (let i = 1; i < exitTrace.length; i += 1) {
+      if (exitTrace[i]!.upper > exitTrace[i - 1]!.upper + 0.02) upperWentUp = true;
+    }
+    check(
+      '坐姿退出（ADR 0057 D1）：0.3s 交接被 16ms 采样完整观测到（upper 单调降到 0）',
+      handoverRows.length >= 5 && !upperWentUp && (lastRow?.upper ?? 1) === 0,
+      {
+        samples: exitTrace.length,
+        handoverSamples: handoverRows.length,
+        upperMax: Math.max(...exitTrace.map((row) => row.upper)),
+        upperLast: lastRow?.upper ?? null,
+      },
+    );
+    check(
+      '坐姿退出（ADR 0057 D1）：覆写跟着交接一起退（rotation 4→0、position 2→0）',
+      (handoverRows[0]?.rot ?? 0) >= 4 &&
+        (handoverRows[0]?.pos ?? 0) >= 2 &&
+        (lastRow?.rot ?? -1) === 0 &&
+        (lastRow?.pos ?? -1) === 0,
+      {
+        first: handoverRows[0] ?? null,
+        last: lastRow,
+        rotationPeak: Math.max(...exitTrace.map((row) => row.rot)),
+      },
+    );
+    check(
+      '坐姿退出（ADR 0057 D3）：交接期间眼睛保持睁开（eyelid 权重不掉回 0 再跳）',
+      handoverRows.every((row) => row.eyelid >= 0.95) && (lastRow?.eyelid ?? 1) === 0,
+      {
+        minDuringHandover: Math.min(...handoverRows.map((row) => row.eyelid)),
+        last: lastRow?.eyelid ?? null,
+      },
+    );
+    check(
+      '坐姿退出（ADR 0057 D1）：坐姿微动作池权重归零（legs/hands/far 全 0）',
+      ['legs', 'hands', 'far'].every((kind) => (lastRow?.pool?.[kind] ?? 1) === 0),
+      lastRow?.pool ?? null,
+    );
+
+    const exited = await waitFor(
+      window,
+      2500,
+      (diagnostics) =>
+        (diagnostics?.sit?.handover ?? null) === null &&
+        (diagnostics?.sit?.sitPoseGain ?? 1) === 0,
+    );
+    check(
+      '坐姿退出（ADR 0057 D1）：交接走完（handover=null、sitPoseGain=0、upperOverride=0）',
+      exited !== null &&
+        (exited.sit?.handover ?? null) === null &&
+        (exited.sit?.sitPoseGain ?? 1) === 0 &&
+        (exited.sit?.upperOverride ?? 1) === 0,
+      exited?.sit
+        ? {
+            handover: exited.sit.handover ?? null,
+            sitPoseGain: exited.sit.sitPoseGain ?? null,
+            upperOverride: exited.sit.upperOverride ?? null,
+          }
+        : null,
+    );
+    check(
+      '坐姿退出（ADR 0057 D1）：骨骼覆写全部释放（rotation/position 都为空）',
+      (exited?.sit?.overrides?.rotation.length ?? -1) === 0 &&
+        (exited?.sit?.overrides?.position.length ?? -1) === 0,
+      exited?.sit?.overrides ?? null,
+    );
+    check(
+      '坐姿退出（ADR 0057 D1）：头骨基底重新来自 mixer（不再被覆写）',
+      exited?.sit?.headBase?.baseFrom === 'mixer' && exited?.sit?.eyelid?.positionOverridden === false,
+      { headBase: exited?.sit?.headBase ?? null, eyelid: exited?.sit?.eyelid ?? null },
+    );
+    // 稳定 0.6s 后再读一次：覆写不许"自己长回来"，也不许有别的路径重新挂上
+    await sleep(600);
+    const afterExit = await readDiagnostics(window);
+    check(
+      '坐姿退出（ADR 0057 D1）：0.6s 后仍然没有任何坐姿覆写/微动残留',
+      (afterExit?.sit?.overrides?.rotation.length ?? -1) === 0 &&
+        (afterExit?.sit?.overrides?.position.length ?? -1) === 0 &&
+        (afterExit?.sit?.eyelid?.applied ?? -1) === 0 &&
+        (afterExit?.sit?.motion?.gain ?? -1) === 0,
+      {
+        overrides: afterExit?.sit?.overrides ?? null,
+        eyelid: afterExit?.sit?.eyelid ?? null,
+        motionGain: afterExit?.sit?.motion?.gain ?? null,
+      },
+    );
+    const standShot = await captureScreenshot(window, 'window-after-sit-exit.png', 'after-sit-exit');
+    logInfo('selftest', 'sit-exit-handover', {
+      eyelidBefore,
+      exitTrace,
+      exitedSit: exited?.sit ?? null,
+      sitEyelidShot,
+      standShot,
+    });
+    shell.releaseSnap();
+    resetScriptedForeground();
+    await sleep(200);
+  }
+
   // 拒绝：前台全屏（游戏/视频）→ 不吸附 + 提示
   notepad.setBounds({ x: 0, y: 0, width: display.bounds.width, height: display.bounds.height });
   pushScriptedForeground(
@@ -5753,6 +6104,339 @@ export async function runSelfTestIfRequested(): Promise<void> {
     total: neutralDiff.total,
     emotionDiffs: emotionChanged,
   });
+
+  // ------------------------------------------------------------------
+  // 3.9) ADR 0057 D2：整体缩放（控制面板滑块 → 主进程 setBounds → 渲染侧 resize）
+  //
+  // 这条链路有三段，且三段都必须成立才叫"能用"：
+  // ① 主进程：窗口宽高 = 基准 × 比例，**底边中心锚点不动**；
+  // ② 渲染进程：`resize` 之后正交视锥与 `pixelsPerUnit` 同比变化（模型脚底仍贴底边），
+  //    掩膜分辨率跟着换（命中精度不因放大而变糊）；
+  // ③ 交互：缩放之后还能像素级命中她（掩膜采样点坐标自动适应）。
+  // ------------------------------------------------------------------
+  {
+    const baseView = shell.viewScaleSnapshot();
+    const base = baseView.base;
+    const contentBefore = window.getContentBounds();
+    const anchorBefore = {
+      x: contentBefore.x + contentBefore.width / 2,
+      y: contentBefore.y + contentBefore.height,
+    };
+    const diagBefore = await readDiagnostics(window);
+    check(
+      '缩放：基准尺寸与窗口一致，初始比例 1.00x（ADR 0057 D2）',
+      base !== null &&
+        base.width > 0 &&
+        base.height > 0 &&
+        Math.abs(baseView.requested - 1) < 0.001 &&
+        Math.abs(contentBefore.width - base.width) <= 1 &&
+        Math.abs(contentBefore.height - base.height) <= 1,
+      { base, baseView, contentBefore },
+    );
+
+    /** 同一套断言跑三遍（1.4x / 0.6x / 2.0x）：窗口、渲染侧、命中三件事一起验 */
+    const scaleCases: Array<{ scale: number; file: string }> = [
+      { scale: 1.4, file: 'window-scale-140.png' },
+      { scale: 0.6, file: 'window-scale-060.png' },
+      { scale: 2.0, file: 'window-scale-200.png' },
+    ];
+    const scaleTrace: Array<Record<string, unknown>> = [];
+    for (const item of scaleCases) {
+      const applied = shell.setViewScale(item.scale, `selftest(${item.scale}x)`);
+      const expectedScale = applied.effective;
+      const expectedWidth = Math.round((base?.width ?? 0) * expectedScale);
+      const expectedHeight = Math.round((base?.height ?? 0) * expectedScale);
+      // 等渲染侧真的 resize（窗口 setBounds 之后浏览器异步发 resize）
+      const diag = await waitFor(
+        window,
+        3000,
+        (d) => Math.abs((d?.view?.scale ?? 0) - expectedScale) <= 0.02 && (d?.view?.width ?? 0) > 0,
+      );
+      const bounds = window.getContentBounds();
+      const anchorAfter = { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height };
+      const hitPoint = await findCurrentHitPoint(window);
+      const shot = await captureScreenshot(window, item.file, `scale-${item.scale}x`);
+      const maskExpected = maskSizeFor(bounds.width, bounds.height);
+      const ppuBefore = diagBefore?.view?.pixelsPerUnit ?? 0;
+      const ppuAfter = diag?.view?.pixelsPerUnit ?? 0;
+      scaleTrace.push({
+        scale: item.scale,
+        effective: expectedScale,
+        clamped: applied.clamped,
+        bounds,
+        diagView: diag?.view ?? null,
+        ppu: { before: ppuBefore, after: ppuAfter },
+        shot,
+      });
+      check(
+        `缩放 ${item.scale.toFixed(2)}x：窗口宽高 = 基准 × 生效比例（±1px，ADR 0057 D2）`,
+        Math.abs(bounds.width - expectedWidth) <= 1 && Math.abs(bounds.height - expectedHeight) <= 1,
+        { bounds, expectedWidth, expectedHeight, effective: expectedScale, clamped: applied.clamped },
+      );
+      check(
+        `缩放 ${item.scale.toFixed(2)}x：底边中心锚点不动（±1px，ADR 0057 D2.2）`,
+        Math.abs(anchorAfter.x - anchorBefore.x) <= 1 &&
+          Math.abs(anchorAfter.y - anchorBefore.y) <= 1,
+        { anchorBefore, anchorAfter },
+      );
+      check(
+        `缩放 ${item.scale.toFixed(2)}x：渲染侧 resize 到同一尺寸（视锥/像素比同比，ADR 0057 D2.4）`,
+        diag?.view !== null &&
+          diag?.view !== undefined &&
+          Math.abs((diag.view.width ?? 0) - bounds.width) <= 1 &&
+          Math.abs((diag.view.height ?? 0) - bounds.height) <= 1 &&
+          (ppuBefore <= 0 || Math.abs(ppuAfter / ppuBefore - expectedScale) <= 0.05),
+        diag?.view ?? null,
+      );
+      check(
+        `缩放 ${item.scale.toFixed(2)}x：掩膜分辨率随尺寸自适应（ADR 0057 D2.5）`,
+        diag?.view?.mask.width === maskExpected.width &&
+          diag?.view?.mask.height === maskExpected.height,
+        { mask: diag?.view?.mask ?? null, expected: maskExpected, content: bounds },
+      );
+      check(
+        `缩放 ${item.scale.toFixed(2)}x：缩放后仍然像素级命中她（掩膜坐标自动适应）`,
+        hitPoint !== null,
+        { hitPoint, bounds },
+      );
+    }
+    const wide = scaleTrace.find((row) => row['scale'] === 1.4) ?? null;
+    const small = scaleTrace.find((row) => row['scale'] === 0.6) ?? null;
+    check(
+      '缩放：1.4x 的窗口比 0.6x 大（等比放大/缩小都真的生效）',
+      wide !== null &&
+        small !== null &&
+        ((wide['bounds'] as ShellBounds).width ?? 0) > ((small['bounds'] as ShellBounds).width ?? 0),
+      { wide: wide?.['bounds'] ?? null, small: small?.['bounds'] ?? null },
+    );
+
+    // 2.0x 在 1080p 桌面上装不下：必须被工作区夹住，而不是把头切到屏幕外
+    const maxCase = scaleTrace.find((row) => row['scale'] === 2.0) ?? null;
+    const workArea = workAreaFor(window.getContentBounds());
+    const fitsAt2x = (base?.height ?? 0) * 2 <= workArea.height;
+    check(
+      '缩放 2.00x：屏幕装不下时按工作区夹住（clamped=workarea，窗口不出工作区）',
+      fitsAt2x
+        ? (maxCase?.['effective'] as number) === 2
+        : maxCase?.['clamped'] === 'workarea' &&
+            ((maxCase?.['bounds'] as ShellBounds).height ?? 0) <= workArea.height,
+      { maxCase, workArea, base },
+    );
+
+    // 还原 1.0x：窗口必须回到原位（也验证了"反复缩放不会漂移"）
+    shell.setViewScale(1, 'selftest-restore');
+    const restored = await waitFor(
+      window,
+      3000,
+      (d) => Math.abs((d?.view?.scale ?? 0) - 1) <= 0.01,
+    );
+    const contentRestored = window.getContentBounds();
+    check(
+      '缩放：还原 1.00x 后窗口回到原位（底边锚点仍然不变，ADR 0057 D2）',
+      Math.abs(contentRestored.x - contentBefore.x) <= 1 &&
+        Math.abs(contentRestored.y - contentBefore.y) <= 1 &&
+        Math.abs(contentRestored.width - contentBefore.width) <= 1 &&
+        Math.abs(contentRestored.height - contentBefore.height) <= 1,
+      { contentBefore, contentRestored },
+    );
+    check(
+      '缩放：还原后渲染侧比例也回到 1.00x',
+      Math.abs((restored?.view?.scale ?? 0) - 1) <= 0.01,
+      restored?.view ?? null,
+    );
+    logInfo('selftest', 'window-scale', { base, anchorBefore, scaleTrace });
+  }
+
+  // ------------------------------------------------------------------
+  // 3.10) ADR 0058：视口安全边距 + 拖拽摇晃不出画
+  //
+  // 真机反馈："1.0x 下拖拽左右摇晃，头发和身体边缘被窗口边缘切掉"。
+  // 根因是窗口/视锥只按静态包围盒算，没给单摆旋转留余量。验收分两段：
+  // ① 静态：内容区 = 包围盒 + 四周空白（她自己的像素尺寸一点没变，变的是窗口）；
+  // ② 动态：抓着头来回甩，逐帧测"她整块"的 CSS 包围盒——任何一帧都不许出界。
+  // ------------------------------------------------------------------
+  {
+    const restContent = window.getContentBounds();
+    const restDiag = await readDiagnostics(window);
+    const restPpu = restDiag?.view?.pixelsPerUnit ?? 0;
+    /**
+     * 静态判据：窗口 550×756，`pixelsPerUnit` 仍是 **57538**。
+     * 后者是关键——它证明"她没有被缩小"，多出来的 128×36 是真空白。
+     */
+    check(
+      '视口边距：1.0x 内容区 = 550×756，模型像素定标不变（ADR 0058 D1）',
+      restContent.width === 550 &&
+        restContent.height === 756 &&
+        Math.abs(restPpu - 57538) <= 2,
+      { content: restContent, pixelsPerUnit: restPpu },
+    );
+
+    const restCss = (await window.webContents.executeJavaScript(
+      'window.petRender.silhouetteCss()',
+      true,
+    )) as { minX: number; minY: number; maxX: number; maxY: number } | null;
+    check(
+      '视口边距：静止时四周都有透明空白（左右 ≥20px、上方 ≥20px，锚点仍在脚底）',
+      restCss !== null &&
+        restCss.minX >= 20 &&
+        restContent.width - restCss.maxX >= 20 &&
+        restCss.minY >= 20 &&
+        Math.abs(restContent.height - restCss.maxY) <= 2,
+      { restCss, content: restContent },
+    );
+
+    /**
+     * 动态判据：抓头摇晃。用**真实手势链路**（脚本光标 → shell 拖拽 → 窗口跟随），
+     * 单摆的支撑加速度是真的；采样在**页面内按帧**做（`dragDigest()` + 每 3 帧一次
+     * `silhouetteCss()`），否则每个采样点一次 ≈300ms 的 IPC 往返会把摇晃本身打散。
+     *
+     * 频率取 0.8Hz 而不是 2.5Hz：`supportAcceleration` 有 90ms 的 EMA 与 ±6000 的限幅，
+     * 高频来回只会被滤成"抖"，摆角根本起不来（实测 2.5Hz 只有 0.047rad）。
+     */
+    const shake = async (localX: number, localY: number, amplitude: number, durationMs: number) => {
+      const before = window.getContentBounds();
+      const grabScreenX = before.x + localX;
+      const grabScreenY = before.y + localY;
+      pushScriptedCursor(grabScreenX, grabScreenY);
+      await sleep(320);
+      await dispatchPointer('down', localX, localY);
+      await sleep(40);
+      await window.webContents.executeJavaScript(
+        `(() => {
+          window.__swingLog = [];
+          window.__swingStop = false;
+          const step = () => {
+            if (window.__swingStop) return;
+            const d = window.petRender.dragDigest();
+            const css = window.__swingLog.length % 3 === 0
+              ? window.petRender.silhouetteCss()
+              : null;
+            window.__swingLog.push({
+              t: Math.round(performance.now()),
+              angle: d.angle, limit: d.angleLimit, gain: d.gain, lift: d.liftPx,
+              accelX: d.supportAcceleration.x, width: d.content.width, height: d.content.height,
+              css,
+            });
+            requestAnimationFrame(step);
+          };
+          requestAnimationFrame(step);
+        })();`,
+        true,
+      );
+      // 越过 D-2 的 4px 阈值进入真实拖拽，再等悬空片段权重满 + 下沉补偿测完（ADR 0058 D5）
+      pushScriptedCursor(grabScreenX + 20, grabScreenY);
+      await sleep(420);
+      const startedAt = Date.now();
+      let midShot: NativeImage | null = null;
+      while (Date.now() - startedAt < durationMs) {
+        const t = (Date.now() - startedAt) / 1000;
+        pushScriptedCursor(grabScreenX + 20 + Math.sin(t * Math.PI * 2 * 0.8) * amplitude, grabScreenY);
+        // 摇到 60% 时抓一张"摆动幅度最大"的实拍（像素级证据用）
+        if (midShot === null && Date.now() - startedAt > durationMs * 0.6) {
+          midShot = await window.webContents.capturePage();
+        }
+        await sleep(16);
+      }
+      await window.webContents.executeJavaScript('window.__swingStop = true;', true);
+      const raw = (await window.webContents.executeJavaScript(
+        'JSON.stringify(window.__swingLog)',
+        true,
+      )) as string;
+      pushScriptedCursor(grabScreenX + 20, grabScreenY);
+      await sleep(60);
+      await dispatchPointer('up', localX + 20, localY);
+      await sleep(120);
+      return {
+        samples: JSON.parse(raw) as Array<{
+          t: number;
+          angle: number;
+          limit: number;
+          gain: number;
+          lift: number;
+          accelX: number;
+          width: number;
+          height: number;
+          css: { minX: number; minY: number; maxX: number; maxY: number } | null;
+        }>,
+        midShot,
+      };
+    };
+
+    const headPoint = restDiag?.probePoints?.head ?? null;
+    const shakeRun = headPoint ? await shake(headPoint.x, headPoint.y, 110, 2400) : null;
+    const shakeSamples = shakeRun?.samples ?? [];
+    const measured = shakeSamples.filter((row) => row.gain > 0.9);
+    const maxAngle = measured.reduce((max, row) => Math.max(max, Math.abs(row.angle)), 0);
+    const maxLimit = measured.reduce((max, row) => Math.max(max, row.limit), 0);
+    const maxLift = measured.reduce((max, row) => Math.max(max, row.lift), 0);
+    /**
+     * 顶点采样的容差（px）：`silhouetteCss()` 含**光环**，而光环是空心的圆环，
+     * 它的 AABB 四角是空白，所以包围盒会比真实像素略大。真正的判据是下面那条像素级的。
+     */
+    const TOLERANCE_PX = 12;
+    const outside = measured.filter(
+      (row) =>
+        row.css !== null &&
+        (row.css.minX < -TOLERANCE_PX ||
+          row.css.maxX > row.width + TOLERANCE_PX ||
+          row.css.minY < -TOLERANCE_PX ||
+          row.css.maxY > row.height + TOLERANCE_PX),
+    );
+    const midShotBounds = shakeRun?.midShot ? alphaBounds(shakeRun.midShot) : null;
+    const midShotSize = shakeRun?.midShot?.getSize() ?? null;
+    if (shakeRun?.midShot) {
+      const file = path.join(app.getAppPath(), 'dist', 'selftest', 'window-swing-100.png');
+      await writeFile(file, shakeRun.midShot.toPNG());
+    }
+    check(
+      '拖拽摇晃：真的甩起来了（抓头摆角 > 0.15rad，不是没摆）',
+      measured.length >= 20 && maxAngle > 0.15,
+      { samples: measured.length, total: shakeSamples.length, maxAngle: Number(maxAngle.toFixed(3)) },
+    );
+    check(
+      '拖拽摇晃：1.0x 下摆角容得下物理上限（边距足够，不需要夹）',
+      maxLimit >= 0.34,
+      { maxLimit: Number(maxLimit.toFixed(3)), physical: 0.35 },
+    );
+    check(
+      '拖拽摇晃：逐帧侧影都在视口内（顶点采样，±12px 容差覆盖光环 AABB）',
+      measured.length >= 20 && outside.length === 0,
+      {
+        samples: measured.length,
+        outside: outside.slice(0, 2),
+        worst: measured.reduce(
+          (acc, row) =>
+            row.css ? { minX: Math.min(acc.minX, row.css.minX), maxX: Math.max(acc.maxX, row.css.maxX) } : acc,
+          { minX: Number.POSITIVE_INFINITY, maxX: Number.NEGATIVE_INFINITY },
+        ),
+      },
+    );
+    check(
+      '拖拽摇晃：摆幅最大那一帧的**像素**也没贴边（实拍 alpha 包围盒四周 ≥2px）',
+      midShotBounds !== null &&
+        midShotSize !== null &&
+        midShotBounds.minX >= 2 &&
+        midShotBounds.minY >= 2 &&
+        midShotSize.width - 1 - midShotBounds.maxX >= 2 &&
+        midShotSize.height - 1 - midShotBounds.maxY >= 2,
+      { bounds: midShotBounds, size: midShotSize },
+    );
+    check(
+      '拖拽摇摆：悬空片段的下沉已补偿（脚不再被底边切，lift > 5px，ADR 0058 D5）',
+      maxLift > 5,
+      { maxLift: Number(maxLift.toFixed(1)) },
+    );
+    logInfo('selftest', 'window-swing', {
+      scale: 1,
+      samples: measured.length,
+      maxAngle: Number(maxAngle.toFixed(3)),
+      maxLift: Number(maxLift.toFixed(1)),
+      midShot: { bounds: midShotBounds, size: midShotSize },
+    });
+
+    // 还原到静止（松手后回弹）
+    await sleep(SETTLE_MS);
+  }
 
   // ------------------------------------------------------------------
   // 4) orchestrator + voice 降级链路

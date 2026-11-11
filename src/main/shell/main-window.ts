@@ -1,6 +1,11 @@
 /**
  * 主窗口的创建与装载。窗口规格逐条对齐契约 §3.2。
  * 尺寸按模型取景包围盒校正（ADR 0009 D4），其余属性不变；运行期禁止改 focusable（§3.6 P-3、ADR 0003）。
+ *
+ * ADR 0057 D2：创建入口改成**接受一个矩形**（而不是宽高），因为整体缩放要的是
+ * "底边中心锚点 + 工作区夹取"之后的结果，而那段几何只有一个实现
+ * （`shared/window-scale.ts` 的 `resolveScaledWindowBounds`）。`computeInitialBounds()`
+ * 仍然保留为"1.0x 时的基准矩形"，供它当锚点用。
  */
 import { BrowserWindow, screen } from 'electron';
 import path from 'node:path';
@@ -19,9 +24,7 @@ export function computeInitialBounds(size: WindowSize): Rect {
   return { x, y, width: size.width, height: size.height };
 }
 
-export function createMainWindow(size: WindowSize): BrowserWindow {
-  const bounds = computeInitialBounds(size);
-
+export function createMainWindow(bounds: Rect): BrowserWindow {
   const window = new BrowserWindow({
     x: bounds.x,
     y: bounds.y,

@@ -5,7 +5,19 @@
  * 关键约束：
  * - 取景排除正则必须两侧一致（渲染侧通过 loadFile 的 query 收到主进程解析后的同一个字符串）；
  * - 窗口尺寸公式只能有一份实现，禁止主进程与渲染侧各写一套。
+ *
+ * ADR 0058 D1：窗口尺寸在"包围盒 × 1.15"之外**再加一圈视口安全边距**
+ * （`MODEL_VIEW_PADDING_PX`：左右各一份、头顶一份、底边 0）。边距是**加法**：
+ * 1.0x 时她的像素尺寸与加边距之前**完全一样**（`pixelsPerUnit` 不变），
+ * 多出来的只是四周的透明空白 —— 这是"拖拽摇晃时头发不被窗口边缘切掉"的空间来源。
  */
+import {
+  BASE_CONTENT_HEIGHT_PX,
+  MODEL_VIEW_PADDING_PX,
+  MODEL_VIEW_PADDING_X_PX,
+  WINDOW_HEIGHT_PX,
+  WINDOW_WIDTH_PX,
+} from './constants';
 
 export interface Bounds3 {
   minX: number;
@@ -77,21 +89,46 @@ export function mergeBounds(bounds: readonly Bounds3[]): Bounds3 | null {
 }
 
 /**
- * 1 个模型单位对应多少 CSS px：让取景包围盒的高度占内容区高度的 `1 / padding`。
+ * 视口安全边距在**内容区高度**里占的份额（0..1）。
+ *
+ * 边距是"px 加法"，但缩放是等比乘窗口，所以运行期不能直接减 `MODEL_VIEW_PADDING_PX`：
+ * 2.0x 时窗口 1512px 高，减 36px 会让她的像素尺寸偏离 2.0x 一点点。
+ * 改成**固定份额** `P / (设计高 + P)`：任何倍率下边距都与窗口同比，
+ * `pixelsPerUnit` 因此严格与内容区高度成正比（缩放比例才是真的等比）。
+ */
+export function viewPaddingShare(designHeightPx: number = WINDOW_HEIGHT_PX): number {
+  const design = designHeightPx > 0 ? designHeightPx : WINDOW_HEIGHT_PX;
+  return MODEL_VIEW_PADDING_PX / (design + MODEL_VIEW_PADDING_PX);
+}
+
+/**
+ * 1 个模型单位对应多少 CSS px。
+ *
+ * 没有视口边距时（`viewPaddingShare = 0`）等价于旧口径：
+ * 取景包围盒的高度占内容区高度的 `1 / padding`。
+ * 有边距时先把内容区按份额折回"纯取景高度"，模型的像素尺寸就只跟内容区高度成比例。
  * 输入非法时返回 0（调用方据此走"不缩放"或失败分支）。
  */
 export function pixelsPerUnitFor(
   frameHeightUnits: number,
   contentHeightPx: number,
   padding: number = MODEL_FRAME_PADDING,
+  viewPaddingShareRatio = 0,
 ): number {
   if (!(frameHeightUnits > 0) || !(contentHeightPx > 0) || !(padding > 0)) return 0;
-  return contentHeightPx / (frameHeightUnits * padding);
+  const share =
+    Number.isFinite(viewPaddingShareRatio) && viewPaddingShareRatio > 0
+      ? Math.min(0.5, viewPaddingShareRatio)
+      : 0;
+  return (contentHeightPx * (1 - share)) / (frameHeightUnits * padding);
 }
 
 /**
- * D-4：高度沿用设计基准（默认 720），宽度按取景包围盒的宽高比推导，
- * 再夹到 [MIN, MAX]。等价于"默认 480×720，按模型包围盒 × 1.15 校正"。
+ * D-4：高度 = 设计基准（默认 720）+ 头顶安全边距；宽度按取景包围盒的宽高比推导
+ * 再加左右各一份边距，最后夹到 [MIN, MAX]。
+ *
+ * 1.0x 的窗口因此从 422×720 变成 494×756：她的像素尺寸不变（`pixelsPerUnit` 仍是
+ * 57538），左右各多 36px、头顶多 36px 的透明空白（ADR 0058 D1）。
  */
 export function computeWindowSize(
   bounds: Bounds3,
@@ -100,26 +137,41 @@ export function computeWindowSize(
 ): WindowSize {
   const widthUnits = frameWidth(bounds);
   const heightUnits = frameHeight(bounds);
-  const pixelsPerUnit = pixelsPerUnitFor(heightUnits, designHeightPx, padding);
+  const share = viewPaddingShare(designHeightPx);
+  const pixelsPerUnit = pixelsPerUnitFor(heightUnits, designHeightPx + MODEL_VIEW_PADDING_PX, padding, share);
 
   if (!(pixelsPerUnit > 0) || !(widthUnits > 0)) {
     return {
       width: MIN_MODEL_WINDOW_WIDTH_PX,
-      height: designHeightPx,
+      height: designHeightPx + MODEL_VIEW_PADDING_PX,
       pixelsPerUnit: 0,
       clampedWidth: false,
     };
   }
 
-  const rawWidth = Math.round(widthUnits * pixelsPerUnit * padding);
+  const rawWidth =
+    Math.round(widthUnits * pixelsPerUnit * padding) + 2 * MODEL_VIEW_PADDING_X_PX;
   const width = Math.min(
     MAX_MODEL_WINDOW_WIDTH_PX,
     Math.max(MIN_MODEL_WINDOW_WIDTH_PX, rawWidth),
   );
   return {
     width,
-    height: designHeightPx,
+    height: designHeightPx + MODEL_VIEW_PADDING_PX,
     pixelsPerUnit,
     clampedWidth: width !== rawWidth,
+  };
+}
+
+/** 1.0x 的基准内容区尺寸（模型缺失/解析失败时的兜底，ADR 0009 D6）。 */
+export function fallbackWindowSize(): WindowSize {
+  return {
+    width: Math.min(
+      MAX_MODEL_WINDOW_WIDTH_PX,
+      WINDOW_WIDTH_PX + 2 * MODEL_VIEW_PADDING_X_PX,
+    ),
+    height: BASE_CONTENT_HEIGHT_PX,
+    pixelsPerUnit: 0,
+    clampedWidth: false,
   };
 }

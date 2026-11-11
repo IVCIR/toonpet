@@ -236,6 +236,31 @@ export function createModelAnimations(
    */
   const activatedRoles = new Set<ClipRole>();
 
+  /**
+   * 把**除 `keep` 之外**所有仍有权的 action 淡出（ADR 0057 D1.3）。
+   *
+   * 为什么必须是一个共用函数：`crossFadeFrom(previous)` 只处理"上一个 action"。
+   * 真机上经常有**第三个** action 正处在交叉淡入的半途（待机站姿轮换 0.8s、
+   * 摸头 0.45s、坐姿 0.45s 都足够长），旧实现只有 `fadeTo()` 会顺手清掉它，
+   * 而 `playHold()` / `playOnce()` 走的是自己的 `crossFadeFrom`，**不清理** ——
+   * 于是那个半途 action 的权重永久停在 0.5 左右：坐姿叠着站姿、悬空叠着待机，
+   * 起身之后还在，读起来就是"姿势抽搐"。
+   */
+  function fadeOutOthers(
+    keep: readonly (THREE.AnimationAction | null)[],
+    fadeSeconds: number,
+  ): void {
+    const seconds = Math.max(0, fadeSeconds);
+    for (const other of actionRegistry) {
+      if (keep.includes(other)) continue;
+      if (!other.enabled) continue;
+      const weight = other.getEffectiveWeight();
+      if (Number.isFinite(weight) && weight > 0.001) {
+        other.fadeOut(seconds);
+      }
+    }
+  }
+
   function fadeTo(action: THREE.AnimationAction, fadeSeconds: number): void {
     const previous = currentAction;
     if (previous === action) {
@@ -251,14 +276,7 @@ export function createModelAnimations(
       action.crossFadeFrom(previous, Math.max(0, fadeSeconds), false);
     }
     // 除目标与上一个 action 外，任何仍有权的动作都要淡出（见 `actionRegistry` 的说明）
-    for (const other of actionRegistry) {
-      if (other === action || other === previous) continue;
-      if (!other.enabled) continue;
-      const weight = other.getEffectiveWeight();
-      if (Number.isFinite(weight) && weight > 0.001) {
-        other.fadeOut(Math.max(0, fadeSeconds));
-      }
-    }
+    fadeOutOthers([action, previous], fadeSeconds);
     currentAction = action;
   }
 
@@ -310,6 +328,8 @@ export function createModelAnimations(
       back.play();
       // crossFadeFrom 会把 back 的权重从 0 拉到 1（fadeIn 内部从 0 开始）
       back.crossFadeFrom(finished as THREE.AnimationAction, Math.max(0, fadeOut), false);
+      // 回到"演出前那个动作"时同样要把其它残权清掉（ADR 0057 D1.3）
+      fadeOutOthers([back, finished], fadeOut);
       currentAction = back;
       // 槽位也要还原：否则诊断里会显示"有一个动作在播、但没有槽位"
       currentSlot = slot;
@@ -362,6 +382,7 @@ export function createModelAnimations(
       activatedRoles.add(role);
       if (next === currentAction && holdAction === next) return true;
       clearOneShot(fadeSeconds);
+      const previous = currentAction;
       next.setLoop(THREE.LoopOnce, 1);
       next.clampWhenFinished = true;
       next.reset();
@@ -369,9 +390,11 @@ export function createModelAnimations(
       next.setEffectiveTimeScale(1);
       next.setEffectiveWeight(1);
       next.play();
-      if (currentAction && currentAction !== next) {
-        next.crossFadeFrom(currentAction, Math.max(0, fadeSeconds), false);
+      if (previous && previous !== next) {
+        next.crossFadeFrom(previous, Math.max(0, fadeSeconds), false);
       }
+      // ADR 0057 D1.3：停住的姿态是"独占身体"的，任何半途的第三个 action 都必须淡出
+      fadeOutOthers([next, previous], fadeSeconds);
       currentAction = next;
       currentSlot = null;
       holdAction = next;
@@ -442,9 +465,12 @@ export function createModelAnimations(
       next.setEffectiveTimeScale(1);
       next.setEffectiveWeight(1);
       next.play();
-      if (currentAction && currentAction !== next) {
-        next.crossFadeFrom(currentAction, Math.max(0, fadeIn), false);
+      const previous = currentAction;
+      if (previous && previous !== next) {
+        next.crossFadeFrom(previous, Math.max(0, fadeIn), false);
       }
+      // ADR 0057 D1.3：一次性演出同样独占身体，半途的第三个 action 一并淡出
+      fadeOutOthers([next, previous], fadeIn);
       currentAction = next;
       currentSlot = null;
       return true;

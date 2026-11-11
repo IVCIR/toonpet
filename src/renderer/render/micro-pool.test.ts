@@ -327,6 +327,36 @@ test('池：空条目池直接抛错（装配错误必须在启动期暴露）',
   assert.throws(() => createMicroPool({ entries: [] }), /至少需要一个条目/);
 });
 
+/**
+ * ADR 0057 D1：`flush()` —— 退出坐姿的收尾要求"微动作池权重在这一帧就是 0"。
+ *
+ * 与 `reset()` 的区别：不清诊断计数（`switches` / `releases`），因为那不是
+ * "重新开始一段时间"，而是"现在就别动了"。
+ */
+test('池：flush 立刻把所有权重清零、回默认条目，但保留诊断计数', () => {
+  const p = pool(0, 300, 300);
+  // 先跑出一段"有切换、权重到 1"的历史
+  for (let t = 0; t <= 1200; t += 16) p.update(t, 0.016, true);
+  const before = p.snapshot()!;
+  assert.ok(before.switches >= 1);
+  assert.ok(Object.values(before.weights).some((weight) => weight > 0.2));
+
+  p.flush(1400);
+  const after = p.snapshot()!;
+  assert.ok(
+    Object.values(after.weights).every((weight) => weight === 0),
+    `flush 之后必须精确为 0：${JSON.stringify(after.weights)}`,
+  );
+  assert.equal(after.active, 'legs', '回到默认条目');
+  assert.equal(after.switches, before.switches, '计数不属于"归零"范围');
+  assert.equal(after.nextSwitchInMs, -1, '下一次抽签要等重新激活时再排期');
+
+  // 重新激活：从现在开始重新计时，不会"一回来就抽签"
+  const resumed = p.update(1500, 0.016, true);
+  assert.equal(resumed.nextSwitchInMs, 300);
+  assert.ok(Object.values(resumed.weights).every((weight) => weight < 0.1));
+});
+
 test('池：过渡速率常量的口径（1-exp(-rate·dt)）被单测锁死', () => {
   // 这条断言的目的不是"数字好看"，而是防止有人把 rate 改成"每帧固定 0.1"这类帧率相关写法：
   // rate=3.0 时 160ms 的过渡量应 ≈ 1-e^{-0.48} ≈ 0.381。

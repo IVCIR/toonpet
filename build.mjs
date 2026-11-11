@@ -93,6 +93,14 @@ const bundles = [
     target: 'node20',
   },
   {
+    // ADR 0057 D2：整体缩放的窗口几何（等比 / 底边中心锚点 / 工作区夹取）
+    entry: 'src/shared/window-scale.test.ts',
+    outfile: 'dist/tests/window-scale.test.mjs',
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+  },
+  {
     entry: 'src/shared/motion.test.ts',
     outfile: 'dist/tests/motion.test.mjs',
     platform: 'node',

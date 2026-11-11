@@ -5,6 +5,8 @@ import { logError, logInfo, logWarn } from './log';
 import { getRuntime, ensureRuntime, logRuntimeFailure } from './runtime';
 import { shell } from './shell/index';
 import { runPanelShotIfRequested } from './panel-shot';
+import { runScaleShotIfRequested } from './scale-shot';
+import { runSwingShotIfRequested } from './swing-shot';
 import { runSelfTestIfRequested } from './selftest';
 
 export function bootstrap(): void {
@@ -79,6 +81,10 @@ export function bootstrap(): void {
       await runSelfTestIfRequested();
       // ADR 0052 D7：控制面板取证（PET_PANEL_SHOT=1）；正常启动时立即返回
       await runPanelShotIfRequested();
+      // ADR 0057 D2：整体缩放的逐档截图（PET_SCALE_SHOT=1），拼成 GIF 当"录屏"看
+      await runScaleShotIfRequested();
+      // ADR 0058 D4：拖拽摇晃的逐帧取证（PET_SWING_SHOT=1），验证"边缘不再被切"
+      await runSwingShotIfRequested();
     })
     .catch((error: unknown) => {
       logError('main', '启动失败', error);

@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { MASK_HEIGHT, MASK_WIDTH } from './constants';
+import {
+  BASE_CONTENT_HEIGHT_PX,
+  MASK_HEIGHT,
+  MASK_SCALE_MAX,
+  MASK_SCALE_MIN,
+  MASK_WIDTH,
+  WINDOW_HEIGHT_PX,
+} from './constants';
 import {
   alphaAt,
   alphaBoundingBox,
@@ -10,6 +17,7 @@ import {
   hitTest,
   isInHeadRegion,
   isInsideContent,
+  maskSizeFor,
   rgbaToAlpha,
 } from './mask';
 
@@ -176,4 +184,56 @@ test('hitTest 在内容区尺寸退化为 0 时不抛异常', () => {
   const sample = hitTest(emptyMask(), MASK_WIDTH, MASK_HEIGHT, 0, 0, 0, 0);
   assert.equal(sample.inside, false);
   assert.equal(sample.hit, false);
+});
+
+// ---------------------------------------------------------------------------
+// ADR 0057 D2.5：掩膜分辨率随整体缩放自适应
+// ---------------------------------------------------------------------------
+
+test('maskSizeFor：1.0x（带边距的 756 高）就是契约基准 128×72；比例夹在 [0.5x, 2x]', () => {
+  // ADR 0058 D1：1.0x 的内容区高度是 720 + 36 = 756，掩膜基准跟着它走
+  assert.deepEqual(maskSizeFor(494, BASE_CONTENT_HEIGHT_PX), { width: 128, height: 72 });
+  // 2x 窗口 → 2 倍分辨率（每个单元覆盖的 CSS 面积不变）
+  assert.deepEqual(maskSizeFor(988, BASE_CONTENT_HEIGHT_PX * 2), { width: 256, height: 144 });
+  // 0.5x → 半分辨率
+  assert.deepEqual(maskSizeFor(247, BASE_CONTENT_HEIGHT_PX * 0.5), { width: 64, height: 36 });
+  // 超出上限/下限都夹住（不无限放大 readPixels 的负担）
+  const huge = maskSizeFor(3840, BASE_CONTENT_HEIGHT_PX * 4);
+  assert.equal(huge.width, MASK_WIDTH * MASK_SCALE_MAX);
+  assert.equal(huge.height, MASK_HEIGHT * MASK_SCALE_MAX);
+  const tiny = maskSizeFor(120, BASE_CONTENT_HEIGHT_PX * 0.2);
+  assert.ok(tiny.width >= 8 && tiny.height >= 8, '最小 8×8，不能退化成 0');
+  assert.ok(MASK_SCALE_MIN < MASK_SCALE_MAX);
+  // 非法输入退回基准（不抛）
+  assert.deepEqual(maskSizeFor(0, 0), { width: 128, height: 72 });
+  assert.deepEqual(maskSizeFor(Number.NaN, Number.NaN), { width: 128, height: 72 });
+  // 边距只改变窗口尺寸，不改变"每单元覆盖多少 CSS 面积"：1.0x 仍是 128×72
+  assert.deepEqual(maskSizeFor(494, WINDOW_HEIGHT_PX + 36), { width: 128, height: 72 });
+});
+
+test('cssToMask：显式尺寸生效，且几何中心仍然映射到掩膜几何中心', () => {
+  const half = cssToMask(480 / 2, 720 / 2, 480, 720, 256, 144);
+  assertClose(half.mx, 127.5);
+  assertClose(half.my, 71.5);
+  // 缺省仍是契约的 128×72
+  assert.deepEqual(cssToMask(240, 360, 480, 720), { mx: 63.5, my: 35.5 });
+});
+
+test('hitTest：掩膜分辨率换了之后，命中点按新网格映射（同一 CSS 点仍命中同一块身体）', () => {
+  // 2x 掩膜（256×144）里把右半区涂满：CSS 右半区应该命中、左半区不命中
+  const width = 256;
+  const height = 144;
+  const mask = new Uint8Array(width * height);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = width / 2; x < width; x += 1) mask[y * width + x] = 255;
+  }
+  assert.equal(hitTest(mask, width, height, 800, 700, 960, 1440).hit, true);
+  assert.equal(hitTest(mask, width, height, 100, 700, 960, 1440).hit, false);
+  // 同一个 CSS 点在 1x 掩膜上的等价映射也对得上（按 CSS 比例，而不是按像素）
+  const oneX = new Uint8Array(MASK_WIDTH * MASK_HEIGHT);
+  for (let y = 0; y < MASK_HEIGHT; y += 1) {
+    for (let x = MASK_WIDTH / 2; x < MASK_WIDTH; x += 1) oneX[y * MASK_WIDTH + x] = 255;
+  }
+  assert.equal(hitTest(oneX, MASK_WIDTH, MASK_HEIGHT, 800, 700, 960, 1440).hit, true);
+  assert.equal(hitTest(oneX, MASK_WIDTH, MASK_HEIGHT, 100, 700, 960, 1440).hit, false);
 });

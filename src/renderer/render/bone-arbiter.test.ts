@@ -173,3 +173,50 @@ test('基底覆写：未登记骨骼会被登记；override 传 null 不报错',
   assert.equal(arbiter.size, 1);
   assert.equal(arbiter.snapshot()[0]?.overridden, false);
 });
+
+/**
+ * 位置覆写（ADR 0057 D3：坐姿停帧后把眼皮放回"睁眼"基线）。
+ *
+ * 与旋转基底覆写同一套语义：**绝对**值、每帧写、传 `null` 就放手。
+ * 这条通道存在的唯一理由是"停帧后 mixer 不再写这根骨，而它被冻在了一个半闭的姿态上"。
+ */
+test('位置覆写：绝对值每帧写回，取消覆写后立即放手（不再写）', () => {
+  const arbiter = createBoneArbiter();
+  const bone = fakeBone('Bip001 bone_eye_D_L');
+  const clipPos = new THREE.Vector3(0.00028, 0.1, 0.2);
+  const openPos = new THREE.Vector3(0, 0.1, 0.2);
+  bone.position.copy(clipPos);
+  arbiter.register(bone);
+
+  // 覆写为"睁眼"基线：即使没有旋转偏移，endFrame 也必须写位置
+  arbiter.overridePosition(bone, openPos);
+  for (let frame = 0; frame < 10; frame += 1) {
+    arbiter.capture();
+    arbiter.beginFrame();
+    arbiter.endFrame();
+  }
+  assert.ok(bone.position.distanceTo(openPos) < 1e-9, '位置必须回到睁眼基线');
+  assert.equal(arbiter.positionOverridden(bone), true);
+  assert.equal(arbiter.snapshot()[0]?.positionOverridden, true);
+
+  // 逐帧写回：有人在两帧之间改了它（等价于 mixer 又写了一帧片段值），下一帧仍然被覆写
+  bone.position.copy(clipPos);
+  arbiter.capture();
+  arbiter.beginFrame();
+  arbiter.endFrame();
+  assert.ok(bone.position.distanceTo(openPos) < 1e-9, '覆写是每帧生效的，不是一次性');
+
+  // 取消覆写：之后仲裁器不再碰位置（值停在最后一次写入，由 mixer 自己接管）
+  arbiter.overridePosition(bone, null);
+  bone.position.copy(clipPos);
+  arbiter.capture();
+  arbiter.beginFrame();
+  arbiter.endFrame();
+  assert.ok(bone.position.distanceTo(clipPos) < 1e-9, '取消覆写后不得再写位置');
+  assert.equal(arbiter.positionOverridden(bone), false);
+
+  // reset 也会清掉位置覆写
+  arbiter.overridePosition(bone, openPos);
+  arbiter.reset();
+  assert.equal(arbiter.positionOverridden(bone), false);
+});

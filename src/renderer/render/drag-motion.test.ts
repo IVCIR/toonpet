@@ -1,13 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { DRAG_SWING_MIN_ANGLE_RAD } from '../../shared/constants';
 import {
   createDragPendulum,
+  maxSwingAngle,
   pendulumConfigFor,
   pivotCompensation,
   stepDragPendulum,
   struggleOffset,
+  swingFits,
 } from './drag-motion';
-import type { DragPendulumState } from './drag-motion';
+import type { DragPendulumState, SwingPoint } from './drag-motion';
 
 const NO_FORCE = { accelerationX: 0, accelerationY: 0 };
 
@@ -131,4 +134,80 @@ test('三态物理参数：抓头/身/脚各不相同，且都不含"按部位�
       assert.ok(Number.isFinite(value) && value >= 0);
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+// ADR 0058 D3：摆角的视口约束
+// ---------------------------------------------------------------------------
+
+/**
+ * 实测侧影（CH0335，1.0x：脚底为原点、px）：[x 半宽, y 高度]。
+ * 最宽在髋部（y≈234 处 ±183），脚只有 ±67 —— 这正是"包围盒四角"不真实的原因。
+ */
+const PROFILE: SwingPoint[] = [
+  { x: 0, y: 0 },
+  { x: 67, y: 33 },
+  { x: -67, y: 33 },
+  { x: 139, y: 100 },
+  { x: -139, y: 100 },
+  { x: 183, y: 234 },
+  { x: -183, y: 234 },
+  { x: 171, y: 268 },
+  { x: -171, y: 268 },
+  { x: 95, y: 402 },
+  { x: -95, y: 402 },
+  { x: 64, y: 535 },
+  { x: -64, y: 535 },
+];
+/** 1.0x 的视口：494 宽（左右各 36px 边距）/ 756 高 */
+const VIEW = { halfWidthPx: 247, heightPx: 756 };
+
+test('摆角约束：θ=0 一定可行；抓头大幅甩动会被夹到可行角以内', () => {
+  const pivot = { x: 0, y: 500 };
+  assert.equal(swingFits(PROFILE, pivot, 0, VIEW), true);
+  // 20°（物理上限 0.35rad）时髋部会顶出内容区
+  assert.equal(swingFits(PROFILE, pivot, 0.35, VIEW), false);
+  const limit = maxSwingAngle({ points: PROFILE, pivot, viewport: VIEW, limitRad: 0.35 });
+  assert.ok(limit > 0.2 && limit < 0.35, `limit=${limit}`);
+  // 夹出来的角度真的可行，再往外 0.02rad 就不可行
+  assert.equal(swingFits(PROFILE, pivot, limit, VIEW), true);
+  assert.equal(swingFits(PROFILE, pivot, limit + 0.02, VIEW), false);
+});
+
+test('摆角约束：物理上限内本来就装得下时原样返回（不偷偷改手感）', () => {
+  const pivot = { x: 0, y: 300 };
+  const limit = maxSwingAngle({ points: PROFILE, pivot, viewport: VIEW, limitRad: 0.32 });
+  assert.equal(limit, 0.32);
+  // 抓脚：支点很低，重心绕脚摆，头部也出不了画
+  const foot = maxSwingAngle({ points: PROFILE, pivot: { x: 0, y: 40 }, viewport: VIEW, limitRad: 0.25 });
+  assert.equal(foot, 0.25);
+});
+
+test('摆角约束：数据异常时退回兜底下限，绝不返回 0（否则拖拽变成硬平移）', () => {
+  const noProfile = maxSwingAngle({ points: [], pivot: { x: 0, y: 300 }, viewport: VIEW, limitRad: 0.3 });
+  assert.ok(noProfile > 0);
+  assert.equal(noProfile, DRAG_SWING_MIN_ANGLE_RAD);
+  const narrow = maxSwingAngle({
+    points: PROFILE,
+    pivot: { x: 0, y: 500 },
+    viewport: { halfWidthPx: 60, heightPx: 756 },
+    limitRad: 0.35,
+  });
+  assert.ok(narrow >= DRAG_SWING_MIN_ANGLE_RAD && narrow <= 0.35);
+  // 上限 0 / 非法输入不产生 NaN
+  assert.equal(maxSwingAngle({ points: PROFILE, pivot: { x: 0, y: 1 }, viewport: VIEW, limitRad: 0 }), 0);
+  const bad = maxSwingAngle({
+    points: [{ x: Number.NaN, y: Number.NaN }],
+    pivot: { x: Number.NaN, y: Number.NaN },
+    viewport: { halfWidthPx: Number.NaN, heightPx: Number.NaN },
+    limitRad: 0.3,
+  });
+  assert.ok(Number.isFinite(bad));
+});
+
+test('摆角约束：边距越大能摆的角度越大（ADR 0058 D1 与 D3 的因果）', () => {
+  const pivot = { x: 0, y: 500 };
+  const tight = maxSwingAngle({ points: PROFILE, pivot, viewport: { halfWidthPx: 211, heightPx: 720 }, limitRad: 0.35 });
+  const padded = maxSwingAngle({ points: PROFILE, pivot, viewport: VIEW, limitRad: 0.35 });
+  assert.ok(padded > tight, `padded=${padded} tight=${tight}`);
 });

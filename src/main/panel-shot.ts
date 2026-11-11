@@ -35,6 +35,8 @@ const TARGETS: Partial<TunableValues> = {
   'sit.phaseAHeadTuneRad': -0.12,
   'sit.spineOverlayWeight': 0.85,
   'gaze.eyeStiffness': 16,
+  // ADR 0057 D2：整体缩放也走同一条"面板 → cmd:panel(preview) → 主进程"的路径
+  'view.scale': 1.35,
 };
 
 function sleep(ms: number): Promise<void> {
@@ -203,6 +205,21 @@ interface Evidence {
   screenshots: string[];
   checks: Array<{ name: string; ok: boolean; detail: string }>;
   ok: boolean;
+  /** ADR 0057 D2：整体缩放的取证读数（请求比例 / 实际比例 / 窗口矩形 / 锚点） */
+  viewScale?: {
+    requested: number;
+    effective: number;
+    clamped: string;
+    base: { width: number; height: number } | null;
+    boundsBefore: { x: number; y: number; width: number; height: number } | null;
+    boundsAfter: { x: number; y: number; width: number; height: number } | null;
+    anchorBefore: { x: number; y: number } | null;
+    anchorAfter: { x: number; y: number } | null;
+    rendererView: { width: number; height: number; scale: number } | null;
+    maskSize: { width: number; height: number } | null;
+    panelScaleText: string | null;
+    statusScaleText: string | null;
+  };
   error?: string;
 }
 
@@ -375,12 +392,18 @@ export async function runPanelShotIfRequested(): Promise<void> {
     });
 
     // 3) 走页面自己的路径拨三项（与用户拖滑块同一条 DOM → preview → IPC 链）
+    const boundsBefore = shell.getBounds();
+    const anchorBefore = {
+      x: boundsBefore.x + boundsBefore.width / 2,
+      y: boundsBefore.y + boundsBefore.height,
+    };
     await panel.webContents.executeJavaScript(
       `(async () => {
         const debug = window.__panelDebug;
         debug.set('sit.phaseAHeadTuneRad', ${TARGETS['sit.phaseAHeadTuneRad']});
         debug.set('sit.spineOverlayWeight', ${TARGETS['sit.spineOverlayWeight']});
         debug.set('gaze.eyeStiffness', ${TARGETS['gaze.eyeStiffness']});
+        debug.set('view.scale', ${TARGETS['view.scale']});
         await debug.preview();
         return true;
       })()`,
@@ -439,6 +462,79 @@ export async function runPanelShotIfRequested(): Promise<void> {
       `detail=${String(dom.tuningDetail)}`,
     );
 
+    /**
+     * ADR 0057 D2：滑块 → 主进程窗口几何 → 渲染侧尺寸，三段都要成立。
+     *
+     * 这一段是"缩放"唯一能证明**真的改了窗口**的地方：单测只能证明纯函数算得对，
+     * 而"面板拖一下 → setBounds → 浏览器 resize → 渲染侧视锥/掩膜跟着变"只有
+     * 把 Electron 跑起来才看得到。
+     */
+    {
+      const boundsAfter = shell.getBounds();
+      const anchorAfter = {
+        x: boundsAfter.x + boundsAfter.width / 2,
+        y: boundsAfter.y + boundsAfter.height,
+      };
+      const viewScale = shell.viewScaleSnapshot();
+      const panelScale = (await panel.webContents.executeJavaScript(
+        `(() => ({
+          slider: document.querySelector('.param[data-id="view.scale"] .num')?.value ?? null,
+          status: document.querySelector('#stat-scale')?.textContent ?? null,
+          statusDetail: document.querySelector('#stat-scale-detail')?.textContent ?? null
+        }))()`,
+      )) as { slider: string | null; status: string | null; statusDetail: string | null };
+      evidence.viewScale = {
+        requested: viewScale.requested,
+        effective: viewScale.effective,
+        clamped: viewScale.clamped,
+        base: viewScale.base,
+        boundsBefore,
+        boundsAfter,
+        anchorBefore,
+        anchorAfter,
+        rendererView: after?.render?.view ?? null,
+        maskSize: null,
+        panelScaleText: panelScale.slider,
+        statusScaleText: panelScale.status,
+      };
+      const expectedWidth = Math.round((viewScale.base?.width ?? 0) * viewScale.effective);
+      const expectedHeight = Math.round((viewScale.base?.height ?? 0) * viewScale.effective);
+      /**
+       * 期望比例：请求值 1.35，但**屏幕装不下时会被夹**（1080p 桌面上 1.35×720=972 > 952）。
+       * 两种结果都算通过，前提是"窗口 = 基准 × 生效比例"且夹取被如实标成 `workarea`。
+       */
+      const expectedScale =
+        viewScale.clamped === 'workarea' ? viewScale.effective : (TARGETS['view.scale'] as number);
+      check(
+        '缩放：窗口宽高 = 基准 × 生效比例（面板 1.35x，超出屏幕时按工作区夹）',
+        Math.abs(viewScale.effective - expectedScale) <= 1e-6 &&
+          Math.abs(boundsAfter.width - expectedWidth) <= 1 &&
+          Math.abs(boundsAfter.height - expectedHeight) <= 1,
+        `effective=${viewScale.effective} clamped=${viewScale.clamped} bounds=${JSON.stringify(boundsAfter)} expect=${expectedWidth}x${expectedHeight}`,
+      );
+      check(
+        '缩放：底边中心锚点不动（±1px）',
+        Math.abs(anchorAfter.x - anchorBefore.x) <= 1 &&
+          Math.abs(anchorAfter.y - anchorBefore.y) <= 1,
+        `before=${JSON.stringify(anchorBefore)} after=${JSON.stringify(anchorAfter)}`,
+      );
+      check(
+        '缩放：渲染侧内容区跟着改成同一尺寸（正交视锥同比）',
+        after?.render?.view !== null &&
+          after?.render?.view !== undefined &&
+          Math.abs(after.render.view.width - boundsAfter.width) <= 1 &&
+          Math.abs(after.render.view.height - boundsAfter.height) <= 1,
+        `renderer=${JSON.stringify(after?.render?.view ?? null)} window=${JSON.stringify(boundsAfter)}`,
+      );
+      check(
+        '缩放：面板滑块与状态页读数（1.35 → 1.35x）',
+        panelScale.slider === '1.35' &&
+          (panelScale.status?.includes('1.35x') ?? false) &&
+          (panelScale.statusDetail?.includes('×') ?? false),
+        `slider=${String(panelScale.slider)} status=${String(panelScale.status)} detail=${String(panelScale.statusDetail)}`,
+      );
+    }
+
     // 4) 截图：物理手感（滑块已改，未保存）
     evidence.screenshots.push(await capture(panel, appRoot, 'panel-physics.png'));
 
@@ -452,11 +548,16 @@ export async function runPanelShotIfRequested(): Promise<void> {
         tuning,
         updatedAt: typeof parsed['updatedAt'] === 'string' ? parsed['updatedAt'] : null,
       };
-      check('config.json 写入三项改动', Object.keys(tuning).length === 3, `keys=${Object.keys(tuning).join(',')}`);
+      check('config.json 写入四项改动', Object.keys(tuning).length === 4, `keys=${Object.keys(tuning).join(',')}`);
       check(
         'config.json 里 A 段抬头 = -0.12',
         tuning['sit.phaseAHeadTuneRad'] === TARGETS['sit.phaseAHeadTuneRad'],
         `file=${String(tuning['sit.phaseAHeadTuneRad'])}`,
+      );
+      check(
+        'config.json 里缩放 = 1.35（持久化，重启后首帧生效）',
+        tuning['view.scale'] === TARGETS['view.scale'],
+        `file=${String(tuning['view.scale'])}`,
       );
     } else {
       check('config.json 写入', false, `文件不存在：${configPath}`);

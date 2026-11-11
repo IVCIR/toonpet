@@ -43,6 +43,8 @@ export interface BoneArbitrationState {
   applied: [number, number, number, number];
   /** 本帧是否用了基底覆写（ADR 0046 D1：眼球） */
   overridden: boolean;
+  /** 本帧是否用了位置覆写（ADR 0057 D3：坐姿眼皮回到睁眼基线） */
+  positionOverridden: boolean;
 }
 
 /** 叠加偏移的接收端（视线、反应通道只依赖这个窄接口）。 */
@@ -79,6 +81,16 @@ export interface BoneArbiter extends BoneOffsetSink {
    * 不改变 `beginFrame()` 的"mixer 有没有重写"判定。
    */
   overrideBase(bone: THREE.Bone, quaternion: THREE.Quaternion | null): void;
+  /**
+   * 覆写某根骨骼的**本地位置**（ADR 0057 D3：坐姿停帧后把眼皮放回"睁眼"基线）。
+   *
+   * 与 `overrideBase` 同一套语义：传 `null` = 取消覆写，下一帧起由 mixer 自己写。
+   * **不是**一条动画通道：没有累加、没有偏移量，只有一个固定值；
+   * 存在的唯一理由是"停帧后 mixer 不再写这根骨，而它被冻在了一个不该保留的姿态上"。
+   */
+  overridePosition(bone: THREE.Bone, position: THREE.Vector3 | null): void;
+  /** 某根骨骼此刻是否被位置覆写（诊断用） */
+  positionOverridden(bone: THREE.Bone): boolean;
   /** 释放：把骨骼恢复到最近一次动画基底。 */
   reset(): void;
   snapshot(): BoneArbitrationState[];
@@ -105,6 +117,8 @@ interface Entry {
   roll: number;
   /** 基底覆写（ADR 0046 D1：坐姿眼球回到绑定姿态）；null = 用动画基底 */
   overrideBase: THREE.Quaternion | null;
+  /** 位置覆写（ADR 0057 D3：坐姿眼皮回到睁眼基线）；null = 由 mixer 决定 */
+  overridePos: THREE.Vector3 | null;
 }
 
 const WORLD_X = new THREE.Vector3(1, 0, 0);
@@ -150,6 +164,7 @@ export function createBoneArbiter(): BoneArbiter {
         pitch: 0,
         roll: 0,
         overrideBase: null,
+        overridePos: null,
       };
       byBone.set(bone, entry);
       entries.push(entry);
@@ -223,6 +238,13 @@ export function createBoneArbiter(): BoneArbiter {
         const hasRotation = entry.yaw !== 0 || entry.pitch !== 0 || entry.roll !== 0;
         // 覆写基底即使零偏移也要写：否则"眼球回到绑定姿态"要等到第一个非零张望才生效
         const hasOverride = entry.overrideBase !== null;
+        const hasPosition = entry.overridePos !== null;
+        if (!hasRotation && !hasOverride && !hasPosition) continue;
+
+        if (hasPosition) {
+          // ADR 0057 D3：位置覆写是**绝对值**（不是偏移），每帧写一次，直到被清成 null
+          entry.bone.position.copy(entry.overridePos as THREE.Vector3);
+        }
         if (!hasRotation && !hasOverride) continue;
 
         const parent = entry.bone.parent;
@@ -264,6 +286,15 @@ export function createBoneArbiter(): BoneArbiter {
       entry.overrideBase = quaternion ? quaternion.clone() : null;
     },
 
+    overridePosition(bone: THREE.Bone, position: THREE.Vector3 | null): void {
+      const entry = entryFor(bone);
+      entry.overridePos = position ? position.clone() : null;
+    },
+
+    positionOverridden(bone: THREE.Bone): boolean {
+      return byBone.get(bone)?.overridePos != null;
+    },
+
     reset(): void {
       for (const entry of entries) {
         entry.bone.quaternion.copy(entry.base);
@@ -273,6 +304,7 @@ export function createBoneArbiter(): BoneArbiter {
         entry.pitch = 0;
         entry.roll = 0;
         entry.overrideBase = null;
+        entry.overridePos = null;
       }
     },
 
@@ -291,6 +323,7 @@ export function createBoneArbiter(): BoneArbiter {
           Number(entry.applied.w.toFixed(6)),
         ],
         overridden: entry.overrideBase !== null,
+        positionOverridden: entry.overridePos !== null,
       }));
     },
   };

@@ -2,11 +2,11 @@
 
 | 项 | 值 |
 |---|---|
-| 对应契约版本 | 1.33.0（ADR 0056：动态模型列表 + Combobox；ADR 0055：LLM 提供商自由切换；ADR 0054：视觉 OCR；ADR 0053：面板二期 AI 人格 / 模型切换 / 记忆管理；ADR 0052：控制面板 / 参数热更新） |
-| 最后更新 | 2026-11-08 |
-| 当前里程碑 | **M30（终极完全体）**：3D 渲染 / 物理 / 动画 / 本地 AI / 视觉 / 控制台全部合入，契约 **1.33.0** |
-| 发布 | **v3.0.0-ultimate**（2026-11-08，git tag `v3.0.0-ultimate`；`package.json` 版本 **3.0.0**） |
-| 本轮验收（2026-11-08，v3.0.0 封版） | `tsc --noEmit` **0 错**；`npm test` **exit 0**（**61 个测试入口 / 597 条**，含 memory 在 Electron 里 **29 条**）；`npm run panel:shot` **exit 0**，`logs/evidence/panel-hot-update.json` 的 **21 项断言全过**（原 17 项 + 模型列表 4 项：拉取填入 Combobox、选 `grok-4.7` 保存并切换后 runtime 真在用、编辑留空 Key 由主进程注入、失败红色提示且手填保存成功），截图 `panel-physics.png` / `panel-status.png` / `panel-persona.png` / `panel-providers.png` / **`panel-models.png`** / `panel-memory.png`；脚本退出前还原用户 `config.json`。自检全绿：主链路 **198 / 0**、输入条 **29 / 0**、语音 **33 / 0**、缺失模型 **4 / 0**、视觉 **16 / 0**；真机 `curl` 验证 OpenCode Go `/models`：无 Key **200**、无效 Key **401**、带 `x-opencode-session` **200**；`npm run panel:opencode` **exit 0**，真实 OpenCode Go 拉取 **30 个模型**，截图 `panel-opencode-models.png`（默认 `panel:shot` 仍只用回环桩） |
+| 对应契约版本 | 1.35.0（ADR 0058：视口安全边距 / 拖拽摆角视口约束 / 悬空姿态下沉补偿 / 自检时序与桩端口；ADR 0057：坐姿退场交接 / 坐姿眼睛照抄站立 / 整体缩放；ADR 0056：动态模型列表 + Combobox；ADR 0055：LLM 提供商自由切换；ADR 0054：视觉 OCR；ADR 0053：面板二期 AI 人格 / 模型切换 / 记忆管理；ADR 0052：控制面板 / 参数热更新） |
+| 最后更新 | 2026-11-11 |
+| 当前里程碑 | **M31（视觉边界完美体）**：拖拽摇晃时头发/身体不再被窗口边缘切掉、摆角按真实侧影自适应、悬空姿态不再被底边切脚；契约 **1.35.0**，发布 tag **`v3.1.0-safe-viewport`** |
+| 发布 | **v3.1.0-safe-viewport**（2026-11-11，git tag `v3.1.0-safe-viewport`；`package.json` 版本 **3.1.0**）。上一个发布是 `v3.0.0-ultimate`（2026-11-08） |
+| 本轮验收（2026-11-11，ADR 0058） | `tsc --noEmit` **0 错**；`npm test` **exit 0**（**62 个测试入口**，新增 `drag-motion` 4 条、`model-frame` 3 条）；**四套自检全绿**：主链路 **236 / 0**（新增 3.10 节 7 条；提交前连跑两轮均 236/0）、输入条 **29 / 0**、语音 **33 / 0**、视觉 **16 / 0**（全部 exit 0）；`npm run panel:shot` **exit 0、26 / 26**；`npm run scale:shot` **exit 0**（11 档）；`npm run swing:shot` 新增（两个倍率各 8–10 帧拖拽摇晃 → `swing-100.gif` / `swing-130.gif` / `swing-strip.png` / `swing-margins.png`）。真机 1600×1000（工作区 1600×952）：1.0x 内容区 **550×756**、`pixelsPerUnit` 仍 **57538**（模型像素尺寸不变）；抓头摇晃摆角 **0.300–0.350rad**（1.0x / 1.26x，`swingLimit` 保持 0.35 未被夹）；**逐帧越界 0**；最贴近边缘的一帧像素包围盒仍留 **左 4px / 右 183px / 上 140px / 下 80px**（均 > 0）；面板 1.3x 实际 **1.26x**（受工作区夹取），同样不出画 |
 | 维护规则 | 每个模块对话收尾时必须更新本文件；只写事实，不写计划性描述（计划进 TODO） |
 
 ## v3.0.0 封版记录（M30 · 终极完全体）
@@ -37,6 +37,26 @@
 ## 模块：shell
 
 ### 已完成
+- **视口安全边距（2026-11-10，ADR 0058 D1/D2/D5）**：窗口从"包围盒 × 1.15"改为**再加一圈边距**——左右各
+  `MODEL_VIEW_PADDING_X_PX=64`、头顶 `MODEL_VIEW_PADDING_PX=36`、**底边 0**（锚点=窗口底边）。
+  1.0x 内容区 **550×756**（原 422×720），而 `pixelsPerUnit` 仍是 **57538**——她的像素尺寸没变，
+  多出来的是透明空白。`shared/model-frame.ts` 新增 `viewPaddingShare()` / `fallbackWindowSize()`
+  （模型缺失时兜底 608×756）。**缩放锚点**改走 `resolveViewAnchor()`：复用上次提交的锚点，
+  只在窗口被拖拽/行走/吸附/D-7 搬动过（>2px）时才重取，连续缩放不再累积 ±0.5px 取整误差
+  （实测原来一轮漂 2px）。
+- **整体缩放（2026-11-10，ADR 0057 D2）**：控制面板"物理手感"页新增滑块 **`view.scale`（角色缩放比例，0.5–2.0，默认 1.0，步长 0.01）**。
+  几何只有一份实现 `src/shared/window-scale.ts`（`resolveScaledWindowBounds`）：等比 `宽高 = 基准 × 比例`、**底边中心锚点不动**、
+  再按当前显示器工作区夹一次（`effective = min(请求, 工作区/base)`，`clamped='workarea'`），位置兜底复用 `shared/geometry.ts`
+  的 `clampRectToWorkAreas()`（D-7：至少 80×120 可见）。执行链：面板 `preview/save/reset` → 主进程 `sendTuning` 闭包里先
+  `shell.applyViewScale()`（`window.setBounds(rect,false)`）再 `cmd:tuning`；启动时 `resolveWindowSize()` 之后按
+  `config.json` 的 `view.scale` **直接算出初始矩形**（不会"先 1.0x 闪一下"）。窗口 `resizable:false` 不影响程序化 `setBounds`；
+  输入条跟随、吸附跟随、拖拽/回弹都读 `getContentBounds()`，自动跟上新尺寸。诊断 `shell.viewScaleSnapshot()` /
+  `shell.setViewScale()`（内部入口，非 §7.2 契约方法）+ 每次缩放一条 INFO/（被夹时）WARN 日志。**没有新定时器、没有新 IPC 通道**。
+  实测（1600×1000 / 工作区 1600×952，基准 422×720）：1.35x/1.4x/2.0x 均被夹到 **1.3222x**（窗口 558×952，底边中心不动）；
+  0.6x → 253×432；掩膜从 128×72 跟着变成 169×95 / 77×43。
+- **自检不再读用户 `config.json`（2026-11-10，ADR 0057 D4）**：`scripts/start.mjs` 给五套自检统一 `PET_PANEL_CONFIG=logs/selftest/panel-config.json`。
+  原来只有 `--panel-shot` 隔离，主链路自检会读到用户真实配置里配好的远程提供商（OpenCode Go），于是"LLM 不可用 → `llm_failed` /
+  `route=fallback` / 熔断"三条断言真的走网络并成功 → 由绿变红，**而且会用用户的 Key 发真实请求**（§10.2 红线）。
 - **动态模型列表 + Combobox（2026-11-08，ADR 0056）**：新增只读 IPC 通道 `cmd:fetch-models`（preload 暴露 `petPanel.fetchModels`，主进程 `shell/panel.ts` 只接受面板 sender，业务校验与网络在 `runtime.panel().fetchModels()`）。提供商表单的模型字段改为 `<input list>` + `<datalist>` + `🔄` 按钮 + 绿色/红色状态行 + 可点击模型 chips；Ollama 仍自动用 `/api/tags` 探测结果填充，手动刷新结果优先。成功填充 `{id,name}`；失败只显示红字，输入框与保存按钮保持可用（手填模型名照常 `provider-save`）。已保存 Key 不进渲染进程：编辑留空时主进程仅在 `type` + 归一化 `baseUrl` 都匹配时注入；地址被改写则要求重新输入 Key。同一配置 2s 节流 + 单飞 + 60s 内存缓存（`src/main/llm-model-list.ts`，注入时钟可单测）。取证新增 `panel-models.png` 与 4 项断言（总 21 项），临时桩只监听 127.0.0.1；另 `npm run panel:opencode` 手动诊断用真实 OpenCode Go `/models` 截图 `panel-opencode-models.png`（30 个模型），默认取证不访问外网
 - **LLM 提供商面板（2026-11-08，ADR 0055）**：`cmd:panel` 扩 5 个动作（`providers` / `provider-save` / `provider-delete` / `provider-activate` / `provider-test`），仍走同一条通道；preload 白名单同步（载荷只做形状校验，业务校验留在主进程）。写权限全在 `shell/panel.ts`：`persistLlmProviders()` 统一写 `llm.providers[]` + `llm.activeProvider`，`writeConfigWithProviders()` 保证"保存参数/恢复默认"不会覆盖提供商；API Key 只在主进程与 `config.json` 之间流动，`PanelProviderFacts` 只含 `hasApiKey`。切换/删除/保存后返回最新列表，面板原子刷新；当前生效项保存或激活后自动 `provider-test`，失败在列表与顶部徽标显示"连接失败"。**不允许删除最后一个本地 Ollama**（默认回退选项）。取证新增 `panel-providers.png` 与 3 项断言
 - **视觉查询（2026-11-07，ADR 0054）**：`cmd:vision-query`（§3.5）+ 热键 `Ctrl+Shift+V`（降级 `Ctrl+Alt+V`）+ 输入条"看看屏幕"按钮，三入口共用 `runVisionQuery`，查询中单飞。`shell` 仍**不** import runtime：`bootstrap` 用 `attachVisionBackend(() => getRuntime()?.vision())` 接线，未就绪时返回 `null` 并 WARN。截图走主进程 `desktopCapturer`（`screen` 按光标 `display_id`、`foreground` 按 presence 标题匹配，失败降级整屏），OCR 走回环 OpenAI 兼容端点；失败只更新按钮与日志，不弹窗、不发事件。视觉上下文由 orchestrator 在**下一轮 LLM** 消费。取证 `npm run selftest:vision`（16 项断言全过，真 Windows OCR 桩；`logs/evidence/vision-chain.json` + `vision-capture.png` / `vision-reply.png` / `vision-desktop.png`）
@@ -257,6 +277,61 @@
 ## 模块：render
 
 ### 已完成
+- **拖拽摇晃不出画：视口边距 + 摆角约束 + 悬空下沉补偿（2026-11-10，ADR 0058）**：
+  ① **视口边距（D1/D2）**：`placeModel()` 与 `computeWindowSize()` 共用 `viewPaddingShare()`
+  （= 36/756），于是 1.0x 的 `pixelsPerUnit` 与加边距之前**逐位相同**（57538），
+  窗口却宽了 128px、高了 36px。掩膜基准从 720 改为 `BASE_CONTENT_HEIGHT_PX`（756），
+  `view.scale` 读数同理（否则 1.0x 会被读成 0.95x）。
+  ② **摆角约束（D3）**：`drag-motion.ts` 新增 `swingFits()` / `maxSwingAngle()`（纯函数，含 4 条单测）；
+  侧影来自 `model-loader.measureSilhouette()`（16 带 × 2048–8192 点，排除光环/配件，已平移到脚底中心）。
+  **关键教训**：用包围盒四角判"会不会出画"会把 0.35rad 压到 0.12rad（脚底那一行是假角落）；
+  用真实侧影能摆到 0.28rad。拖拽中按 `DRAG_SWING_RECALIBRATE_MS=[220,550,900,1400]` 重采样
+  （悬空片段的头发会继续往外甩：0.2s ±182px → 1.4s ±221px），新点**只增不减**地并入，
+  上限按 120ms 指数收敛；退化时返回兜底 0.06（**绝不返回 0**）。
+  实测 1.0x 下 `swingLimit` 保持 **0.35（物理上限，不用夹）**，只有抓最靠上的头发时收到 0.24–0.27。
+  ③ **悬空下沉补偿（D5）**：`calibrateDragPose()` 量当前姿态最低点，`dragLift = 下沉量 + 32px×比例`
+  （32px 是几何必需：绕抓取点转 θ 时脚会往下扫，只补下沉会把摆角压成 0.02rad），
+  随 `dragPoseGain` 淡入淡出 —— 修掉"拖着走时靴子被底边切一截"。
+  ④ **取证入口**：`silhouetteCss()`（当前姿态整块 CSS 包围盒，含光环）、`dragDigest()`（O(1) 摘要：
+  角度/上限/补偿/支撑加速度/内容区），以及新增 `npm run swing:shot`（脚本光标 → 真实拖拽 → 0.8Hz 摇晃，
+  逐帧记录 + `capturePage`，产物 `swing-100.gif` / `swing-130.gif` / `swing-strip.png` / `swing-margins.png`）。
+  ⑤ **自检 3.10 新增 7 条**：内容区 550×756 且 `pixelsPerUnit` 不变、静止四周有空白、
+  摇晃摆角 >0.15rad、1.0x 下摆角容得下物理上限、逐帧侧影在视口内、**摆幅最大那一帧实拍 alpha 包围盒
+  四周 ≥2px**、下沉补偿 >5px。
+- **坐姿退场交接 + 坐姿眼皮睁眼 + 整体缩放（2026-11-10，ADR 0057）**：
+  ① **退场交接（D1，修"坐完站起来抽搐"）**：新增纯函数 `sitUpperExitBlend()`（`SIT_UPPER_HANDOVER_MS=300`，`easeInOutCubic`）
+  与 `updateSitUpperHandover()` / `finishSitExit()`。`sitUpperWeight` 成为**唯一**的上半身覆盖权重
+  （坐姿内 = `stageBBlend × sitPoseGain`；离开后从离开那一刻的值 0.3s 收到 0），呼吸/张望/晃腿同乘这条曲线；
+  收到 0 的那一帧 `releaseSitBoneOverrides()` 显式 `overrideBase(null)` × {`Spine`/`Spine1`/`Neck`/`Head`/`eye_L`/`eye_R`}
+  + `overridePosition(null)` × {`bone_eye_D_L/R`}，并清 `sitGain`/`sitPoseGain`/`sitDropSpring`/`sitBodyYaw`/
+  `sitPhaseAHeadApplied`/`sitStageBGain`、`sitMotion.reset()`、**新增** `sitPool.flush()`（立刻清零，不走指数衰减）。
+  两条入口都开交接：`exitSit()` 与 `drag_started`（后者不经过 `exitSit`）。片段交叉淡出 0.35 → **0.28s**（`SIT_EXIT_CROSSFADE_SECONDS`），
+  保证"覆写归零那一帧片段权重已经到 0"，补偿不掉块。**根因**：`BoneArbiter.overrideBase()` 是每帧持续写的，
+  旧实现权重归零后**从不放手** → 头/胸/下背/眼球被永久冻在坐姿上（真机：走路时上半身拧着、头随光标抽）。
+  ② **残留权重（D1.3）**：`animation-controller` 抽出 `fadeOutOthers(keep, seconds)`，在 `fadeTo` / `playHold` /
+  `playOnce` / `finished` 里都调用 —— 旧实现只有 `fadeTo` 会清"半途的第三个 action"，`playHold`（坐姿 0.45s）
+  与 `playOnce`（摸头 0.45s）会把它永久留在 0.5 权重上（真机第二类"抽搐"）。
+  ③ **眼睛照抄站立（D3，修"坐下就眯眼"）**：本资产的眼睛是一条**骨骼链**——眼卡片根骨 `eye_L/R`
+  （片段在 16.2s 把它平移 −0.00016 ≈ **−9px**）、子骨 `eye_*_1/_2`（各转 ±0.077/0.045 quat ≈ **8.8°/5.1°**）、
+  眼皮链 `bone_eye_D_*` + `_01` + `_02`（眨眼 = 本地 `translation.x`：睁眼 0.000275 → 闭眼 0.000435）。
+  **第一版只还原眼皮 x（片段 0.00033 → 0.000275），真机 A/B 几乎没变化**（眼球仍被压住）——逐轨对照
+  GLB 才发现主因是"卡片下移 + 子骨对拧"。改为整条链**照抄站立待机**：`model-loader` 新增 8 个骨骼槽位
+  （`eye_*_1/_2`、`bone_eye_D_*_01/_02`）；`BoneArbiter` 新增 `overridePosition()`（**绝对值**、每帧写、
+  `null` 放手，与已删除的"手写眨眼位移通道"不是一回事）；三份快照 `eyeChainBind`（`setupAnimations()` 之前）/
+  `eyeChainIdle`（第一帧纯待机，与上半身同帧）/ `eyeChainSitFrom`（阶段 B 起点），
+  `quat = slerp(片段, 站立, blend)`、`pos = lerp(片段, 站立, blend)`，张望仍以加法叠在眼卡片上；
+  退场期间保持睁开，`finishSitExit()` 后放手。**没有任何眨眼动画被恢复**（ADR 0046 D2 仍有效）。
+  实测修复后 `sit.eyelid.x` 0.00033 → **0.00027**、`sit.eyes.captured=true`（12 根全部登记），
+  真机 A/B 见 `logs/evidence/sit-eyes-before-after.png`。
+  ④ **诊断**：`sit.{handover,eyelid,eyes,overrides}` 与 `RenderDiagnostics.view = {width,height,scale,pixelsPerUnit,mask,faceZoom}`，
+  `sitSequence()` 增 `handoverRemainingMs` / `eyelidApplied` / `overrideCount`；**未新增状态、事件、`intent`、`emotion`、
+  IPC 通道或 `RenderState` 字段**。
+  ⑤ **整体缩放（D2.4/D2.5）**：`resize()` 增加 `maskCapture.resize(w,h)`；掩膜分辨率改为 `maskSizeFor()`（128×72 × 缩放，
+  夹 64×36–256×144），`MaskSampler` 用**当前帧实际尺寸**做 CSS → 掩膜映射、尺寸变化作废旧 bbox；
+  `headBandDiagnostics()` 不再用 `MASK_HEIGHT` 常量。
+  ⑥ **自检新增 12 条**（坐姿覆写在位 ≥4 根 / 眼皮回到基线 / 16ms 采样抓到完整交接（upper 单调降到 0、覆写 4→0 与 2→0、
+  交接期间眼皮不掉）/ 收尾后 handover=null 且覆写为空、`headBase.baseFrom='mixer'`、微动作池全 0、0.6s 后仍然为空；
+  缩放 1.4x/0.6x/2.0x 三档的窗口尺寸、锚点、渲染侧尺寸、掩膜分辨率、缩放后仍能命中，2.0x 被工作区夹住、还原 1.0x）。
 - **参数热更新与状态上报（2026-11-06，ADR 0052）**：
   ① `src/renderer/render/tunables-store.ts` 是渲染侧**唯一**参数表：`get()` / `values()` /
   `apply(patch)`（夹取后返回真正变化的 id）/ `reset()` / `restoreDefaults()`；默认值来自
@@ -485,6 +560,12 @@
 | 现象 | 影响 | 规避 |
 |---|---|---|
 | **"躯干完全没有跟随"的第一嫌疑不是被动画覆盖**（本轮真机） | 容易先去改骨骼仲裁/动画权重，越改越乱 | 先读 `gaze.spineBone`：`axisY ≈ 1` 且 `spineYawRad ≈ submittedYawRad` ⇒ 骨骼真的转了，问题在**幅度**（第一版 0.08/0.18 只给 1.7°，肉眼不可见）；只有 `spineYawRad ≈ 0` 才是被覆盖/没提交 |
+| **判"会不会出画"绝不能用包围盒四角**（ADR 0058 D3） | 用四角时抓头单摆上限被压到 0.12rad（真实可摆 0.28rad），看起来像"单摆坏了" | 用 `measureSilhouette()` 的**侧影行剖面**；包围盒在脚底那一行也有 ±183px 的假角落 |
+| **悬空姿态本身比站立宽 ≈95px、且偏左 ≈50px**（ADR 0058 D2） | 只加"站立侧影 + 36px 边距"仍会切发梢 | 左右边距用 `MODEL_VIEW_PADDING_X_PX=64`；侧影在拖拽中**重采样并入**（只增不减），让摆角上限跟着收 |
+| **下沉补偿不能用"片段造成的下沉"当上限**（ADR 0058 D4） | 绕抓取点转 θ 时脚本来就往下扫，只补下沉会把摆角压成 0.02rad（等于没有单摆） | `dragLift = 下沉量 + DRAG_LIFT_MIN_PX(32px)`；代价是抓取点相对光标上移 ≤32px |
+| **缩放锚点不能每次从 bounds 现算**（ADR 0058 D5） | 宽高取整带 ±0.5px，连续缩放漂 2px（自检"还原 1.00x 回原位"失败） | `resolveViewAnchor()` 记住上次提交的锚点，只在窗口被别人搬动 >2px 时重取 |
+| **坐姿时序断言不能用 `getDiagnostics()` 单帧**（ADR 0058 D7） | `getDiagnostics()` 单次 ≈300ms，而落座弹簧只有 ≈0.3s → "半蹲过渡/补偿缩放"偶发假失败（同代码一天内一绿一红） | 从接近阶段就开 16ms 的 `sitSequence()` 轻采样，断言整段不变量（`offset == raw × gain` 每帧成立、`sitDrop` 中间态 ≥3 帧、阶段 B 过渡时长 150–700ms） |
+| **自检桩端口写死会被 Windows 的动态端口排除范围打掉**（ADR 0058 D8） | `LLM 桩无法监听 127.0.0.1:11435（EACCES）`→ 语音/视觉自检**断言全过但 exit 1**（重启后 Hyper-V 重新占段，实测 `11367–11466` 被整段排除） | `scripts/start.mjs` 拉起前逐个候选端口试绑，写进 `PET_LLM_URL`/`PET_SELFTEST_*_PORT`；桩从环境变量取端口，启动后打一行"本地桩已监听" |
 | **池的 `hold` 必须短于抽签间隔** | 自检把间隔压到 650ms 时，`headTilt` 的 3–5s hold 会被下一次抽签提前打断（不是 bug，是测试语义） | 生产是 3–8s hold < 15–30s 间隔；生命周期用**单测**（1000ms hold + 2000ms 间隔）验证，自检只验证"强制/解除后回正" |
 | **`forceMicroPool` 期间忽略 hold** | 取证时以为"hold 没生效" | 强制是诊断开关，语义是"一直看这个姿态"；解除强制时才回默认条目。要看 hold 用单测或等自然抽签 |
 | **张望放慢后，自检采样窗口必须 > 一个周期** | 21 个样本 × 250ms 只有 5.3s，会只看到一个目标，"换过方向"假失败 | 坐到 45 × 250ms ≈ 11.3s（> 最大周期 10.2s）；"头真的在转"改用 `yawRange + pitchRange` 之和，避免两个目标恰好接近 |
@@ -972,7 +1053,7 @@
 | 阻塞项 | 涉及模块 | 当前状态 | 需要谁决定 |
 |---|---|---|---|
 | 输入条独立窗口是否复用同一 preload | shell | 已决定：**不复用**，独立最小 preload 只暴露 `submit(text)`（ADR 0016 D1） | —（已解决） |
-| 掩膜坐标系在窗口缩放/DPI 变化时的重建时机 | shell、render | 待定 | 同上 |
+| 掩膜坐标系在窗口缩放/DPI 变化时的重建时机 | shell、render | **已解决（ADR 0057 D2.5）**：整体缩放改窗口尺寸 → 浏览器 `resize` → `render-module.resize()` 重建掩膜 RT（`maskSizeFor()`，128×72 × 缩放、夹 0.5–2x）、作废旧包围盒、下一次 probe 立刻重采；CSS → 掩膜映射一律用**当前帧实际尺寸**。DPI 变化仍由同一路径覆盖（内容区尺寸变了就重建） | —（已解决） |
 | **契约正文仍写"VRM / three-vrm"（§1.2、§2、§3.1、§7.3、§11），资产实际是 glTF `.glb`** | 全局 | ADR 0009 已记录差异，本轮按指令不改 `CONTRACTS.md` | 下一次契约升版时把"VRM"改为"glTF 2.0（GLB）"（minor） |
 | **当前动作名想进 `getState()` 就需要给 `RenderState` 加字段** | render | 本轮按 ADR 0014 D7 走内部诊断，`RenderState` 未增删字段 | 若 `shell`/`orchestrator` 确需读取，先出 ADR 再升契约 minor |
 | **本机 Ollama 已有对话模型**（`qwen3:4b`，doctor 实测 4 个模型） | orchestrator | **已解决（ADR 0018 D2）**：提示词明确禁止 + 校验前剥离装饰（围栏/括号动作/Markdown），真机 1.7s `route=llm`；冷启动首问仍可能撞 8s 预算（见 orchestrator 坑位） | —（已解决） |
@@ -1027,4 +1108,5 @@
 | 2026-11-05 | render、全局 | **待机重构：删除空闲 shy + 七个正面静态站姿轮换**（ADR 0050）：① **删除** `fidget.shy`（`Cafe_Reaction` 3.2–4.9s 掩面缩身）、`fidget.ts` 调度模块、`RenderDiagnostics.fidget` 与"启动后 45s 冷却"整套机制；空闲路径不再引用 `Cafe_Reaction`，同时消除换姿势时"手绕着手腕突然垂下"的扭曲（片段过渡被淡入截断所致，不再触发）。② **新增** `idle-variation.ts`（纯逻辑）：44 段筛出 **7 个正面静态循环待机**（`Cafe_Idle` / `Formation_Idle` / `Carrier_Idle` / `Victory_End_Random` / `Carrier2_Idle` / `Victory_End` / `Formation_Idle_Random`），每 **20–45s** 抽一个非当前且可用的角色，`playRole(..., 0.8s, 'idle')` 交叉淡入；间隔/淡入常量集中在 `shared/constants.ts`。③ **上下文门**：拖拽 / 坐姿 / 行走 / 说话 / 一次性演出期间不换；到点不满足则从恢复时刻重新计时；片段缺失只跳过候选，不回退程序化。④ 呼吸（片段自带）与视线（`gaze.ts` 三层阻尼）不换轨；顺手补 `IDLE_MICRO_POOL` 漏掉的 `speaking` 门。⑤ 自检新增 8 条（生产常量 / 候选池 / 压缩抽签 / 无 `Cafe_Reaction` / 中段权重证明交叉淡入 / 7 张站姿截图 / 交叉淡入 4 帧 / 角色表 ×7），主链路 **189/189**、`npm test` exit 0、`tsc` 0 错；截图 `idle-pose-00..06.png`、`idle-crossfade-00..03.png`；另修掉 `clicked` / `window-gone` 两条瞬态 `startle` 假失败（改为同时接受渲染侧稳定日志）。**未新增/删除状态名、事件、`intent`、`emotion`、IPC 通道、模块接口方法或 `RenderState` 字段** | 1.27.0 |
 | 2026-11-05 | render、全局 | **坐姿两段式 + 临界阻尼下坐 + 看镜头**（ADR 0051）：① **窗口** 14.5–14.7 → **14.2–16.2s**；阶段 A（14.2–16.0）正放官方"坐下 + 第一次张望"（14.95s 头部 0.253rad 转头），阶段 B 16.0–16.2 停帧。② **覆盖** 0.3s `easeInOutCubic` 淡入站立上半身，`upperBlend = stageBBlend × sitGain × sitDrop`；覆盖链三根 → **下背/胸/颈/头四根**，采集改到 `beginFrame()` 后用 `animationBase()`（不读含视线偏移的 `bone.quaternion`）；实测 `headOrientation.pitch` **0.59 → 0.0102rad**。③ **下坐弹簧** `sit-drop.ts`（k=180 / c=26.8 / 1/240s 子步长 / dt≤0.05s），`sitDrop` 0→1，所有补偿/侧身/覆盖乘 `sitGain × sitDrop`。④ **看镜头**：张望 1/3 概率 `camera`（yaw/pitch=0），其余随机；过渡 800–1200ms、到位静止 ≥2s。⑤ 自检新增 6 条（A 无覆盖 / B 0.3s 到 1 / 16ms 头部步进 <0.15rad / 弹簧无过冲 / A/B 截图 / targetKind=camera）；主链路 **189→195**、`npm test` exit 0、`tsc` 0 错。**0 新依赖 / 0 新定时器 / 0 新 IPC / `RenderState` 未增删字段** | 1.28.0 |
 | 2026-11-06 | render、全局 | **坐姿手感标定 + A/B 封版**（ADR 0051 D7）：① 新增 `SIT_PHASE_A_HEAD_TUNE_RAD`（默认 **0**）——阶段 A（14.2–16.0s）头骨俯仰按 `sitPoseGain × (1 − stageBBlend)` 淡入淡出，负值 = 抬头；② 新增 `SIT_SPINE_OVERLAY_WEIGHT`（默认 **1.0**）——只乘下背 `Spine` 的覆盖权重（0.85 = 保留 15% 片段前倾），胸/颈/头仍是完整 `upperBlend`；③ 诊断 `sit.{phaseAHeadTuneRad,phaseAHeadAppliedRad,spineOverlayWeight,spineOverlayApplied}` 与 `sitSequence()`，**未新增状态/事件/IPC/接口方法/`RenderState` 字段**；④ A/B 两组（0/1.0 与 -0.12/0.85）各跑 `tsc` + 主链路自检，均 **198/0**；自检新增"A/B 特写已产出"1 条，产出 `sit-ab-stage-{a,b}.png` 与对比图 `logs/evidence/sit-ab-compare.png`（`tools/compose-sit-ab.py`）；⑤ 本轮 `npm test` **525/0**（52 文件）、四套自检 **198 / 29 / 33 / 4** 全 exit 0，封版 `v1.7.0-sit-final` | 1.28.1 |
+| 2026-11-10 | render、shell、全局 | **坐姿退场残留 / 坐姿眯眼 / 整体缩放**（ADR 0057）：① **退场交接**——`BoneArbiter.overrideBase()` 是每帧持续写的，旧实现权重归零后从不放手，头/胸/颈/下背/眼球被永久冻在坐姿上（真机"站起来走路上半身拧着、头随光标抽搐"）。新增 `sitUpperExitBlend()`（0.3s `easeInOutCubic`）+ `updateSitUpperHandover()` + `finishSitExit()`：`sitUpperWeight` 成为唯一的上半身覆盖权重，收到 0 时显式 `overrideBase(null)`/`overridePosition(null)`（上半身 4 根 + 眼睛链 12 根）、清弹簧/增益/侧身、`sitMotion.reset()`、`sitPool.flush()`；`exitSit` 与 `drag_started` 两条入口都开交接；片段淡出 0.35 → 0.28s。② **残留权重**——`animation-controller` 新增 `fadeOutOthers()`，`playHold` / `playOnce` / `finished` 也会清掉"半途的第三个 action"（旧实现只有 `fadeTo` 会）。③ **眼睛照抄站立**——第一版只还原眼皮 x（0.00033 → 0.00027），真机 A/B 几乎无变化；逐轨对照 GLB 后改为覆盖**整条眼睛链 12 根**（`eye_L/R` 卡片被片段平移 ≈9px、`eye_*_1/_2` 各转 ≈8.8°/5.1°、眼皮链 `bone_eye_D_*_01/_02`），三份快照（绑定 / 站立待机 / 阶段 B 起点）+ `slerp`/`lerp`；`overridePosition()` 为新增的绝对值位置覆写通道；`model-loader` 增 8 个眼睛链骨骼槽位。④ **整体缩放**——控制面板新增 `view.scale`（0.5–2.0，默认 1.0）；`shared/window-scale.ts` 唯一几何（等比 + 底边中心锚点不动 + 工作区夹取 + D-7 兜底）；主进程 `applyViewScale()` 走 `setBounds`，启动按 `config.json` 首帧生效；渲染侧只 `resize`（视锥/`pixelsPerUnit` 同比、掩膜按 `maskSizeFor()` 自适应 169×95 / 77×43）。⑤ **自检隔离**——五套自检统一 `PET_PANEL_CONFIG=logs/selftest/`，不再读用户真实 `config.json`（否则会拿用户的远程提供商 Key 发真实请求，且三条降级断言必红）。验证：单测全绿、`tsc` 0 错、四套自检 **229 / 29 / 33 / 16** 全 exit 0、`panel:shot` **26/26**、`npm run scale:shot` 11 帧；证据 `logs/evidence/{window-scale-sweep.gif,window-scale-strip.png,sit-eyes-before-after.png,sit-exit-after.png,panel-physics.png,panel-status.png}`。**未新增状态名、事件、`intent`、`emotion`、IPC 通道、模块接口方法或 `RenderState` 字段** | 1.34.0 |
 | 2026-11-06 | render、全局 | **控制面板 / 参数热更新**（ADR 0052）：① 新增第三个窗口（`shell/panel.ts` + `panel-window.ts` + 独立 preload `preload/panel.ts`，800×600、不可缩放、无边框、置顶、不占任务栏），入口 `Ctrl+Shift+P` + 托盘第一项，`Esc` 收起；② 五项可调参数（`sit.phaseAHeadTuneRad` / `sit.spineOverlayWeight` / `gaze.{eye,head,spine}Stiffness`）唯一出处 `shared/tunable-params.ts`（默认值引用 `shared/constants.ts`），夹取唯一一份 `clampTunableValue`（越界夹取、非法退默认、`-0` 归一）；③ 热更新链路 `cmd:panel{set}` → 主进程夹取 → `cmd:tuning` → 渲染侧 `tunables-store`，**不重启渲染进程、不重播坐姿**；④ `config.json` 持久化（只写改动项、保留未知顶层键、`tmp+rename` 原子写、坏文件降级、`PET_PANEL_CONFIG` 可覆盖）；⑤ 只读状态页 4Hz（复用 16ms 轮询器、仅面板可见时）+ Ollama 3s 探测三态（只诊断，不碰熔断/事件/托盘）；⑥ 新增 5 条控制面 IPC 通道 `cmd:panel` / `cmd:panel-state` / `cmd:tuning` / `cmd:state-poll` / `cmd:state-report`，**未新增/删除状态名、事件、`intent`、`emotion`、模块接口方法或 `RenderState` 字段**；⑦ 取证 `npm run panel:shot` 7 项断言全过（渲染侧收到 `-0.12/0.85/16`、面板数字框、状态页、`config.json`），`npm test` **552/0**（56 文件）、`tsc` 0 错 | 1.29.0 |

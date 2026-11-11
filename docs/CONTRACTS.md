@@ -2,8 +2,8 @@
 
 | 项 | 值 |
 |---|---|
-| 契约版本 | 1.33.0 |
-| 生效日期 | 2026-11-08 |
+| 契约版本 | 1.35.0 |
+| 生效日期 | 2026-11-10 |
 | 适用平台 | Windows 11 x64（唯一目标平台） |
 | 权威性 | 本文件是唯一事实来源；与代码、口头约定冲突时以本文件为准 |
 | 修改方式 | 先写 ADR → 再改本文件 → 版本号按 §15 递增 |
@@ -116,7 +116,10 @@
 | `backgroundColor` | `#00000000` | 必须显式透明 |
 | `focusable` | **恒为 `false`，运行期禁止修改** | 运行期切换 focusable 在 Windows 上会闪烁、丢置顶、输入法异常（§3.6 P-3、ADR 0003） |
 | 尺寸 | 默认 `480 × 720` CSS px，按模型包围盒 × 1.15 校正 | 保证脚底与头顶留白 |
-| 锚点 | 角色脚底中心 = 窗口内容区底边中心 | "坐在窗口下沿" |
+| 视口安全边距（ADR 0058 D1/D2） | 在"包围盒 × 1.15"之外**再加**边距：**左右各 `MODEL_VIEW_PADDING_X_PX = 64`、头顶 `MODEL_VIEW_PADDING_PX = 36`、底边 0**。1.0x 因此是 **`550 × 756`**（本资产），而 `pixelsPerUnit` 与加边距之前**完全一致**（57538）——模型像素尺寸不变，多出来的是透明空白。`pixelsPerUnitFor()` 用固定份额 `viewPaddingShare = 36/(720+36)` 折算，保证任何倍率下像素比与内容高严格成正比。**底边永远 0**：锚点就是窗口底边 | 拖拽单摆绕抓取点旋转时，头发/身体会被窗口边缘切掉（横向余量原来只有 27px）；悬空姿态（`Formation_Pickup`）本身就有 ≈462px 宽，横向需要更多余量 |
+| 缩放锚点（ADR 0058 D5） | `applyViewScale()` 复用上一次提交的逻辑锚点，只在窗口被别的路径搬动过（>2px）时才从当前 bounds 重取 | 宽高取整会让锚点带 ±0.5px 误差，连续缩放会累积漂移（实测一轮 2px） |
+| 缩放（ADR 0057 D2） | 控制面板"整体缩放"滑块 `view.scale`，范围 **0.5–2.0**（默认 1.0）；窗口内容区宽高 = 基准尺寸 × 比例（**等比**），**底边中心锚点不动**，主进程 `setBounds` 实时生效并持久化到 `config.json`。**实际生效比例还受当前显示器工作区限制**（`effective = min(请求, 工作区/base)`，1080p 桌面上 2.0x 通常只能到 ~1.32x），差额由 `ShellModule.viewScaleSnapshot()` 诊断与面板状态页显示。渲染侧**不写窗口几何**，只响应 `resize` | 缩放不能把头顶切到屏幕外、也不能让窗口超出工作区后拖不回来 |
+| 锚点 | 角色脚底中心 = 窗口内容区底边中心（缩放时保持不变） | "坐在窗口下沿" |
 | 输入条 | **独立窗口**：`260 × 44`、非透明、无边框、置顶、`skipTaskbar`、`show: false` 复用 | 唯一可聚焦窗口，见 ADR 0003 |
 
 ### 3.3 命中与点击穿透（规则 R）
@@ -124,8 +127,8 @@
 | 编号 | 规则 |
 |---|---|
 | R-1 | 窗口内容只有 canvas 与最少 DOM（字幕气泡）；角色命中**不得**依赖 DOM 元素；输入条不在本窗口（§3.2） |
-| R-2 | 命中判定基于 CPU 侧 alpha 掩膜：渲染侧把角色渲染到独立的 `128 × 72` 离屏 RenderTarget，用 `readRenderTargetPixels` 读回。**禁止**对 drawing buffer 调 `readPixels`，**禁止**开启 `preserveDrawingBuffer`（§3.6 P-2） |
-| R-3 | 掩膜以窗口内容坐标系定义并覆盖整个 canvas；光标 CSS 坐标按 canvas 尺寸等比映射到掩膜坐标 |
+| R-2 | 命中判定基于 CPU 侧 alpha 掩膜：渲染侧把角色渲染到独立的离屏 RenderTarget（契约基准 `128 × 72`），用 `readRenderTargetPixels` 读回。**禁止**对 drawing buffer 调 `readPixels`，**禁止**开启 `preserveDrawingBuffer`（§3.6 P-2）。**分辨率随整体缩放自适应**（ADR 0057 D2.5）：`maskSizeFor(内容宽, 内容高)` 按 `内容高 / BASE_CONTENT_HEIGHT_PX`（1.0x = 720 + 36 = **756**，ADR 0058 D1）缩放 128×72 并夹在 `[0.5x, 2x]`（64×36 – 256×144），保证每个掩膜单元覆盖的 CSS 面积恒定；尺寸变化时重建 RT、采样器作废旧包围盒，CSS → 掩膜映射必须用**当前帧的实际尺寸**（不得用常量）。视口加边距后映射仍然是**相对**的（掩膜铺满整个内容区，空白区 alpha=0），命中坐标不需要任何额外换算 |
+| R-3 | 掩膜以窗口内容坐标系定义并覆盖整个 canvas；光标 CSS 坐标按 canvas 尺寸等比映射到掩膜坐标（缩放后同一套比例，无需另算） |
 | R-4 | 光标处的命中值 = 掩膜双线性插值；`alpha ≥ 0.5` 判为命中。光标停留在同一掩膜单元内时复用缓存结果，不重复计算 |
 | R-5 | 掩膜刷新：光标在窗口矩形内 ≥ 20Hz；光标离开窗口矩形则暂停采集；重新进入且掩膜陈旧 > 100ms 时立即重采一次再判定 |
 | R-6 | 穿透恢复由主进程驱动（Windows 上 `forward` 无效，§3.6 P-1）：主进程以 ~16ms 轮询 `screen.getCursorScreenPoint()`，光标进入窗口矩形 → 发 `cmd:probe` → 渲染侧用最新掩膜判定 → 回 `cmd:interactive{hit}` → `hit=true` 关闭穿透并保持，`hit=false` 维持穿透 |
@@ -164,9 +167,9 @@
 | `cmd:panel` | panel → main | 控制面板的**写操作 / 状态请求**唯一入口联合体（ADR 0052；ADR 0053/0055 扩展动作）：`snapshot` / `status` / `preview{values}` / `save{values}` / `reset` / `card` / `save-card{text}` / `set-model{model}` / `providers` / `provider-save{provider}` / `provider-delete{id}` / `provider-activate{id}` / `provider-test{id}` / `tts-test` / `memories{limit?}` / `memory-delete{id}` / `memory-clear{confirm}` / `hide`。只接受面板窗口这一个 sender；preload 与主进程各做一层白名单，业务校验（模型名、提供商地址/Key/模型、`limit`、二次确认、角色卡非空）在主进程。**只读网络动作** `cmd:fetch-models` 单列一行（ADR 0056） |
 | `cmd:panel-state` | main → panel | 控制面板的**只读**快照（ADR 0052；ADR 0053/0055 扩展）：`{ render, ollama, persona, providers, memory, panelVisible }`。`render` 是渲染进程 `cmd:state-report` 的原样转发（面板只显示，不反推行为）；`ollama` 含 `models` 清单与 `modelPresent`（ADR 0053）；`persona`/`providers`/`memory` 是只读概览，`providers` **不含 API Key**（只给 `hasApiKey`） |
 | `cmd:fetch-models` | panel → main（invoke） | 模型列表（ADR 0056）：入参 `{ type?, baseUrl, apiKey?, providerId? }`，返回 `{ ok:true, models:[{id,name}] }` 或 `{ ok:false, error }`。**只读**：不写盘、不换客户端、不改熔断、不发事件；只接受面板窗口这一个 sender。`apiKey` 留空时主进程仅在 `type` 与归一化 `baseUrl` 都与 `providerId` 对应项一致时注入已保存 Key；同一配置 2s 节流 + 单飞 |
-| `cmd:tuning` | main → renderer | 生效参数（ADR 0052）：完整一组 `TunableValues`，主进程启动即发一次（让 `config.json` 在首帧生效），之后每次 `set`/`save`/`reset` 再发。渲染侧夹取后写入唯一参数表，**不得**绕过 |
+| `cmd:tuning` | main → renderer | 生效参数（ADR 0052）：完整一组 `TunableValues`（ADR 0057 起含 `view.scale`），主进程启动即发一次（让 `config.json` 在首帧生效），之后每次 `set`/`save`/`reset` 再发。**`view.scale` 的消费方是主进程**：`sendTuning` 里先 `shell` 改窗口（`setBounds`）再把整组参数发给渲染侧（渲染侧只跟着 `resize`）。渲染侧夹取后写入唯一参数表，**不得**绕过 |
 | `cmd:state-poll` | main → renderer | 索要一次渲染侧快照（ADR 0052）：只在控制面板可见时发（4Hz，复用既有 16ms 轮询器）。**没有新定时器** |
-| `cmd:state-report` | renderer → main | 渲染侧事实快照（ADR 0052）：`{ at, state, tuning, sit }`，只在主进程索要时回一次。不含控制指令，**不得**被当成事件 |
+| `cmd:state-report` | renderer → main | 渲染侧事实快照（ADR 0052；ADR 0057 增 `view`）：`{ at, state, clip, sit, tuning, view, collectedAt }`，其中 `view = { width, height, scale }` 是**内容区实际尺寸与生效比例**（`scale = height / 720`），只在主进程索要时回一次。不含控制指令，**不得**被当成事件 |
 | `cmd:vision-query` | renderer → main（invoke） | 视觉查询（ADR 0054）：入参 `{ source?: 'screen' \| 'foreground' }`，返回 `VisionResult`——`{ ok, source, capturedFrom, text, chars, at, durationMs, image:{bytes,width,height}\|null, model, baseUrl, reason, detail }`。`ok:false` 时 `reason ∈ {disabled, unavailable, timeout, empty, empty-source}`。主进程做**单飞**（同刻只允许一次），截图与 OCR 都不抛异常；只允许回环 OCR 端点（§10.2） |
 
 ### 3.6 Windows 平台事实（已实测，不得再走回头路）
@@ -457,6 +460,20 @@ export interface RenderState {
 - **拖拽表现（ADR 0035、ADR 0041 D1）**：`dragged` 期间**任何抓取带**都播同一段官方悬空片段（`CH0335_Formation_Pickup`，从第 0 秒起播以取得"被拎起"的起势），只保留"整身绕抓取点旋转 + 单摆/挣扎角度 + `pivotCompensation`"。**禁止**再按部位写骨骼姿态、**禁止**任何程序化的整身抬升/缩放下蹲（落地缓冲除外）。
 - **摸头反应（ADR 0039、ADR 0041 D2）**：**只有官方片段，没有程序化姿态**。`head_patted` → `clip-bank` 的 `pat` 角色（`CH0335_Victory_Start_Random` **0.3–2.05s**，停在"还缩着"的保持段末尾），表情临时投影 `shy`。片段播完按 **0.45s** 交叉淡入回到**演出前正在播的那个动作**（不是"`idle` 槽位对应的片段"——待机姿态会轮换，回槽位会造成抱臂→普通站姿的姿态跳变）。**身体是否接管按 §5.3 的表**：只有 Base=`idle` 且无 Physics 且不在 `speaking` 时才播整身片段；`speaking` / `walking` / `sitting` 时身体通道一动不动，只有表情。**禁止**为摸头写任何骨骼偏移或 `scale`（含 squash）；`dragged` / `settling` 期间不得建 reaction，`drag_started` 必须清掉在播的摸头片段与 reaction。
 - **落地缓冲（ADR 0035 D4，口径与幅度见 ADR 0040 D3）**：`motion_ended{kind:'settle'}` 之后 220ms 的轻微下蹲，**冲击只看 `drag_released.vy`**（松手瞬间竖直速度），门槛 700px/s、上限 1000px/s；`scale.y` 压扁 ≤ **3%**，脊柱/膝/臂只作小辅助（≤0.16rad）。轻放不触发；不得调回 8%（8% 会被读成一个独立动作，与摸头的缩身混淆）。
+- **坐姿的退出交接（ADR 0057 D1，硬约束）**：离开 `sitting`（拖拽 / 点击 / 命令 / 目标消失 / 全屏）后 **0.3s**（`SIT_UPPER_HANDOVER_MS`）内必须把下列"坐姿残留"**平滑归零并整块放手**，不得硬切：
+  ① 上半身基底覆写（`Spine` / `Spine1` / `Neck` / `Head` 的 `overrideBase`）与眼骨基底覆写；
+  ② 眼皮位置覆写（ADR 0057 D3）；
+  ③ `sitGain` / `sitPoseGain` / 下坐弹簧 `sitDrop` / 阶段 B 权重 / 微侧身 / 大腿弯曲；
+  ④ 坐姿微动作池的三个权重（`legs` / `hands` / `far`）。
+  收尾那一帧必须显式调用 `overrideBase(bone, null)` / `overridePosition(bone, null)`（`BoneArbiter` 的覆写是**每帧持续写**的，权重归零并不等于放手 —— 旧实现就是在这里把头/胸/下背/眼球永久冻在坐姿上，真机表现为"坐完站起来上半身拧着、头随光标抽搐"）。判定口径：退出后 `RenderDiagnostics.sit.overrides.rotation/position` 两个数组为空、`sit.upperOverride=0`、`sit.motion.gain=0`、`microPool.sit` 三项权重为 0。**片段自身的交叉淡出（`SIT_EXIT_CROSSFADE_SECONDS=0.28`）必须短于交接窗口**，否则补偿（`raw × sitPoseGain`）会在最后一帧掉一块。
+- **坐姿的眼睛（ADR 0057 D3）**：本资产的"眼睛"是一条**骨骼链**——眼卡片根骨 `eye_L/R`（片段会把它平移 ≈9px）、它的子骨 `eye_*_1/_2`（片段会把它们各转 ≈8.8°/5.1°）、眼皮链 `bone_eye_D_*` + `_01` + `_02`（眨眼 = 本地 `translation.x`：睁眼 **0.000275**、闭眼 **0.000435**）。片段停在 16.2s 时 Mixer 不再写这些骨，她会被冻在半闭状态（真机："坐下就眯着眼"）。阶段 B 起必须把整条链**照抄站立待机**（`slerp`/`lerp`，权重 = 上半身覆盖权重，目标里眼皮链的 x 取"待机帧与绑定姿态中更小者"以防采到眨眼帧），退场期间保持睁开，`finishSitExit()` 之后再放手交给站姿动画。**只允许这一处"照抄站立"的覆写**；**禁止**恢复任何逐帧累加的手写眨眼通道（ADR 0046 D2 仍然有效），**禁止**给眼睛写 `scale`。
+- **整体缩放（ADR 0057 D2）**：`view.scale` 由**主进程**消费（`shell.applyViewScale` → `window.setBounds`），渲染侧只响应窗口 `resize`：正交视锥 = `±w/2, ±h/2`、`pixelsPerUnit = 内容高 × (1 − 视口边距份额) /(取景高 × 1.15)`、`animationRoot.position.y = -h/2`、`applyPlacement()` 重算脚底锚点、掩膜重建（R-2）。**不得**用 `model.scale` 实现缩放（会与脚底锚点/命中坐标系脱钩），**不得**让渲染侧改窗口几何。
+- **视口安全边距与拖拽摆角（ADR 0058，硬约束）**：
+  ① 窗口内容区 = 包围盒 × 1.15 **再加**边距：左右各 `MODEL_VIEW_PADDING_X_PX = 64`、头顶 `MODEL_VIEW_PADDING_PX = 36`、**底边 0**（锚点=窗口底边，见 §1.2）。1.0x 为 `550 × 756`，`pixelsPerUnit` 与加边距之前一致（≈57538）。
+  ② `dragged` 期间提交给根节点的摆角必须被**视口约束**夹住（`maxSwingAngle()`）：约束用**真实侧影行剖面**（`measureSilhouette()`，16 带），**禁止**用包围盒四角（脚底那一行的假角落会把 20° 的物理上限压成 7°）。剖面在拖拽中按 `DRAG_SWING_RECALIBRATE_MS` 重采样并**只增不减**地并入，上限按 `DRAG_SWING_LIMIT_SMOOTH_MS` 收敛（禁止跳变）；侧影缺失时返回兜底 `DRAG_SWING_MIN_ANGLE_RAD = 0.06`，**禁止返回 0**。
+  ③ 悬空姿态的下沉必须补偿：`dragLift = 片段下沉量 + DRAG_LIFT_MIN_PX × 比例`（32px 是几何必需——绕抓取点转 θ 时脚会往下扫），随 `dragPoseGain` 淡入淡出；**禁止**改窗口底边来给脚让位。
+  ④ 判据口径：`RenderDiagnostics.view.{silhouetteBands,swingLimit}` 与 `drag.angleLimit` 是内部诊断；"没被切"的硬证据是**实拍 alpha 包围盒**四周仍 >0（自检 3.10 与 `swing:shot`）。
+- **切换动作时的残留权重（ADR 0057 D1，硬约束）**：任何一次"接管身体"（`play` / `playRole` / `playHold` / `playOnce` / 一次性演出播完回原动作）都必须把**除目标与上一个之外**所有仍有权的 action 一并 `fadeOut`（`fadeOutOthers`）。`crossFadeFrom(previous)` 只管上一个 action，半途的"第三个"若不清理，权重会永久停在 0.5 左右（真机："坐姿叠着站姿、起身之后还挂着"）。
 
 **表情表现（ADR 0026）**：
 
@@ -607,9 +624,9 @@ export interface MemoryWrite {
 
 | 项 | 规定 |
 |---|---|
-| 唯一可调参数集 | 五项，定义在 `src/shared/tunable-params.ts`（`TUNABLE_IDS` / `TUNABLE_META` / `TUNABLE_DEFAULTS`）：`sit.phaseAHeadTuneRad`、`sit.spineOverlayWeight`、`gaze.eyeStiffness`、`gaze.headStiffness`、`gaze.spineStiffness`。**默认值必须引用 `shared/constants.ts`**，不得另写一份数字；新增第六项要改 ADR，不能"顺手加个滑块" |
+| 唯一可调参数集 | 六项，定义在 `src/shared/tunable-params.ts`（`TUNABLE_IDS` / `TUNABLE_META` / `TUNABLE_DEFAULTS`）：`view.scale`、`sit.phaseAHeadTuneRad`、`sit.spineOverlayWeight`、`gaze.eyeStiffness`、`gaze.headStiffness`、`gaze.spineStiffness`。**默认值必须引用 `shared/constants.ts`**，不得另写一份数字；新增第七项要改 ADR，不能"顺手加个滑块" |
 | 夹取 | 只有一份：`clampTunableValue()`（主进程、面板、渲染侧共用）。越界夹到区间、非数字（含 `null`/`NaN`/`"abc"`）退回默认值；`-0` 归一成 `0` |
-| 生效链路 | 面板 `cmd:panel{preview}` → 主进程夹取 + 广播 `cmd:tuning` → 渲染进程参数表 → 下一帧读取。**热更新不得重启渲染进程**，也**不得**让渲染侧自己持久化 |
+| 生效链路 | 面板 `cmd:panel{preview}` → 主进程夹取 + 广播 `cmd:tuning` → 渲染进程参数表 → 下一帧读取。**热更新不得重启渲染进程**，也**不得**让渲染侧自己持久化。**例外是 `view.scale`**：它的消费方是主进程（`sendTuning` 闭包里先 `shell.applyViewScale`（`setBounds`）再发 `cmd:tuning`），渲染侧只是跟着窗口 `resize` 变化（ADR 0057 D2.2） |
 | 持久化 | `config.json`（`app.getAppPath()` 下；`PET_PANEL_CONFIG` 可覆盖）。**只写与默认值不同的项**，且保留未知顶层键（以后放别的设置）；写入是"临时文件 + rename"，坏文件只记 `error` 并按默认值启动，**不阻断启动** |
 | 本地模型（ADR 0053） | 模型选择的旧持久化位置是 `config.json.llm.model`；优先级 `config.json` > `PET_LLM_MODEL` > `qwen3:4b`。面板下拉只列 `/api/tags` 里真实存在的模型；主进程拒绝不在清单里的名字与非法名字（白名单 `[namespace/]name[:tag]`，逐段匹配）。切换 = 新 `LlmClient` + `orchestrator.replaceLlm`（**清零健康检查/熔断**）+ `heartbeat.retarget`（**清零预热状态**）；在途请求用旧模型说完，下一轮用新模型；运行期成功后才写盘 |
 | LLM 提供商（ADR 0055） | 持久化改为 `config.json.llm.providers[]` + `llm.activeProvider`（旧 `llm.model` 仍可读，迁移成本地 Ollama 模型）。类型仅 `ollama` / `openai` / `opencode-go`；**运行时至少保留一个本地 Ollama**（默认回退，不允许删除最后一个）。地址规则：Ollama 仅回环 http；OpenAI 兼容远程仅 https（回环可 http），禁 URL 内嵌凭证/查询串；OpenCode Go 固定 `https://opencode.ai/inference/go/openai/v1`（带 `x-opencode-session` 请求头），配置不能改写。API Key 只存 `config.json`，**不进日志、不进 `cmd:panel-state`**（面板只拿 `hasApiKey`）；编辑时留空 = 沿用旧 Key。切换/保存/删除 = `runtime.panel()` 建新客户端 → `orchestrator.replaceLlm`（清零熔断）→ `heartbeat.retarget`（清零预热）；失败不崩，下一轮走 §9.1 规则/兜底。`provider-test` 是**显式用户动作**：Ollama 读 `/api/tags`；OpenAI 兼容读 `/models`（401/403 判失败，404/405 退化为 1-token 对话），结果只存面板内存，不写盘、不改熔断 |
@@ -618,7 +635,7 @@ export interface MemoryWrite {
 | 记忆管理（ADR 0053） | 面板经 `runtime.panel()` 读/删/清（`memories` / `memory-delete` / `memory-clear`），**不直接碰 SQLite**；`shell` 不 import `memory`。列表默认最近 20 条（`limit` 主进程再夹取）；删除/清空以主进程回执为准；**清空必须 `confirm === true`**（UI 两次点击只是体验） |
 | 快捷键 | `Ctrl+Shift+P`（面板）、`Ctrl+Shift+S`（吸附，沿用）；`Esc` → `cmd:panel{hide}`（只 hide，不销毁） |
 | 关闭 | `Esc` 收起（`hide`，不销毁）；托盘的"控制面板"是同一入口 |
-| 只读状态页 | `cmd:panel-state` 的 `render` 段来自渲染进程 `cmd:state-report`（`at`/`state`/`tuning`/`sit`），**4Hz、仅面板可见时**；面板**不得**凭显示值反推或改变服务状态 |
+| 只读状态页 | `cmd:panel-state` 的 `render` 段来自渲染进程 `cmd:state-report`（`at`/`state`/`clip`/`sit`/`tuning`/`view`），**4Hz、仅面板可见时**；面板**不得**凭显示值反推或改变服务状态。`view` 用于显示"请求 x.xx → 实际 x.xx"（缩放被屏幕工作区夹住时两者不等） |
 | Ollama 探测 | 面板可见时每 **3s** 最多一次 `GET /api/tags`（本地回环，零成本），三态 `online`/`offline`/`unknown`，并带回 `models` 清单与 `modelPresent`（ADR 0053，`:latest` 等价判定与 `llm-client` 同源）；**只用于诊断**，不得影响 `orchestrator` 的熔断、不得写 `llm_failed`、不得进托盘诊断。`status` 动作强制刷新（绕过 TTL） |
 | 动态模型列表（ADR 0056） | 提供商表单的模型字段是 `<input list>` + `<datalist>` Combobox，旁边有 `🔄` 刷新按钮。刷新 = `cmd:fetch-models`（§3.5）：Ollama 读 `/api/tags`，OpenAI 兼容读 `<baseURL>/models`，OpenCode Go 读固定预设 `/models`（Bearer + `x-opencode-session`）。**只在用户点 🔄 / 在模型框按 Enter 时发起**；同一配置 2s 节流 + 单飞，成功/失败结果内存缓存 60s。成功填充 datalist 与模型 chips；失败在状态行显示红色 `error`，**输入框与保存按钮保持可用**（手填模型名仍可保存）。已保存的 Key **不进渲染进程**：编辑时留空由主进程在 `type` 与归一化 `baseUrl` 都匹配时注入；地址被改写则要求重新输入 Key。远程请求仍受 §10.2 约束（只由用户动作触发） |
 | 取证 | `npm run panel:shot`（`--panel-shot`）：打开面板 → 走页面自身路径改三项 → 断言渲染侧收到 → 截图 → 保存并读回 `config.json` → **AI 人格页**（改角色卡并断言 runtime `cardChars` 变化 + 隔离副本落盘）→ **提供商**（默认含本地 Ollama；新增回环离线端点写盘并切换到它，断言运行时真的换提供商且面板显示"连接失败"）→ **模型列表**（127.0.0.1 临时桩：拉取三条模型 → 断言 datalist/chips/绿色状态 → 选 `grok-4.7` 保存并切换 → 断言 runtime 真在用 → 编辑留空 Key 再拉取，断言桩收到 Bearer → 关闭端口失败后手填保存）→ **记忆页**（隔离库种两条 → 删一条 → 两次确认清空 → 断言列表/行数/空态）→ 还原用户配置与角色卡 → 退出。证据 `logs/evidence/panel-hot-update.json`（21 项断言）+ `panel-physics.png` / `panel-status.png` / `panel-persona.png` / `panel-providers.png` / `panel-models.png` / `panel-memory.png`。另：`npm run panel:opencode` 是**手动诊断**（真实 OpenCode Go `/models`，无 Key 公开清单），截图 `panel-opencode-models.png`，不属于默认取证、默认取证仍不访问外网 |
@@ -899,6 +916,8 @@ flowchart TD
 | **视觉：上下文过期**（超过 `PET_VISION_CONTEXT_TTL_MS`） | 注入前按 `now - at` 判定 | 无感知（这一轮没有画面） | 整段 3.6 不出现，清空上下文并记一条"已过期，丢弃"；不阻断本轮回复（ADR 0054 D4） | 无 |
 | **视觉：查询中再次按热键** | `controller.pending` | 无感知 | 忽略第二次按键（单飞），不排队、不取消第一次（ADR 0054 D5） | 无 |
 | **模型列表拉取失败**（Key 错 / 端点无 `/models` / 网络断 / 超时） | `cmd:fetch-models` 返回 `{ ok:false, error }` | 面板模型行显示红色提示，输入框与保存按钮保持可用 | 不改熔断、不换客户端、不发事件、不写盘；用户可继续手填模型名保存（ADR 0056 D6） | 无 |
+| **整体缩放被屏幕工作区夹住**（1080p 桌面上 2.0x 需要 1440px 高） | `resolveScaledWindowBounds()` 的 `clamped='workarea'` | 无感知（她只是没变得那么大） | 按能装下的最大比例生效，窗口完整留在工作区内；1 条 WARN + 面板状态页显示"请求 2.00x → 实际 1.32x"（ADR 0057 D2.3） | 无 |
+| **坐姿眼皮骨缺失**（`bone_eye_D_L/R` 不在模型里） | 模型加载期骨骼表 | 无感知（其它一切照常） | 记 1 条 WARN，不施加"睁眼"位置覆写 —— 坐姿仍可能眯眼，但不得因此报错或回退到其它骨骼（ADR 0057 D3） | 无 |
 
 ## 12. 并发与时序
 
@@ -920,6 +939,8 @@ flowchart TD
 | 主动性节拍 | `orchestrator` 内部 15s 一个定时器（`PROACTIVE_TICK_MS`），只做 idle-drive 评估；**不参与**穿透、掩膜、窗口位移，与上面的"唯一 16ms 轮询器"不冲突（ADR 0031 D1）。未装配 `proactive` 时**不建任何定时器** |
 | 生命周期心跳 | `heartbeat` 独立一个 15s 定时器（`HEARTBEAT_TICK_MS`），只做生命周期任务（当前 = 预热）；与 idle-drive 那条互不引用，任一关闭都不影响另一条（ADR 0033 D1）。`PET_SELFTEST=1` 或 `PET_WARMUP_DISABLE=1` 时**整个不建**（零后台推理）。`model_ready` 到达时立即触发一次预热，不等节拍（ADR 0033 D2） |
 | 视觉查询 | 由热键/IPC 触发的**一次性**异步任务，**不开定时器**；同一时刻最多一次（`pending` 单飞）。查询不打断在途对话，也不被对话打断；OCR 超时只结束本次查询（ADR 0054 D5） |
+| 整体缩放 | 由面板 `preview` / `save` / `reset` 触发的**一次性** `setBounds`：**不开定时器**、不排队；渲染侧只等浏览器 `resize` 事件后重算视锥/掩膜。拖动滑块时每个 `preview`（60ms 防抖）改一次窗口，几何计算是纯函数（ADR 0057 D2） |
+| 拖拽摆角重标定 | 挂在**渲染帧循环**上（`updateFrame` 里比较 `now − dragStartedAt` 与 `DRAG_SWING_RECALIBRATE_MS` 的四个时刻），**不开定时器**；每次 `measureSilhouette()` ≤2048 点/网格 ≈5ms，只在 `dragged` 期间发生（ADR 0058 D3） |
 | presence 采样 | 2s 懒采样（`getSnapshot()` 节流），**不是定时器**；不读光标位置（那是 16ms 轮询器的事），只调 `GetLastInputInfo`（ADR 0030 D1.3） |
 | 穿透恢复延迟 | 光标进入窗口到可交互约 1–2 帧（16–32ms）；此间快速点击会落空，属已知残余缺陷 |
 | 掩膜刷新 | 窗口内 ≥ 20Hz；窗口外暂停；陈旧阈值 100ms |
@@ -1009,6 +1030,8 @@ flowchart TD
 | 1.30.0 | 2026-11-06 | **控制面板二期：AI 人格 + 记忆管理**：① §3.5 `cmd:panel` 的动作联合体从 5 个扩到 13 个（新增 `card` / `save-card` / `set-model` / `tts-test` / `memories` / `memory-delete` / `memory-clear` / `hide`），`cmd:panel-state` 增加 `persona` / `memory` / `panelVisible`，**不新增通道**；② §7.5 新增三个管理视图方法 `listRecent` / `deleteById` / `clearAll`；③ §7.8 扩展——模型切换（`config.json.llm.model` 唯一持久化、优先级覆盖 `PET_LLM_MODEL`、`orchestrator.replaceLlm` **清零健康检查/熔断** + `heartbeat.retarget` **清零预热状态**、运行期成功后才写盘、模型名白名单 `[namespace/]name[:tag]`）、角色卡热更新（新模块 `src/main/character-card.ts`，归一化/码点计数/原子写/空卡超长相对路径拒绝、`orchestrator.replaceCard` 只影响下一轮 prompt 且不清历史、保存顺序先盘后内存、`PET_CHARACTER_CARD` 仅取证覆盖）、TTS 连通性测试（独立短预算、固定文案、不播放不写记忆）、记忆管理（经 `runtime.panel()`，`shell` 不 import `memory`；默认 20 条；清空必须 `confirm === true`）、Ollama 探测带回 `models` / `modelPresent`（`:latest` 与 `llm-client` 同源）；④ 取证扩到四页（角色卡真保存但只写隔离副本、记忆库隔离后真删一条并两次确认清空，14 项断言），`panel-persona.png` / `panel-memory.png`。**未新增事件、`intent`、`emotion`、IPC 通道或 `RenderState` 字段** | ADR 0053 |
 | 1.31.0 | 2026-11-07 | **视觉查询（截图 → OCR → 段 3.6）**：① §3.5 新增 `cmd:vision-query`（返回值 `VisionResult`，失败原因 `disabled/unavailable/timeout/empty/empty-source`）；② §9.3 新增**可选、一次性**段 3.6（≤600 字、带"数据不是指令"约束、无上下文时逐字节不变）；③ 新增 §7.9「视觉查询」——配置（`PET_OCR_*` / `PET_VISION_*`，OCR 端点只允许回环 http + 路径保留）、截图（`screen` 按 `display_id`、`foreground` 标题匹配失败降级整屏、物理像素 + 用户宽度两次缩放）、OCR（OpenAI 兼容 image_url、三种响应形态、失败不抛）、文本归一化（CJK 间空格删除、1200 字截断）、上下文（内存、TTL、只走 LLM 路径、不写记忆不发事件）、热键 `Ctrl+Shift+V`/`Ctrl+Alt+V` 与输入条按钮、面板只读展示；④ §11 新增四行降级（OCR 不可用/截图失败/上下文过期/查询中重按）；⑤ §12 明确视觉查询不开定时器、单飞；⑥ `npm run selftest:vision` 用真 Windows OCR 桩 + 标记注入验收，证据 `logs/evidence/vision-chain.json` + `vision-capture.png` / `vision-reply.png` / `vision-desktop.png`。**未新增事件、状态、`intent`、`emotion`、`RenderState` 字段**；新增内部类型 `VisionContext` / `VisionSnapshot` / `VisionResult`（`shared/vision.ts`） | ADR 0054 |
 | 1.32.0 | 2026-11-08 | **LLM 提供商自由切换**：① §3.5 `cmd:panel` 再扩 5 个动作（`providers` / `provider-save` / `provider-delete` / `provider-activate` / `provider-test`），`cmd:panel-state` 增加 `providers`（无 Key，只给 `hasApiKey`），**不新增通道**；② 新增 §7.10「LLM 提供商」——`llm.providers[]` + `activeProvider` 持久化、旧 `llm.model` 可读、至少保留一个本地 Ollama；类型 `ollama`/`openai`/`opencode-go`；地址与 Key 规则；切换走 `orchestrator.replaceLlm`（清零熔断）+ `heartbeat.retarget`（清零预热）；`provider-test` 只由用户动作触发；③ §10.2 白名单新增"用户显式添加的远程主机（HTTPS）"，并明确远程提供商不是默认链、启动/空闲不探测；④ 取证扩到 17 项断言并新增 `panel-providers.png`。**未新增事件、状态、`intent`、`emotion`、`RenderState` 字段**；新增共享类型 `LlmProviderConfig` / `LlmProviderType` 与面板类型 `PanelProviderFacts` / `PanelProviderTestFacts` | ADR 0055 |
+| 1.35.0 | 2026-11-10 | **视口安全边距 + 拖拽摆角的视口约束 + 悬空姿态下沉补偿**：① §3.2 新增「视口安全边距」行——窗口 = 包围盒 × 1.15 **再加**左右各 64px、头顶 36px、**底边 0**（1.0x 为 `550 × 756`），`pixelsPerUnit` 与加边距之前一致（≈57538，模型像素尺寸不变）；新增「缩放锚点」行（复用上次提交的锚点，避免取整误差累积）；② §3.3 **R-2** 的 1.0x 掩膜基准从 720 改为 `BASE_CONTENT_HEIGHT_PX`（756），并明确"加边距后掩膜映射仍是相对的、命中坐标不需换算"；③ §7.3 新增一条硬规则**「视口安全边距与拖拽摆角」**——摆角必须被 `maxSwingAngle()`（真实 16 带侧影剖面）夹住、剖面按 `DRAG_SWING_RECALIBRATE_MS` 重采样且只增不减、上限 120ms 收敛、兜底下限 0.06 不得为 0；悬空姿态下沉必须补偿（`DRAG_LIFT_MIN_PX = 32` + 片段下沉量），**禁止改窗口底边**；"没被切"的硬证据是实拍 alpha 包围盒四周 >0；④ §12 新增「拖拽摆角重标定」行（挂在帧循环上，不开定时器）；⑤ 新增 `main/swing-shot.ts` 与 `npm run swing:shot`（逐帧取证 + GIF）、`tools/glb-silhouette.mjs`（离线量侧影）；自检 3.10 新增 7 条断言（主链路 229 → **236**）。**未新增/删除状态名、事件、`intent`、`emotion`、IPC 通道、模块接口方法或 `RenderState` 字段**；`RenderDiagnostics.view.{silhouetteBands,swingLimit}` 与 `drag.angleLimit` 为内部诊断；`window.petRender.{silhouetteCss,dragDigest}` 为取证入口（非 §7.3 契约方法） | ADR 0058 |
+| 1.34.0 | 2026-11-10 | **坐姿退场交接 + 坐姿眼睛照抄站立 + 整体缩放**：① §3.2 新增「缩放」行——`view.scale` 0.5–2.0（默认 1.0）、窗口 = 基准 × 比例（等比）、**底边中心锚点不动**、实际生效比例受显示器工作区夹取、渲染侧只响应 `resize`；② §3.3 **R-2** 掩膜不再固定 `128 × 72`：`maskSizeFor()` 按缩放自适应并夹在 `[0.5x, 2x]`，CSS → 掩膜映射必须用当前帧实际尺寸；③ §3.5 `cmd:state-report` 载荷增 `view = {width,height,scale}`（`cmd:tuning` 的 `view.scale` 由**主进程**消费，其余仍由渲染侧消费）；④ §7.3 新增四条硬规则——坐姿**退出交接**（0.3s 内把上半身/眼睛链覆写、弹簧、微动作池全部归零并显式 `overrideBase(null)`/`overridePosition(null)`，片段淡出 0.28s 必须短于交接）、坐姿**眼睛照抄站立**（整条眼睛链 12 根骨的旋转 + 位置，退场保持、收尾放手；禁止恢复手写眨眼、禁止写 scale）、**整体缩放**（主进程改窗口，渲染侧只 resize，禁止 `model.scale`）、**切换动作时的残留权重**（`fadeOutOthers`，禁止留下半途的第三个 action）；⑤ §7.8 可调参数五项 → **六项**（新增 `view.scale`），`view` 进入只读状态页；⑥ §11 新增两行降级（缩放被工作区夹住 / 眼睛链骨骼缺失）；⑦ §12 新增「整体缩放」一行（一次性 `setBounds`，不开定时器）。**未新增/删除状态名、事件、`intent`、`emotion`、IPC 通道、模块接口方法或 `RenderState` 字段**；`RenderDiagnostics.sit.{handover,eyelid,eyes,overrides}` 与 `RenderDiagnostics.view` 为内部诊断；`ModelBones` 增 8 个眼睛链槽位（内部类型）；主进程新增内部入口 `shell.setViewScale()` / `viewScaleSnapshot()`（非 §7.2 契约方法） | ADR 0057 |
 | 1.33.0 | 2026-11-08 | **动态模型列表 + Combobox**：① `LLMProvider` 新增 `fetchModels()`——Ollama `GET /api/tags`、OpenAI 兼容 `GET {base}/models`、OpenCode Go 固定预设 `GET /models`（Bearer + `x-opencode-session`），返回 `{id,name}[]`；② §3.5 新增**只读** `cmd:fetch-models`（`{type?,baseUrl,apiKey?,providerId?}` → `{ok,models}` / `{ok,error}`），只接受面板 sender，业务校验在 `src/main/llm-model-list.ts`；③ §7.8 提供商表单的模型字段改为 `<input list>` + `<datalist>` Combobox + `🔄` 刷新 + 绿色/红色状态 + 模型 chips；失败仍可手填保存；④ 安全：已保存 Key 不进渲染进程，仅在 `type` 与归一化 `baseUrl` 都匹配时由主进程注入；地址被改写则要求重新输入 Key；⑤ 同一配置 2s 节流 + 单飞 + 60s 内存缓存，**不新增定时器**；⑥ `panel:shot` 扩到 21 项断言并新增 `panel-models.png`。**未新增事件、状态、`intent`、`emotion`、`RenderState` 字段**；新增共享类型 `LlmModelOption` / `LlmModelListResult`、面板类型 `PanelFetchModelsRequest` / `PanelFetchModelsResult` | ADR 0056 |
 
 ## 16. 如何在新对话中接续

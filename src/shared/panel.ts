@@ -85,6 +85,12 @@ export interface PanelRenderFacts {
   } | null;
   /** 渲染进程**实际生效**的调参值（用于证明"滑块真的到了渲染侧"） */
   tuning: TunableValues;
+  /**
+   * ADR 0057 D2.6：整体缩放的渲染侧事实（面板只显示，不反推行为）。
+   * `scale` = 内容区高 / 基准高 720；主进程会再按屏幕工作区夹一次，
+   * 所以它才是"真正生效的比例"（滑块上的是请求值）。
+   */
+  view: { width: number; height: number; scale: number };
   /** 渲染进程采样时刻（`performance.now()` 同一进程时基，只用于判断新鲜度） */
   collectedAt: number;
 }

@@ -50,7 +50,7 @@
 - **单一定时器**：穿透判定、拖拽位移、行走、回弹、吸附跟随、面板状态轮询共用同一个 ~16ms 轮询器，不额外开定时器。
 - **主进程权威**：窗口位置、穿透状态、配置写盘、LLM 客户端切换、SQLite 读写全部在主进程；渲染侧只做表现。
 - **安全边界**：默认只连本机回环；远程 LLM/OCR 端点必须由用户在面板里显式添加；API Key 只存本机 `config.json`，不进日志、不进状态快照。
-- **可验证**：60+ 测试入口 / 近 600 条单测 + 五套真机自检 + 面板取证（`panel:shot` 21 项断言）。
+- **可验证**：62 个测试入口 / 近 600 条单测 + 五套真机自检 + 面板取证（`panel:shot` 26 项断言）。
 - **零默认成本**：未配置远程提供商时，不产生任何按 token / 按次计费的外部调用；远程只在用户显式添加并启用后发生。
 
 ---
@@ -181,15 +181,20 @@ npm start        # 启动桌宠
 | `npm start` | 构建并启动桌宠 |
 | `npm test` | 全量 Node 单测（含 memory 的 Electron 子进程） |
 | `npm run doctor` | 只读环境自检（模型 / 台词池 / 角色卡 / Ollama / TTS / OCR） |
-| `npm run selftest` | 主链路真机自检（198 项） |
+| `npm run selftest` | 主链路真机自检（236 项） |
 | `npm run selftest:input` | 输入条自检（29 项） |
 | `npm run selftest:speech` | 对话 + 发声闭环自检（33 项） |
 | `npm run selftest:fallback` | 缺失模型回退自检（4 项） |
 | `npm run selftest:vision` | 视觉/OCR 全链路自检（16 项，真 Windows OCR 桩） |
-| `npm run panel:shot` | 控制面板真机取证（21 项断言 + 截图，使用本地回环桩） |
+| `npm run panel:shot` | 控制面板真机取证（26 项断言 + 截图，使用本地回环桩） |
 | `npm run panel:opencode` | 手动诊断：真实 OpenCode Go `/models` 截图（依赖外网，非默认测试链） |
+| `npm run scale:shot` | 整体缩放逐档取证（0.5x→2.0x 共 11 帧 + `scale-sweep.json`，拼成 GIF 当录屏看） |
+| `npm run swing:shot` | 拖拽摇晃逐帧取证（1.0x / 1.3x，0.8Hz 摇晃 + `swing.json` + GIF，验证"头发不被窗口边缘切掉"） |
 
 取证产物在 `logs/evidence/`（已忽略，不入库）；自检截图在 `dist/selftest/`。
+
+**换模型后要重测"她会不会被窗口边缘切掉"**：`npm run swing:shot`（逐帧记录摆角/侧影/像素包围盒，产出两个倍率的 GIF），
+想看离线侧影剖面就 `node tools/glb-silhouette.mjs <模型>.glb` —— 边距与摆角上限的定标依据都在 ADR 0058 D2。
 
 ---
 

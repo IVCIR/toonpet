@@ -13,6 +13,7 @@ import {
   SIT_CLIP_STAGE_B_SECONDS,
   SIT_CLIP_START_SECONDS,
   SIT_STAGE_B_FADE_MS,
+  SIT_UPPER_HANDOVER_MS,
 } from '../../shared/constants';
 import { easeInOutCubic } from './sit-pose';
 
@@ -45,5 +46,21 @@ export function sitStageAt(localSeconds: number): SitStage {
 export function sitStageBBlend(elapsedMs: number): number {
   if (!Number.isFinite(elapsedMs)) return 0;
   const p = Math.min(1, Math.max(0, elapsedMs / Math.max(1, SIT_STAGE_B_FADE_MS)));
+  return easeInOutCubic(p);
+}
+
+/**
+ * **退出坐姿的交接进度**（ADR 0057 D1）：0 → 1，`SIT_UPPER_HANDOVER_MS` 用 cubic 走完。
+ *
+ * 用途只有一个：离开 `sitting` 之后把"上半身覆写权重"从离开那一刻的值乘 `(1 - 本值)` 收到 0，
+ * 收到 0 的那一帧再把 `overrideBase/overridePosition` 全部清成 `null`，
+ * 把这四根骨（+眼球 +眼皮）彻底还给 `AnimationMixer`。
+ *
+ * 为什么也是 cubic：与阶段 B 的淡入对称 —— 起点/终点速度都是 0，交接不会读成"头被拽一下"。
+ * 非法输入（NaN/负值）按 0 处理，超时按 1 处理（= 收尾已完成，可以放手）。
+ */
+export function sitUpperExitBlend(elapsedMs: number): number {
+  if (!Number.isFinite(elapsedMs)) return 0;
+  const p = Math.min(1, Math.max(0, elapsedMs / Math.max(1, SIT_UPPER_HANDOVER_MS)));
   return easeInOutCubic(p);
 }
