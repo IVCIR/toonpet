@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "updatedAt": "2026-01-01T00:00:00.000Z",
+  "tuning": {
+    "sit.phaseAHeadTuneRad": -0.02
+  },
+  "llm": {
+    "activeProvider": "local-ollama",
+    "providers": [
+      {
+        "id": "local-ollama",
+        "type": "ollama",
+        "name": "本地 Ollama",
+        "baseUrl": "http://127.0.0.1:11434",
+        "apiKey": "",
+        "model": "qwen3:4b"
+      },
+      {
+        "id": "opencode-go",
+        "type": "opencode-go",
+        "name": "opencode",
+        "baseUrl": "https://opencode.ai/inference/go/openai/v1",
+        "apiKey": "YOUR_API_KEY_HERE",
+        "model": "deepseek-v4.1-flash"
+      }
+    ]
+  }
+}

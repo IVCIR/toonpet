@@ -16,8 +16,14 @@ logs/
 *.obj
 Character_Mouth_*.png
 
-# 参考音频由用户自备（ADR 0015 D2.4；零成本约束下不自动下载）
+# 参考音频与 TTS 权重由用户自备，绝不入库（ADR 0015 D2.4 / 契约 C-4）
+# *.wav / *.mp3 覆盖根目录、data/ref/ 以及调试时随手录下的音频
 data/ref/
+*.wav
+*.mp3
+*.pth
+*.ckpt
+*.safetensors
 
 # 本地记忆库由运行期生成，不入库（ADR 0020 D2）
 data/memory.db
