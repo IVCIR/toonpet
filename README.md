@@ -1,6 +1,6 @@
 <div align="center">
 
-# ToonPet · 凯伊 3D 桌宠
+# ToonPet · 3D 桌宠
 
 **ToonPet** · `toonpet`
 
@@ -18,16 +18,15 @@
 
 ![演示](docs/swing.gif)
 
-> 🎬 **演示**：拖拽抓取 → 受迫单摆 → 松手回弹落地的实拍片段（1100×1512，10 帧）。
-> 想换成含对话/控制面板的完整录屏时，直接用新 GIF 覆盖 `docs/swing.gif` 即可，README 无需改动；建议横屏 960×540、≤ 8 MB。
-
 ---
 
 ## 这是什么
 
 一个 **Windows 11 桌面宠物**：角色以无边框、透明、置顶的独立窗口常驻桌面，不占任务栏；鼠标只有真正落到角色像素上才可交互，其余区域点击直接穿透到桌面。
 
-她能在桌面底部自己走动、被拖着甩来甩去、被摸头会害羞、会吸附到你当前窗口的边缘坐下；对话走**本地 Ollama**，语音走**本地 GPT-SoVITS**，记忆存在**本地 SQLite**，视觉 OCR 也走**本地 OpenAI 兼容端点** —— 开箱即用路径上没有任何按 token / 按次计费的外部调用。
+她能在桌面底部自己走动、被拖着甩来甩去、被摸头会害羞、会吸附到你当前窗口的边缘坐下；对话走**本地 Ollama**，语音走**本地 GPT-SoVITS**，记忆存在**本地 SQLite**，视觉 OCR 也走**本地 OpenAI 兼容端点** —— 开箱即用路径上没有任何按 token / 按次计费的外部调用。（也有填API Key的选择）
+
+默认是Kei，当然也可以换成其他模型。
 
 > 技术栈：Electron 33 + Three.js（glTF 2.0 / GLB）+ TypeScript + esbuild + better-sqlite3。
 > 只用 Windows 11 x64；角色模型、贴图、语音等资产需自备（仓库不内置，见[资产说明](#资产与版权)）。
@@ -135,7 +134,6 @@ copy .env.example .env   # 本机环境变量；.env 已被 .gitignore 排除
 > - **音色模型（GPT-SoVITS）**：[B 站音色模型视频](https://www.bilibili.com/video/BV1o4fyYuEPW/) 的简介 / 置顶评论（含参考音频与权重的获取方式，参考音频要求 3–10 秒干净人声）
 > - **表情差分**：自行从官方资源提取，文件名见 `data/expressions/README.md`；嘴型图集随模型自带
 >
-> 如果你愿意提供网盘 / GitHub Releases 镜像，把链接写在这里 → `<!-- TODO(owner): 镜像链接 -->`
 
 
 ### 4. 构建并运行
@@ -313,7 +311,5 @@ data/                    # 角色卡、台词池、记忆库（运行期生成�
 ---
 
 <div align="center">
-
-凯伊，毕业快乐。
 
 </div>
