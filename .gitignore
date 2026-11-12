@@ -37,5 +37,16 @@ tools/clip-preview/shots/
 # 官方表情图集由 tools/spine-expression-atlas.py 从游戏资产生成，不入库（契约 C-4）
 data/expression/
 
+# 用户自备的官方表情差分（版权资产，不入库；data/expressions/README.md 列出文件名）
+# 本目录只保留项目自带的占位/遮罩 PNG 与说明文档
+data/expressions/eyes_happy.png
+data/expressions/eyes_shy.png
+data/expressions/eyes_sad.png
+data/expressions/eyes_surprised.png
+data/expressions/blush.png
+
+# 视频抽帧调试产物由 tools/video-frames.cjs 生成，不入库（内含角色截图与他人弹幕）
+tools/video-frames/
+
 # Panel tuning lives in the user's config.json (ADR 0052); never commit it
 config.json

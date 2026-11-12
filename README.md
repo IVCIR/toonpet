@@ -138,9 +138,10 @@ copy .env.example .env   # 本机环境变量；.env 已被 .gitignore 排除
 ### 4. 构建并运行
 
 ```powershell
-npm run doctor    # 可选：只读体检（模型/图集/台词池/角色卡/Ollama/TTS/OCR）
 npm run build     # esbuild 打包到 dist/
-npm start         # 启动桌宠（内部会先 build）
+npm start         # 启动桌宠（内部会再 build 一次，万无一失）
+
+npm run doctor    # 可选：只读体检（模型/图集/台词池/角色卡/Ollama/TTS/OCR）
 ```
 
 启动后：
