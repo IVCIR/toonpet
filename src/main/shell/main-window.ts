@@ -31,7 +31,7 @@ export function createMainWindow(bounds: Rect): BrowserWindow {
     width: bounds.width,
     height: bounds.height,
     show: false,
-    title: '3D 桌宠',
+    title: 'ToonPet',
     frame: false, // §3.2
     transparent: true, // §3.2
     backgroundColor: '#00000000', // §3.2：必须显式透明

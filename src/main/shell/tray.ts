@@ -46,7 +46,7 @@ export interface ShellTray {
 
 export type TrayLog = (level: 'info' | 'warn' | 'error', message: string, data?: unknown) => void;
 
-export const TRAY_TOOLTIP = '凯伊 · 3D 桌宠';
+export const TRAY_TOOLTIP = 'ToonPet · 凯伊';
 
 /**
  * 16×16 占位图标（浅蓝猫脸，4× 超采样后缩放）。

@@ -1,6 +1,6 @@
-# 贡献指南（Contributing to aa3dpet）
+# 贡献指南（Contributing to ToonPet）
 
-感谢你对「凯伊 · 3D 桌宠」的关注！这是一个以 **Windows 11 桌面 + 本地 AI** 为核心的实验性项目，欢迎通过 Issue 与 Pull Request 参与。
+感谢你对「ToonPet · 凯伊 3D 桌宠」的关注！这是一个以 **Windows 11 桌面 + 本地 AI** 为核心的实验性项目，欢迎通过 Issue 与 Pull Request 参与。
 
 ---
 

@@ -1,10 +1,10 @@
 {
-  "name": "aa3dpet",
+  "name": "toonpet",
   "version": "3.1.0",
   "private": true,
-  "description": "Windows 11 3D desktop pet: transparent always-on-top window, 128x72 alpha mask hit testing, local-first AI, zero metered external calls.",
+  "description": "ToonPet: Windows 11 3D desktop pet — transparent always-on-top window, 128x72 alpha mask hit testing, local-first AI, zero metered external calls.",
   "license": "MIT",
-  "author": "aa3dpet 项目所有者",
+  "author": "IVCIR <m13336119579@163.com>",
   "engines": {
     "node": ">=20"
   },

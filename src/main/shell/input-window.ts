@@ -13,7 +13,7 @@ import type { Rect } from '../../shared/geometry';
 import { computeInputBarBounds } from './input-bar-geometry';
 import type { InputBarBounds } from './input-bar-geometry';
 
-export const INPUT_BAR_TITLE = '3D 桌宠 · 输入条';
+export const INPUT_BAR_TITLE = 'ToonPet · 输入条';
 
 /**
  * 契约 §3.2 / ADR 0003 §2：

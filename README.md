@@ -1,8 +1,8 @@
 <div align="center">
 
-# 凯伊 · 3D 桌宠
+# ToonPet · 凯伊 3D 桌宠
 
-**Kaiyi Desktop Pet** · `aa3dpet`
+**ToonPet** · `toonpet`
 
 常驻 Windows 11 桌面的透明置顶 3D 角色 —— 纯本地 AI 对话、GLB 骨骼动画、物理单摆拖拽、NPR 卡通渲染，默认零按次计费。
 
@@ -16,11 +16,10 @@
 
 ## 演示
 
-![演示](docs/demo.gif)
+![演示](docs/swing.gif)
 
-> 🎬 **演示 GIF 占位符**：仓库里的 `docs/demo.gif` 目前只是一张占位图。请用 [ScreenToGif](https://www.screentogif.com/) 录制一段 10–20 秒的真实交互（拖拽 → 落地回弹 → 摸头 → `Ctrl+Shift+B` 对话 → `Ctrl+Shift+P` 控制面板），导出 GIF 覆盖 `docs/demo.gif` 即可。
->
-> 录制建议：窗口缩放保持 1.0x、画面 960×540 左右、体积 ≤ 8 MB，画面最干净。
+> 🎬 **演示**：拖拽抓取 → 受迫单摆 → 松手回弹落地的实拍片段（1100×1512，10 帧）。
+> 想换成含对话/控制面板的完整录屏时，直接用新 GIF 覆盖 `docs/swing.gif` 即可，README 无需改动；建议横屏 960×540、≤ 8 MB。
 
 ---
 
@@ -104,8 +103,8 @@
 ### 1. 安装依赖
 
 ```powershell
-git clone <your-repo-url> aa3dpet-app
-cd aa3dpet-app
+git clone <your-repo-url> toonpet
+cd toonpet
 npm install
 ```
 
@@ -130,9 +129,13 @@ copy .env.example .env   # 本机环境变量；.env 已被 .gitignore 排除
 | 表情差分（可选） | `data/expressions/eyes_*.png`、`blush.png` | 缺失时自动降级为「只变嘴型」 |
 | 参考音频（TTS，可选） | `data/ref/kaiyi.wav` | 3–10 秒干净人声；`PET_TTS_REF_AUDIO` 覆盖 |
 
-> 📦 **资产获取**：仓库不附带模型 / 表情 / 参考音频。你可以从原始来源自行获取，或把自备资产打包上传到网盘 / GitHub Releases，然后把下载链接填在下面这行（别提交资产本体）：
+> 📦 **资产获取**：仓库不附带 3D 模型 / 贴图 / 音色等资产，请从原始来源自取（版权归原作者，本仓库不再分发）：
 >
-> `<!-- TODO(owner): 在此粘贴你的网盘 / Releases 链接 -->`
+> - **3D 模型（GLB）**：到 [Kivo.wiki](https://kivo.wiki/) 搜索 `CH0335`（天童凯伊）
+> - **音色模型（GPT-SoVITS）**：[B 站音色模型视频](https://www.bilibili.com/video/BV1o4fyYuEPW/) 的简介 / 置顶评论（含参考音频与权重的获取方式，参考音频要求 3–10 秒干净人声）
+> - **表情差分**：自行从官方资源提取，文件名见 `data/expressions/README.md`；嘴型图集随模型自带
+>
+> 如果你愿意提供网盘 / GitHub Releases 镜像，把链接写在这里 → `<!-- TODO(owner): 镜像链接 -->`
 
 
 ### 4. 构建并运行
@@ -305,7 +308,7 @@ data/                    # 角色卡、台词池、记忆库（运行期生成�
 
 ## License
 
-[MIT](LICENSE) © 2026 项目所有者
+[MIT](LICENSE) © 2026 IVCIR
 
 ---
 
