@@ -130,6 +130,11 @@ copy .env.example .env   # 本机环境变量；.env 已被 .gitignore 排除
 | 表情差分（可选） | `data/expressions/eyes_*.png`、`blush.png` | 缺失时自动降级为「只变嘴型」 |
 | 参考音频（TTS，可选） | `data/ref/kaiyi.wav` | 3–10 秒干净人声；`PET_TTS_REF_AUDIO` 覆盖 |
 
+> 📦 **资产获取**：仓库不附带模型 / 表情 / 参考音频。你可以从原始来源自行获取，或把自备资产打包上传到网盘 / GitHub Releases，然后把下载链接填在下面这行（别提交资产本体）：
+>
+> `<!-- TODO(owner): 在此粘贴你的网盘 / Releases 链接 -->`
+
+
 ### 4. 构建并运行
 
 ```powershell

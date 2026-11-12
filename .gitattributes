@@ -1,0 +1,20 @@
+# 统一行尾：仓库内一律 LF，检出时按平台转换
+* text=auto
+
+# Windows 批处理/脚本必须保持 CRLF，避免 cmd.exe 解析问题
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制资产不做文本转换（这些文件本身已被 .gitignore 排除，此处只做保护）
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.glb binary
+*.vrm binary
+*.wav binary
+*.mp3 binary
+*.pth binary
+*.ckpt binary
